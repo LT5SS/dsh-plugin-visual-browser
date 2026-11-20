@@ -53,7 +53,7 @@ export declare function toLosslessJson(value: unknown): any;
  * Resolves the default absolute artifact directory anchored to:
  * 1. Explicit `config.artifactDir` (from cordis.yml)
  * 2. `DSH_BROWSER_ARTIFACT_DIR` env var
- * 3. Host Cordis `ctx.baseDir` (active profile / pack directory in DSH Desktop & CLI)
+ * 3. Host Cordis `baseDir` (active profile / pack directory in DSH Desktop & CLI)
  * 4. `DSH_HOME` env var or `~/.dsh` fallback
  */
 export declare function resolveDefaultArtifactDir(configuredDir?: string, ctx?: DshCordisContext): string;

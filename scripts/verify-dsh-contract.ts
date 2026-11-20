@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -71,6 +72,44 @@ async function main() {
     );
   }
   console.log('[Strict DSH 0.2 Contract] Verified package.json dsh.bundle.patch & peerDependencies!');
+
+  // 0b. Cordis 4.x restricted-ctx regression checks (must survive bare & hostile uninjected getters)
+  const bareTools: ToolDefinition[] = [];
+  const bareCtx = {
+    tools: { register: (t: ToolDefinition) => bareTools.push(t) },
+    effect: (fn: () => void) => fn(),
+    on() {},
+    get: () => undefined,
+  };
+  assert.doesNotThrow(
+    () => apply(bareCtx as any, {}),
+    'apply() must survive a ctx without optional services'
+  );
+  assert.equal(bareTools.length, 4, 'bareCtx must register all 4 tools');
+
+  const hostileTools: ToolDefinition[] = [];
+  const hostileBase = {
+    tools: { register: (t: ToolDefinition) => hostileTools.push(t) },
+    effect: (fn: () => void) => fn(),
+    on() {},
+    get: (name: string) => {
+      throw new Error(`cannot get service "${name}" without inject`);
+    },
+  };
+  const hostileCtx = new Proxy(hostileBase, {
+    get(target, key) {
+      if (['tools', 'effect', 'on', 'get'].includes(String(key))) {
+        return (target as any)[key];
+      }
+      throw new Error(`cannot get property "${String(key)}" without inject`);
+    },
+  });
+  assert.doesNotThrow(
+    () => apply(hostileCtx as any, {}),
+    'apply() must not read services it did not inject'
+  );
+  assert.equal(hostileTools.length, 4, 'hostileCtx must register all 4 tools');
+  console.log('[Strict DSH 0.2 Contract] Verified bareCtx & hostileCtx apply() guards (4/4 tools registered)!');
 
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
   const artifactDir = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test');
@@ -219,7 +258,15 @@ async function main() {
       throw new Error(`browser_subagent_run output violations: ${runViolations.join('; ')}`);
     }
     const runBlocks = runDef.output.render({}, runVal);
-    console.log(`[Strict DSH 0.2 Contract] browser_subagent_run (hostLlmCalls=${hostLlmCalls}) rendered blocks: ${runBlocks.map((b: any) => b.type).join(', ')}`);
+    console.log(`[Strict DSH 0.2 Contract] browser_subagent_run (hostLlmCalls=${hostLlmCalls}, planner_mode=${runVal.planner_mode}) rendered blocks: ${runBlocks.map((b: any) => b.type).join(', ')}`);
+    assert.equal(runVal.planner_mode, 'host-ctx-llm', 'Expected planner_mode to be host-ctx-llm when ctx.llm is provided');
+
+    // 4. Execute browser_quick_snapshot on hostileCtx to verify getAttachmentsService does not throw during execute()
+    const hostileSnapDef = hostileTools.find((t) => t.name === 'browser_quick_snapshot')!;
+    const hostileSnapVal: any = await hostileSnapDef.execute({ url: srv.url }, fakeExec);
+    const hostileSnapViolations = validateJsonSchemaValue(hostileSnapDef.output.schema, hostileSnapVal);
+    assert.equal(hostileSnapViolations.length, 0, `hostileCtx snapshot output violations: ${hostileSnapViolations.join('; ')}`);
+    console.log('[Strict DSH 0.2 Contract] Verified browser_quick_snapshot on hostileCtx (no throw on uninjected attachments)!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS (P0 + P1 + P2) PASSED!');
   } finally {

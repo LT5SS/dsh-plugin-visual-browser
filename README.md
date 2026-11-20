@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.1.1 — DSH 0.2.x Verified Bundle Release)
+# `dsh-plugin-visual-browser` (v1.1.2 — DSH 0.2.x Verified Bundle Release)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -48,12 +48,13 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.1.1+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.1.2+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
-# 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本）
+# 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）
 cd <DSH_HOME>/plugins/dsh-plugin-visual-browser
-npm ci --omit=dev
+npm ci --omit=dev --omit=peer
+# 注：使用 pnpm 或旧版 npm 遇到 peer 提示时，也可加 --legacy-peer-deps（效果等价）
 
 # 3. 挂载到你的目标 profile（会自动校验 package.json 中的 dsh.bundle.patch 并写入 dsh.profile.bundles）
 dsh plugin --profile <your-profile> add link:<插件目录的绝对路径>

@@ -26,19 +26,50 @@ export function toLosslessJson(value) {
     return JSON.parse(JSON.stringify(value));
 }
 /**
+ * Safely reads an optional Cordis service (such as `baseDir`, `attachments`, `llm`).
+ * In Cordis 4.x, property getters for services not listed in `inject` throw instead of returning
+ * `undefined`, so both `ctx.get?.(name)` and `ctx[name]` must be guarded with `try/catch`.
+ */
+function getHostService(ctx, serviceName) {
+    try {
+        const viaGet = ctx?.get?.(serviceName);
+        if (viaGet !== undefined)
+            return viaGet;
+    }
+    catch {
+        /* service not injected or getter threw */
+    }
+    try {
+        const service = ctx?.[serviceName];
+        if (service !== undefined)
+            return service;
+    }
+    catch {
+        /* service not injected on this host */
+    }
+    return undefined;
+}
+/**
  * Resolves the default absolute artifact directory anchored to:
  * 1. Explicit `config.artifactDir` (from cordis.yml)
  * 2. `DSH_BROWSER_ARTIFACT_DIR` env var
- * 3. Host Cordis `ctx.baseDir` (active profile / pack directory in DSH Desktop & CLI)
+ * 3. Host Cordis `baseDir` (active profile / pack directory in DSH Desktop & CLI)
  * 4. `DSH_HOME` env var or `~/.dsh` fallback
  */
 export function resolveDefaultArtifactDir(configuredDir, ctx) {
+    const readHostString = (read) => {
+        try {
+            const value = read();
+            return typeof value === 'string' && value.length > 0 ? value : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    };
     const ctxAny = ctx;
-    const hostBaseDir = typeof ctxAny?.baseDir === 'string'
-        ? ctxAny.baseDir
-        : typeof ctxAny?.root?.config?.baseDir === 'string'
-            ? ctxAny.root.config.baseDir
-            : undefined;
+    const hostBaseDir = readHostString(() => ctxAny?.get?.('baseDir')) ??
+        readHostString(() => ctxAny?.baseDir) ??
+        readHostString(() => ctxAny?.root?.config?.baseDir);
     const raw = configuredDir ||
         process.env.DSH_BROWSER_ARTIFACT_DIR ||
         (hostBaseDir ? path.join(hostBaseDir, 'artifacts', 'dsh-browser') : undefined) ||
@@ -46,10 +77,10 @@ export function resolveDefaultArtifactDir(configuredDir, ctx) {
     return path.resolve(raw);
 }
 function getAttachmentsService(ctx) {
-    return ctx.attachments ?? ctx.get?.('attachments');
+    return getHostService(ctx, 'attachments');
 }
 function getLlmService(ctx) {
-    return ctx.llm ?? ctx.get?.('llm');
+    return getHostService(ctx, 'llm');
 }
 async function tryRegisterImageAttachment(ctx, screenshotPath) {
     if (!screenshotPath || !fs.existsSync(screenshotPath))
@@ -81,7 +112,7 @@ function renderToolContent(textSummary, imageAttachment) {
 }
 function resolveSubagentPlanner(ctx, config, exec) {
     if (config.customPlanner) {
-        return config.customPlanner;
+        return { planner: config.customPlanner, plannerMode: 'custom' };
     }
     // 1. Prefer DSH 0.2 native `ctx.llm` service if available and a model route is known
     const llm = getLlmService(ctx);
@@ -91,25 +122,34 @@ function resolveSubagentPlanner(ctx, config, exec) {
         const provider = config.hostProvider || agentSelection?.provider;
         const model = config.hostModel || agentSelection?.model;
         if (provider && model) {
-            return createDshHostLlmPlanner({
-                llm,
-                attachments: getAttachmentsService(ctx),
-                provider,
-                model,
-            });
+            return {
+                planner: createDshHostLlmPlanner({
+                    llm,
+                    attachments: getAttachmentsService(ctx),
+                    provider,
+                    model,
+                }),
+                plannerMode: 'host-ctx-llm',
+            };
         }
     }
     // 2. Next check explicit OpenAI-compatible Vision API key
     const apiKey = config.visionApiKey || process.env.DSH_VISION_API_KEY;
     if (apiKey) {
-        return createOpenAIVisionPlanner({
-            apiKey,
-            baseUrl: config.visionBaseUrl || process.env.DSH_VISION_BASE_URL,
-            model: config.visionModel || process.env.DSH_VISION_MODEL,
-        });
+        return {
+            planner: createOpenAIVisionPlanner({
+                apiKey,
+                baseUrl: config.visionBaseUrl || process.env.DSH_VISION_BASE_URL,
+                model: config.visionModel || process.env.DSH_VISION_MODEL,
+            }),
+            plannerMode: 'external-vision-api',
+        };
     }
     // 3. Zero-config deterministic visual walkthrough fallback (never hard-crashes)
-    return createBuiltinInspectorPlanner();
+    return {
+        planner: createBuiltinInspectorPlanner(),
+        plannerMode: 'builtin-inspector',
+    };
 }
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
@@ -173,7 +213,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             const style = args.cursor_preset
                 ? { ...activeCursorStyle, preset: args.cursor_preset }
                 : activeCursorStyle;
-            const planner = resolveSubagentPlanner(ctx, config, exec);
+            const { planner, plannerMode } = resolveSubagentPlanner(ctx, config, exec);
             const res = await runner.runTask({
                 role: String(args.role || 'Browser Subagent'),
                 taskPrompt: String(args.task_prompt),
@@ -197,6 +237,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             return toLosslessJson({
                 status: res.status,
                 subagent_id: res.subagentId,
+                planner_mode: plannerMode,
                 host_facts_block: res.hostFactsBlock,
                 subagent_report: res.subagentReport,
                 approval_card: res.approvalCard ?? null,
