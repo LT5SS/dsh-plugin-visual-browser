@@ -79,6 +79,8 @@ export interface BrowserSessionOptions {
     backgroundSilent?: boolean;
     /** Initial customizable virtual cursor & trail style */
     cursorStyle?: VirtualCursorStyleConfig;
+    /** Enable page beforeunload confirmation guard while tasks are active (default: false) */
+    unloadGuard?: boolean;
 }
 export interface Point2D {
     x: number;
@@ -97,6 +99,16 @@ export interface ClickActionResult extends Point2D {
     blocked?: 'PLUGIN_UI_LAYER';
     hit?: string;
     element?: string;
+    hint?: string;
+}
+export interface DragActionResult {
+    ok: boolean;
+    from: Point2D;
+    to: Point2D;
+    steps: number;
+    blocked?: 'PLUGIN_UI_LAYER';
+    hit?: string;
+    at?: Point2D;
     hint?: string;
 }
 export interface MotionOptions {

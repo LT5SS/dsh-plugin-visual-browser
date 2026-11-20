@@ -1,22 +1,31 @@
 import type { Page } from 'playwright-core';
-import type { ClickActionResult, ClickHitTestResult, MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
+import type { ClickActionResult, ClickHitTestResult, DragActionResult, MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
 export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
 export declare class HumanMotionController {
     private page;
     private pos;
     private cursorStyle;
     private showTakeoverControl;
+    private takeoverMode;
     private shouldAbort?;
     private takeoverRole;
     private takeoverHotkey;
+    private unloadGuardEnabled;
     constructor(page: Page, initialStyle?: VirtualCursorStyleConfig, opts?: {
         showTakeoverControl?: boolean;
         takeoverHotkey?: string;
+        unloadGuard?: boolean;
         shouldAbort?: () => boolean;
     });
     getPosition(): Point2D;
+    setPosition(x: number, y: number): void;
+    resetPosition(x?: number, y?: number): void;
+    syncPositionFromPage(): Promise<Point2D>;
     getCursorStyle(): VirtualCursorStyleConfig;
-    ensureCursorHUD(): Promise<void>;
+    updateActiveStyleFromPage(style: VirtualCursorStyleConfig): void;
+    isUnloadGuardEnabled(): boolean;
+    setUnloadGuard(on: boolean): Promise<void>;
+    ensureCursorHUD(syncActiveState?: boolean): Promise<void>;
     setTakeoverHotkey(hotkey: string): Promise<void>;
     setTakeoverState(mode: TakeoverControlMode, roleLabel?: string): Promise<void>;
     resetTakeoverRequest(): Promise<void>;
@@ -38,6 +47,14 @@ export declare class HumanMotionController {
     hitTestAt(x: number, y: number): Promise<ClickHitTestResult>;
     clickAt(x: number, y: number, opts?: MotionOptions): Promise<ClickActionResult>;
     clickSelector(selector: string, opts?: MotionOptions): Promise<ClickActionResult>;
+    resolvePoint(target: string | Point2D): Promise<Point2D>;
+    /**
+     * Performs a physical mouse drag (`move(from)` -> `down()` -> Bezier interpolation -> `up()`),
+     * rendering press-shrink, thickened reversed-gradient drag trail, origin anchor ring, and drop state.
+     */
+    drag(from: Point2D, to: Point2D, opts?: MotionOptions & {
+        onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
+    }): Promise<DragActionResult>;
     smoothScroll(deltaY: number, frames?: number, durationMs?: number): Promise<void>;
     private syncHUD;
 }

@@ -1,4 +1,5 @@
-import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
+import { buildVirtualCursorInitScript, resolveCursorStyle } from '../injected/virtual-cursor.js';
+import { mergeCursorStyleConfig } from '../settings-store.js';
 import { safeEvaluate } from '../sampler/page-snapshot.js';
 function easeInOutCubic(t) {
     return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -19,37 +20,96 @@ export class HumanMotionController {
     pos = { x: 120, y: 120 };
     cursorStyle;
     showTakeoverControl;
+    takeoverMode;
     shouldAbort;
     takeoverRole = '';
     takeoverHotkey;
+    unloadGuardEnabled = false;
     constructor(page, initialStyle = {}, opts = {}) {
         this.page = page;
-        this.cursorStyle = initialStyle;
+        this.cursorStyle = resolveCursorStyle(initialStyle);
         this.showTakeoverControl = Boolean(opts.showTakeoverControl);
+        this.takeoverMode = this.showTakeoverControl ? 'running' : 'hidden';
         this.takeoverHotkey = typeof opts.takeoverHotkey === 'string' ? opts.takeoverHotkey : 'F8';
+        this.unloadGuardEnabled = Boolean(opts.unloadGuard);
         this.shouldAbort = opts.shouldAbort;
     }
     getPosition() {
         return { ...this.pos };
     }
+    setPosition(x, y) {
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+            this.pos = { x, y };
+        }
+    }
+    resetPosition(x = 120, y = 120) {
+        this.pos = { x, y };
+    }
+    async syncPositionFromPage() {
+        const pagePos = await safeEvaluate(this.page, () => {
+            const st = window.__dshCursorAPI?.getState?.();
+            if (st && Number.isFinite(st.x) && Number.isFinite(st.y)) {
+                return { x: Math.round(st.x), y: Math.round(st.y) };
+            }
+            return null;
+        }, null, 0).catch(() => null);
+        if (pagePos) {
+            this.pos = pagePos;
+        }
+        return { ...this.pos };
+    }
     getCursorStyle() {
         return { ...this.cursorStyle };
     }
-    async ensureCursorHUD() {
-        const initScript = buildVirtualCursorInitScript(this.cursorStyle, {
+    updateActiveStyleFromPage(style) {
+        if (style && typeof style === 'object') {
+            this.cursorStyle = resolveCursorStyle(style);
+        }
+    }
+    isUnloadGuardEnabled() {
+        return this.unloadGuardEnabled;
+    }
+    async setUnloadGuard(on) {
+        this.unloadGuardEnabled = Boolean(on);
+        if (this.unloadGuardEnabled) {
+            await this.ensureCursorHUD(false);
+        }
+        await safeEvaluate(this.page, (flag) => {
+            window.__dshCursorAPI?.setUnloadGuard?.(flag);
+        }, undefined, { arg: this.unloadGuardEnabled, retries: 0 });
+    }
+    async ensureCursorHUD(syncActiveState = false) {
+        const resolvedStyle = resolveCursorStyle(this.cursorStyle);
+        const initScript = buildVirtualCursorInitScript(resolvedStyle, {
             showTakeoverControl: this.showTakeoverControl,
             roleLabel: this.takeoverRole,
             takeoverHotkey: this.takeoverHotkey,
+            unloadGuard: this.unloadGuardEnabled,
         });
-        await safeEvaluate(this.page, (script) => {
+        await safeEvaluate(this.page, (arg) => {
             if (!window.__dshVirtualCursorInstalled) {
-                (0, eval)(script);
+                (0, eval)(arg.script);
+                return;
             }
-        }, undefined, { arg: initScript, retries: 1 });
+            if (arg.sync && window.__dshCursorAPI) {
+                window.__dshCursorAPI.setStyle?.(arg.style, { fromHost: true });
+                window.__dshCursorAPI.setTakeoverHotkey?.(arg.hotkey);
+                window.__dshCursorAPI.setUnloadGuard?.(arg.unloadGuard);
+            }
+        }, undefined, {
+            arg: {
+                script: initScript,
+                sync: syncActiveState,
+                style: resolvedStyle,
+                hotkey: this.takeoverHotkey,
+                unloadGuard: this.unloadGuardEnabled,
+            },
+            retries: 1,
+        });
     }
     async setTakeoverHotkey(hotkey) {
         this.takeoverHotkey = hotkey;
-        await this.ensureCursorHUD();
+        await this.ensureCursorHUD(false);
         await safeEvaluate(this.page, (hk) => {
             window.__dshCursorAPI?.setTakeoverHotkey?.(hk);
         }, undefined, { arg: hotkey, retries: 0 });
@@ -58,8 +118,9 @@ export class HumanMotionController {
         if (typeof roleLabel === 'string') {
             this.takeoverRole = roleLabel;
         }
+        this.takeoverMode = mode;
         this.showTakeoverControl = mode !== 'hidden';
-        await this.ensureCursorHUD();
+        await this.ensureCursorHUD(false);
         await safeEvaluate(this.page, ({ m, role }) => {
             window.__dshCursorAPI?.setTakeoverState(m, role);
         }, undefined, { arg: { m: mode, role: this.takeoverRole }, retries: 0 });
@@ -73,11 +134,11 @@ export class HumanMotionController {
      * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).
      */
     async setCursorStyle(style) {
-        this.cursorStyle = { ...this.cursorStyle, ...style };
-        await this.ensureCursorHUD();
+        this.cursorStyle = mergeCursorStyleConfig(this.cursorStyle, style);
+        await this.ensureCursorHUD(false);
         await safeEvaluate(this.page, (cfg) => {
-            window.__dshCursorAPI?.setStyle(cfg);
-        }, undefined, { arg: style, retries: 1 });
+            window.__dshCursorAPI?.setStyle(cfg, { fromHost: true });
+        }, undefined, { arg: this.cursorStyle, retries: 1 });
     }
     async clearTrail() {
         await this.ensureCursorHUD();
@@ -316,8 +377,116 @@ export class HumanMotionController {
             label: opts.label ?? `CLICK ${selector}`,
         });
     }
+    async resolvePoint(target) {
+        if (typeof target !== 'string') {
+            return { x: target.x, y: target.y };
+        }
+        const loc = this.page.locator(target).first();
+        await loc.waitFor({ state: 'visible', timeout: 8000 });
+        const box = await loc.boundingBox();
+        if (!box) {
+            throw new Error(`Cannot resolve boundingBox for target: ${target}`);
+        }
+        return {
+            x: Math.round(box.x + box.width * 0.5),
+            y: Math.round(box.y + box.height * 0.5),
+        };
+    }
+    /**
+     * Performs a physical mouse drag (`move(from)` -> `down()` -> Bezier interpolation -> `up()`),
+     * rendering press-shrink, thickened reversed-gradient drag trail, origin anchor ring, and drop state.
+     */
+    async drag(from, to, opts = {}) {
+        await this.ensureCursorHUD(false);
+        await this.moveTo(from.x, from.y, {
+            steps: 8,
+            durationMs: 120,
+            label: 'AIM DRAG',
+        });
+        const hit = await this.hitTestAt(from.x, from.y);
+        if (hit.hitsPluginUi) {
+            await this.syncHUD(from.x, from.y, 'BLOCKED · PLUGIN_UI_LAYER');
+            return {
+                ok: false,
+                from,
+                to,
+                steps: 0,
+                blocked: 'PLUGIN_UI_LAYER',
+                hit: hit.topElement,
+                at: from,
+                hint: '该位置被工具 UI 覆盖，请滚动或用 #ref',
+            };
+        }
+        const steps = Math.max(2, Math.round(opts.steps ?? 12));
+        const durationMs = opts.durationMs ?? Math.max(220, steps * 22);
+        const curvature = opts.arcCurvature ?? 0.08;
+        const p0 = { x: from.x, y: from.y };
+        const p3 = { x: to.x, y: to.y };
+        const dx = p3.x - p0.x;
+        const dy = p3.y - p0.y;
+        const dist = Math.hypot(dx, dy);
+        const nx = dist > 0 ? -dy / dist : 0;
+        const ny = dist > 0 ? dx / dist : 0;
+        const arcOffset = dist * curvature;
+        const p1 = {
+            x: p0.x + dx * 0.3 + nx * arcOffset,
+            y: p0.y + dy * 0.3 + ny * arcOffset,
+        };
+        const p2 = {
+            x: p0.x + dx * 0.72 + nx * (arcOffset * 0.55),
+            y: p0.y + dy * 0.72 + ny * (arcOffset * 0.55),
+        };
+        const stepDelay = Math.max(6, Math.round(durationMs / steps));
+        const dragLabel = `DRAG (${Math.round(from.x)},${Math.round(from.y)}) → (${Math.round(to.x)},${Math.round(to.y)})`;
+        let mouseIsDown = false;
+        try {
+            await this.page.mouse.move(from.x, from.y);
+            await this.page.mouse.down();
+            mouseIsDown = true;
+            this.pos = { x: from.x, y: from.y };
+            await safeEvaluate(this.page, ({ px, py, lbl }) => {
+                window.__dshCursorAPI?.dragStart?.(px, py, lbl);
+            }, undefined, { arg: { px: from.x, py: from.y, lbl: dragLabel }, retries: 0 });
+            await opts.onPhase?.('down');
+            const midStep = Math.max(1, Math.ceil(steps / 2));
+            for (let i = 1; i <= steps; i++) {
+                if (this.shouldAbort?.())
+                    break;
+                const progress = easeInOutCubic(i / steps);
+                const pt = cubicBezier(p0, p1, p2, p3, progress);
+                this.pos = pt;
+                await this.page.mouse.move(pt.x, pt.y);
+                await safeEvaluate(this.page, ({ px, py, tx, ty }) => {
+                    window.__dshCursorAPI?.dragMove?.(px, py, tx, ty);
+                }, undefined, { arg: { px: pt.x, py: pt.y, tx: to.x, ty: to.y }, retries: 0 });
+                if (i === midStep) {
+                    await opts.onPhase?.('dragging');
+                }
+                await this.page.waitForTimeout(stepDelay);
+            }
+            await this.page.mouse.up();
+            mouseIsDown = false;
+            const dropLabel = `DROP (${Math.round(this.pos.x)},${Math.round(this.pos.y)})`;
+            await safeEvaluate(this.page, ({ px, py, lbl }) => {
+                window.__dshCursorAPI?.dragEnd?.(px, py, lbl);
+            }, undefined, { arg: { px: this.pos.x, py: this.pos.y, lbl: dropLabel }, retries: 0 });
+            await opts.onPhase?.('up');
+            await this.page.waitForTimeout(80);
+            return {
+                ok: true,
+                from: { ...from },
+                to: { ...this.pos },
+                steps,
+            };
+        }
+        finally {
+            if (mouseIsDown) {
+                await this.page.mouse.up().catch(() => { });
+            }
+        }
+    }
     async smoothScroll(deltaY, frames = 16, durationMs = 360) {
-        await this.ensureCursorHUD();
+        await this.ensureCursorHUD(false);
         const delay = Math.max(8, Math.round(durationMs / frames));
         let accumulated = 0;
         for (let i = 1; i <= frames; i++) {
@@ -328,7 +497,10 @@ export class HumanMotionController {
             accumulated = targetNow;
             await this.page.mouse.wheel(0, stepDelta);
             const dirSign = deltaY >= 0 ? '+' : '';
-            await this.syncHUD(this.pos.x, this.pos.y, `SCROLL ${dirSign}${Math.round(accumulated)}px`);
+            const scrollLabel = `SCROLL ${dirSign}${Math.round(accumulated)}px`;
+            await safeEvaluate(this.page, ({ dy, lbl }) => {
+                window.__dshCursorAPI?.scrollEffect?.(dy, lbl);
+            }, undefined, { arg: { dy: stepDelta || deltaY, lbl: scrollLabel }, retries: 0 });
             await this.page.waitForTimeout(delay);
         }
     }

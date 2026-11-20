@@ -1,5 +1,6 @@
 import { type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { BrowserRuntimeMode, BrowserWindowBounds, BrowserWindowMode, VirtualCursorStyleConfig } from './driver/types.js';
+import { type PersistedVisualBrowserSettings } from './settings-store.js';
 import { BrowserSubagentRunner, type SubagentPlanner } from './subagent/runner.js';
 export * from './driver/types.js';
 export * from './driver/browser-session.js';
@@ -9,6 +10,7 @@ export * from './injected/virtual-cursor.js';
 export * from './sampler/telemetry-collector.js';
 export * from './sampler/page-snapshot.js';
 export * from './tools/atomic-tools.js';
+export * from './settings-store.js';
 export * from './subagent/host-facts.js';
 export * from './subagent/sliding-context.js';
 export * from './subagent/runner.js';
@@ -19,6 +21,7 @@ export interface DshCordisContext {
     };
     llm?: any;
     attachments?: any;
+    webServer?: any;
     get?: (name: string) => any;
     inject?: (deps: string[] | Record<string, any>, callback: (ctx: any) => void) => any;
     effect?: (fn: () => (() => void) | void, label?: string) => any;
@@ -27,6 +30,7 @@ export interface DshCordisContext {
 export interface OptionalHostServices {
     llm?: any;
     attachments?: any;
+    webServer?: any;
 }
 export type PlannerMode = 'custom' | 'host-ctx-llm' | 'host-ctx-llm-fallback' | 'external-vision-api' | 'external-vision-api-fallback' | 'builtin-inspector';
 export interface VolatileRef<T> {
@@ -94,9 +98,27 @@ export declare function resolveHostLlmRoute(config: VisualBrowserPluginConfig, e
  * Resolves which planner backend will handle `browser_subagent_run` given config and bound host services.
  */
 export declare function resolvePlannerMode(config: VisualBrowserPluginConfig, hostServices?: OptionalHostServices, exec?: Partial<ToolRunContext>): PlannerMode;
+export interface EffectiveVisualBrowserSettings {
+    cursorStyle: VirtualCursorStyleConfig;
+    windowMode: BrowserWindowMode;
+    keepWindowOpen: boolean;
+    showTakeoverControl: boolean;
+    takeoverHotkey: string;
+    settingsFile: string;
+}
 export interface LiveVisualBrowserSettingsBridge {
     syncFromSettingsDocument: () => void;
+    getEffectiveSettings: () => EffectiveVisualBrowserSettings;
+    saveSettings: (patch: Partial<PersistedVisualBrowserSettings>, opts?: {
+        persist?: boolean;
+    }) => EffectiveVisualBrowserSettings;
 }
+/**
+ * Builds the Node HTTP handler mounted at `/__dsh_visual_browser` (serving `/settings`)
+ * so the DSH browser settings panel can read and persist settings.json even when the host
+ * does not inject a writable configForm provider.
+ */
+export declare function createSettingsHttpHandler(bridge: Pick<LiveVisualBrowserSettingsBridge, 'getEffectiveSettings' | 'saveSettings'>): (req: any, res: any) => Promise<void>;
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */

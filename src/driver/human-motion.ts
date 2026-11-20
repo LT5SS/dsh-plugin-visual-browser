@@ -2,11 +2,13 @@ import type { Page } from 'playwright-core';
 import type {
   ClickActionResult,
   ClickHitTestResult,
+  DragActionResult,
   MotionOptions,
   Point2D,
   VirtualCursorStyleConfig,
 } from './types.js';
-import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
+import { buildVirtualCursorInitScript, resolveCursorStyle } from '../injected/virtual-cursor.js';
+import { mergeCursorStyleConfig } from '../settings-store.js';
 import { safeEvaluate } from '../sampler/page-snapshot.js';
 
 export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
@@ -33,19 +35,28 @@ export class HumanMotionController {
   private pos: Point2D = { x: 120, y: 120 };
   private cursorStyle: VirtualCursorStyleConfig;
   private showTakeoverControl: boolean;
+  private takeoverMode: TakeoverControlMode;
   private shouldAbort?: () => boolean;
   private takeoverRole = '';
   private takeoverHotkey: string;
+  private unloadGuardEnabled = false;
 
   constructor(
     page: Page,
     initialStyle: VirtualCursorStyleConfig = {},
-    opts: { showTakeoverControl?: boolean; takeoverHotkey?: string; shouldAbort?: () => boolean } = {}
+    opts: {
+      showTakeoverControl?: boolean;
+      takeoverHotkey?: string;
+      unloadGuard?: boolean;
+      shouldAbort?: () => boolean;
+    } = {}
   ) {
     this.page = page;
-    this.cursorStyle = initialStyle;
+    this.cursorStyle = resolveCursorStyle(initialStyle);
     this.showTakeoverControl = Boolean(opts.showTakeoverControl);
+    this.takeoverMode = this.showTakeoverControl ? 'running' : 'hidden';
     this.takeoverHotkey = typeof opts.takeoverHotkey === 'string' ? opts.takeoverHotkey : 'F8';
+    this.unloadGuardEnabled = Boolean(opts.unloadGuard);
     this.shouldAbort = opts.shouldAbort;
   }
 
@@ -53,31 +64,108 @@ export class HumanMotionController {
     return { ...this.pos };
   }
 
+  public setPosition(x: number, y: number): void {
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      this.pos = { x, y };
+    }
+  }
+
+  public resetPosition(x = 120, y = 120): void {
+    this.pos = { x, y };
+  }
+
+  public async syncPositionFromPage(): Promise<Point2D> {
+    const pagePos = await safeEvaluate<Point2D | null>(
+      this.page,
+      () => {
+        const st = (window as any).__dshCursorAPI?.getState?.();
+        if (st && Number.isFinite(st.x) && Number.isFinite(st.y)) {
+          return { x: Math.round(st.x), y: Math.round(st.y) };
+        }
+        return null;
+      },
+      null,
+      0
+    ).catch(() => null);
+    if (pagePos) {
+      this.pos = pagePos;
+    }
+    return { ...this.pos };
+  }
+
   public getCursorStyle(): VirtualCursorStyleConfig {
     return { ...this.cursorStyle };
   }
 
-  public async ensureCursorHUD(): Promise<void> {
-    const initScript = buildVirtualCursorInitScript(this.cursorStyle, {
+  public updateActiveStyleFromPage(style: VirtualCursorStyleConfig): void {
+    if (style && typeof style === 'object') {
+      this.cursorStyle = resolveCursorStyle(style);
+    }
+  }
+
+  public isUnloadGuardEnabled(): boolean {
+    return this.unloadGuardEnabled;
+  }
+
+  public async setUnloadGuard(on: boolean): Promise<void> {
+    this.unloadGuardEnabled = Boolean(on);
+    if (this.unloadGuardEnabled) {
+      await this.ensureCursorHUD(false);
+    }
+    await safeEvaluate(
+      this.page,
+      (flag: boolean) => {
+        (window as any).__dshCursorAPI?.setUnloadGuard?.(flag);
+      },
+      undefined,
+      { arg: this.unloadGuardEnabled, retries: 0 }
+    );
+  }
+
+  public async ensureCursorHUD(syncActiveState = false): Promise<void> {
+    const resolvedStyle = resolveCursorStyle(this.cursorStyle);
+    const initScript = buildVirtualCursorInitScript(resolvedStyle, {
       showTakeoverControl: this.showTakeoverControl,
       roleLabel: this.takeoverRole,
       takeoverHotkey: this.takeoverHotkey,
+      unloadGuard: this.unloadGuardEnabled,
     });
     await safeEvaluate(
       this.page,
-      (script: string) => {
+      (arg: {
+        script: string;
+        sync: boolean;
+        style: VirtualCursorStyleConfig;
+        hotkey: string;
+        unloadGuard: boolean;
+      }) => {
         if (!(window as any).__dshVirtualCursorInstalled) {
-          (0, eval)(script);
+          (0, eval)(arg.script);
+          return;
+        }
+        if (arg.sync && (window as any).__dshCursorAPI) {
+          (window as any).__dshCursorAPI.setStyle?.(arg.style, { fromHost: true });
+          (window as any).__dshCursorAPI.setTakeoverHotkey?.(arg.hotkey);
+          (window as any).__dshCursorAPI.setUnloadGuard?.(arg.unloadGuard);
         }
       },
       undefined,
-      { arg: initScript, retries: 1 }
+      {
+        arg: {
+          script: initScript,
+          sync: syncActiveState,
+          style: resolvedStyle,
+          hotkey: this.takeoverHotkey,
+          unloadGuard: this.unloadGuardEnabled,
+        },
+        retries: 1,
+      }
     );
   }
 
   public async setTakeoverHotkey(hotkey: string): Promise<void> {
     this.takeoverHotkey = hotkey;
-    await this.ensureCursorHUD();
+    await this.ensureCursorHUD(false);
     await safeEvaluate(
       this.page,
       (hk: string) => {
@@ -92,8 +180,9 @@ export class HumanMotionController {
     if (typeof roleLabel === 'string') {
       this.takeoverRole = roleLabel;
     }
+    this.takeoverMode = mode;
     this.showTakeoverControl = mode !== 'hidden';
-    await this.ensureCursorHUD();
+    await this.ensureCursorHUD(false);
     await safeEvaluate(
       this.page,
       ({ m, role }: { m: TakeoverControlMode; role: string }) => {
@@ -119,15 +208,15 @@ export class HumanMotionController {
    * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).
    */
   public async setCursorStyle(style: VirtualCursorStyleConfig): Promise<void> {
-    this.cursorStyle = { ...this.cursorStyle, ...style };
-    await this.ensureCursorHUD();
+    this.cursorStyle = mergeCursorStyleConfig(this.cursorStyle, style);
+    await this.ensureCursorHUD(false);
     await safeEvaluate(
       this.page,
       (cfg: VirtualCursorStyleConfig) => {
-        (window as any).__dshCursorAPI?.setStyle(cfg);
+        (window as any).__dshCursorAPI?.setStyle(cfg, { fromHost: true });
       },
       undefined,
-      { arg: style, retries: 1 }
+      { arg: this.cursorStyle, retries: 1 }
     );
   }
 
@@ -400,8 +489,147 @@ export class HumanMotionController {
     });
   }
 
+  public async resolvePoint(target: string | Point2D): Promise<Point2D> {
+    if (typeof target !== 'string') {
+      return { x: target.x, y: target.y };
+    }
+    const loc = this.page.locator(target).first();
+    await loc.waitFor({ state: 'visible', timeout: 8000 });
+    const box = await loc.boundingBox();
+    if (!box) {
+      throw new Error(`Cannot resolve boundingBox for target: ${target}`);
+    }
+    return {
+      x: Math.round(box.x + box.width * 0.5),
+      y: Math.round(box.y + box.height * 0.5),
+    };
+  }
+
+  /**
+   * Performs a physical mouse drag (`move(from)` -> `down()` -> Bezier interpolation -> `up()`),
+   * rendering press-shrink, thickened reversed-gradient drag trail, origin anchor ring, and drop state.
+   */
+  public async drag(
+    from: Point2D,
+    to: Point2D,
+    opts: MotionOptions & {
+      onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
+    } = {}
+  ): Promise<DragActionResult> {
+    await this.ensureCursorHUD(false);
+    await this.moveTo(from.x, from.y, {
+      steps: 8,
+      durationMs: 120,
+      label: 'AIM DRAG',
+    });
+
+    const hit = await this.hitTestAt(from.x, from.y);
+    if (hit.hitsPluginUi) {
+      await this.syncHUD(from.x, from.y, 'BLOCKED · PLUGIN_UI_LAYER');
+      return {
+        ok: false,
+        from,
+        to,
+        steps: 0,
+        blocked: 'PLUGIN_UI_LAYER',
+        hit: hit.topElement,
+        at: from,
+        hint: '该位置被工具 UI 覆盖，请滚动或用 #ref',
+      };
+    }
+
+    const steps = Math.max(2, Math.round(opts.steps ?? 12));
+    const durationMs = opts.durationMs ?? Math.max(220, steps * 22);
+    const curvature = opts.arcCurvature ?? 0.08;
+
+    const p0: Point2D = { x: from.x, y: from.y };
+    const p3: Point2D = { x: to.x, y: to.y };
+    const dx = p3.x - p0.x;
+    const dy = p3.y - p0.y;
+    const dist = Math.hypot(dx, dy);
+    const nx = dist > 0 ? -dy / dist : 0;
+    const ny = dist > 0 ? dx / dist : 0;
+    const arcOffset = dist * curvature;
+
+    const p1: Point2D = {
+      x: p0.x + dx * 0.3 + nx * arcOffset,
+      y: p0.y + dy * 0.3 + ny * arcOffset,
+    };
+    const p2: Point2D = {
+      x: p0.x + dx * 0.72 + nx * (arcOffset * 0.55),
+      y: p0.y + dy * 0.72 + ny * (arcOffset * 0.55),
+    };
+    const stepDelay = Math.max(6, Math.round(durationMs / steps));
+    const dragLabel = `DRAG (${Math.round(from.x)},${Math.round(from.y)}) → (${Math.round(to.x)},${Math.round(to.y)})`;
+
+    let mouseIsDown = false;
+    try {
+      await this.page.mouse.move(from.x, from.y);
+      await this.page.mouse.down();
+      mouseIsDown = true;
+      this.pos = { x: from.x, y: from.y };
+
+      await safeEvaluate(
+        this.page,
+        ({ px, py, lbl }: { px: number; py: number; lbl: string }) => {
+          (window as any).__dshCursorAPI?.dragStart?.(px, py, lbl);
+        },
+        undefined,
+        { arg: { px: from.x, py: from.y, lbl: dragLabel }, retries: 0 }
+      );
+      await opts.onPhase?.('down');
+
+      const midStep = Math.max(1, Math.ceil(steps / 2));
+      for (let i = 1; i <= steps; i++) {
+        if (this.shouldAbort?.()) break;
+        const progress = easeInOutCubic(i / steps);
+        const pt = cubicBezier(p0, p1, p2, p3, progress);
+        this.pos = pt;
+
+        await this.page.mouse.move(pt.x, pt.y);
+        await safeEvaluate(
+          this.page,
+          ({ px, py, tx, ty }: { px: number; py: number; tx: number; ty: number }) => {
+            (window as any).__dshCursorAPI?.dragMove?.(px, py, tx, ty);
+          },
+          undefined,
+          { arg: { px: pt.x, py: pt.y, tx: to.x, ty: to.y }, retries: 0 }
+        );
+        if (i === midStep) {
+          await opts.onPhase?.('dragging');
+        }
+        await this.page.waitForTimeout(stepDelay);
+      }
+
+      await this.page.mouse.up();
+      mouseIsDown = false;
+      const dropLabel = `DROP (${Math.round(this.pos.x)},${Math.round(this.pos.y)})`;
+      await safeEvaluate(
+        this.page,
+        ({ px, py, lbl }: { px: number; py: number; lbl: string }) => {
+          (window as any).__dshCursorAPI?.dragEnd?.(px, py, lbl);
+        },
+        undefined,
+        { arg: { px: this.pos.x, py: this.pos.y, lbl: dropLabel }, retries: 0 }
+      );
+      await opts.onPhase?.('up');
+      await this.page.waitForTimeout(80);
+
+      return {
+        ok: true,
+        from: { ...from },
+        to: { ...this.pos },
+        steps,
+      };
+    } finally {
+      if (mouseIsDown) {
+        await this.page.mouse.up().catch(() => {});
+      }
+    }
+  }
+
   public async smoothScroll(deltaY: number, frames = 16, durationMs = 360): Promise<void> {
-    await this.ensureCursorHUD();
+    await this.ensureCursorHUD(false);
     const delay = Math.max(8, Math.round(durationMs / frames));
     let accumulated = 0;
 
@@ -413,7 +641,15 @@ export class HumanMotionController {
 
       await this.page.mouse.wheel(0, stepDelta);
       const dirSign = deltaY >= 0 ? '+' : '';
-      await this.syncHUD(this.pos.x, this.pos.y, `SCROLL ${dirSign}${Math.round(accumulated)}px`);
+      const scrollLabel = `SCROLL ${dirSign}${Math.round(accumulated)}px`;
+      await safeEvaluate(
+        this.page,
+        ({ dy, lbl }: { dy: number; lbl: string }) => {
+          (window as any).__dshCursorAPI?.scrollEffect?.(dy, lbl);
+        },
+        undefined,
+        { arg: { dy: stepDelta || deltaY, lbl: scrollLabel }, retries: 0 }
+      );
       await this.page.waitForTimeout(delay);
     }
   }

@@ -10,5 +10,6 @@ export declare function buildVirtualCursorInitScript(initialStyle?: VirtualCurso
     showTakeoverControl?: boolean;
     roleLabel?: string;
     takeoverHotkey?: string;
+    unloadGuard?: boolean;
 }): string;
 export declare const VIRTUAL_CURSOR_INIT_SCRIPT: string;

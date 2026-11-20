@@ -178,6 +178,7 @@ export class PageSnapshotSampler {
         detectedTechHints: [] as string[],
       },
       interactiveElements: [] as InteractiveElementNode[],
+      cursorState: null as Point2D | null,
     };
 
     const extracted = await safeEvaluate(
@@ -315,6 +316,12 @@ export class PageSnapshotSampler {
       if (document.querySelectorAll('canvas').length > 0) techHints.push('HTML5 Canvas 2D/WebGL');
       if (document.querySelectorAll('svg path').length > 25) techHints.push('High-Density SVG Animation');
 
+      const vcState = (window as any).__dshCursorAPI?.getState?.();
+      const cursorState =
+        vcState && Number.isFinite(vcState.x) && Number.isFinite(vcState.y)
+          ? { x: Math.round(vcState.x), y: Math.round(vcState.y) }
+          : null;
+
       return {
         scroll: {
           scrollX: sx,
@@ -344,6 +351,7 @@ export class PageSnapshotSampler {
           detectedTechHints: techHints,
         },
         interactiveElements: nodes,
+        cursorState,
       };
     },
       fallbackExtracted,
@@ -355,6 +363,10 @@ export class PageSnapshotSampler {
       }
     );
 
+    if (extracted.cursorState) {
+      this.session.motion.setPosition?.(extracted.cursorState.x, extracted.cursorState.y);
+    }
+
     // 2. Capture viewport screenshot with the Virtual Cursor HUD & Custom Trail
     try {
       await this.session.screenshot(screenshotPath);
@@ -363,11 +375,16 @@ export class PageSnapshotSampler {
       degradedReason = 'sampler degraded: navigation race';
     }
 
+    const syncedPos =
+      extracted.cursorState ??
+      (await this.session.motion.syncPositionFromPage?.()) ??
+      this.session.motion.getPosition();
+
     return {
       stepIndex: this.stepCounter,
       timestamp: new Date().toISOString(),
       screenshotPath,
-      cursorPosition: this.session.motion.getPosition(),
+      cursorPosition: syncedPos,
       scroll: extracted.scroll,
       domStats: extracted.domStats,
       interactiveElements: extracted.interactiveElements,

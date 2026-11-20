@@ -21,13 +21,17 @@ import {
   SUBAGENT_SYSTEM_PROMPT,
   apply,
   computeDefaultBackgroundWindowBounds,
+  createSettingsHttpHandler,
   extractHostStreamChunk,
+  loadPersistedSettings,
   parseJsonDecision,
   readVolatileValue,
   resolveBrowserWindowMode,
   resolveCursorStyle,
   resolvePlannerMode,
+  resolveSettingsFilePath,
   safeEvaluate,
+  savePersistedSettings,
   type DshCordisContext,
 } from '../src/index.js';
 
@@ -344,11 +348,22 @@ async function main() {
   assert.equal(asyncRes.hostServices.llm, undefined);
   assert.equal(asyncRes.hostServices.attachments, undefined);
   assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'builtin-inspector');
-  assert.equal(asyncHost.pendingInjects.length, 2, 'apply() must register 2 independent ctx.inject child fibers');
+  assert.equal(asyncHost.pendingInjects.length, 3, 'apply() must register 3 independent ctx.inject child fibers');
 
   const lateLlmStub = { stream: () => {} };
   const lateAttachmentsStub = createAttachmentsStub();
+  const registeredWebRoutes: Array<{ kind: string; path: string; handler: any }> = [];
+  let webRouteDisposed = false;
+  const lateWebServerStub = {
+    register(opts: { kind: string; path: string; handler: any }) {
+      registeredWebRoutes.push(opts);
+      return () => {
+        webRouteDisposed = true;
+      };
+    },
+  };
   let llmChildDisposer: (() => void) | undefined;
+  let webChildDisposer: (() => void) | undefined;
 
   for (const entry of asyncHost.pendingInjects) {
     if (entry.deps.includes('llm')) {
@@ -373,17 +388,37 @@ async function main() {
         ['attachments', 'effect']
       );
       entry.cb(subProxy);
+    } else if (entry.deps.includes('webServer')) {
+      const subProxy = createStrictScopedProxy(
+        {
+          webServer: lateWebServerStub,
+          effect: (fn: () => (() => void) | void) => {
+            const d = fn();
+            if (typeof d === 'function') webChildDisposer = d;
+            return d;
+          },
+        },
+        ['webServer', 'effect']
+      );
+      entry.cb(subProxy);
     }
   }
 
   assert.equal(asyncRes.hostServices.llm, lateLlmStub);
   assert.equal(asyncRes.hostServices.attachments, lateAttachmentsStub);
+  assert.equal(asyncRes.hostServices.webServer, lateWebServerStub);
+  assert.equal(registeredWebRoutes.length, 1);
+  assert.equal(registeredWebRoutes[0]?.path, '/__dsh_visual_browser');
   assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'host-ctx-llm');
   assert.ok(llmChildDisposer, 'llm secondary child fiber must register an unbind effect disposer');
+  assert.ok(webChildDisposer, 'webServer secondary child fiber must register an unbind effect disposer');
   llmChildDisposer!();
+  webChildDisposer!();
+  assert.equal(webRouteDisposed, true, 'Expected webServer route disposer to run on unbind');
   assert.equal(asyncRes.hostServices.llm, undefined);
+  assert.equal(asyncRes.hostServices.webServer, undefined);
   assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'builtin-inspector');
-  console.log('[Strict DSH 0.2 Contract] Verified async ctx.inject late-binding & child-fiber unbind!');
+  console.log('[Strict DSH 0.2 Contract] Verified async ctx.inject late-binding (llm/attachments/webServer) & child-fiber unbind!');
 
   // 0e. TASK-v1.1.7 P0: safeEvaluate() navigation-race resilience & non-navigation error propagation
   let navCalls = 0;
@@ -813,6 +848,7 @@ async function main() {
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
   const artifactDir = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test');
   fs.mkdirSync(artifactDir, { recursive: true });
+  fs.rmSync(path.join(artifactDir, 'settings.json'), { force: true });
 
   const srv = await startSilentStaticServer(distDir);
   let hostLlmCalls = 0;
@@ -1680,6 +1716,465 @@ async function main() {
       console.log('[Strict DSH 0.2 Contract] 5l Verified HUD badge viewport flip, 8px clamping & resize re-clamp!');
     } finally {
       await badgeSession.close();
+    }
+
+    // 0k / B2: settings.json persistence, restart-survival over cordis.yml, browser_set_cursor_trail write + HTTP endpoint
+    const persistArtDir = path.join(artifactDir, 'persist-settings-check');
+    fs.rmSync(persistArtDir, { recursive: true, force: true });
+    fs.mkdirSync(persistArtDir, { recursive: true });
+    const settingsPath = resolveSettingsFilePath(persistArtDir);
+
+    const persistHost1 = createCordisStrictCtx({ validateSchemas: false });
+    const persistRes1 = apply(persistHost1.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      artifactDir: persistArtDir,
+      cursorStyle: { preset: 'cyber-neon', pointerShape: 'arrow' },
+    });
+    allDisposers.push(...persistHost1.effectDisposers);
+    assert.ok(persistRes1.bridge, 'Expected LiveVisualBrowserSettingsBridge on apply() return');
+
+    // Verify HTTP settings endpoint GET + POST + OPTIONS against real Node http.Server
+    const handler = createSettingsHttpHandler(persistRes1.bridge!);
+    const RESTRICTED_FETCH_PORTS = new Set([
+      1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+    ]);
+    const httpSrv = http.createServer((req, res) => {
+      void handler(req, res);
+    });
+    let port = 0;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise<void>((r) => httpSrv.listen(0, '127.0.0.1', () => r()));
+      port = (httpSrv.address() as { port: number }).port;
+      if (!RESTRICTED_FETCH_PORTS.has(port)) break;
+      await new Promise<void>((r) => httpSrv.close(() => r()));
+    }
+    try {
+      const endpoint = `http://127.0.0.1:${port}/__dsh_visual_browser/settings`;
+      const optRes = await fetch(endpoint, { method: 'OPTIONS' });
+      assert.equal(optRes.status, 204);
+
+      const getRes1 = await (await fetch(endpoint)).json();
+      assert.equal(getRes1.ok, true);
+      assert.equal(getRes1.cursorStyle.pointerShape, 'arrow');
+
+      const postRes = await (
+        await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            persist: true,
+            cursorStyle: {
+              preset: 'custom',
+              pointerShape: 'star',
+              pointerColor: '#00f0ff',
+              pointerScale: 1.4,
+            },
+            takeoverHotkey: 'F7',
+          }),
+        })
+      ).json();
+      assert.equal(postRes.ok, true);
+      assert.equal(postRes.persisted, true);
+      assert.equal(postRes.cursorStyle.pointerShape, 'star');
+      assert.equal(postRes.takeoverHotkey, 'F7');
+      assert.ok(fs.existsSync(settingsPath), 'Expected settings.json to be written on disk');
+
+      // Simulate full DSH restart: fresh apply() with default cordis.yml config MUST load settings.json override!
+      const persistHost2 = createCordisStrictCtx({ validateSchemas: false });
+      const persistRes2 = apply(persistHost2.ctx, {
+        mode: 'auto',
+        windowMode: 'headless',
+        artifactDir: persistArtDir,
+        cursorStyle: { preset: 'cyber-neon', pointerShape: 'arrow' },
+      });
+      allDisposers.push(...persistHost2.effectDisposers);
+      const restartedEffective = persistRes2.bridge!.getEffectiveSettings();
+      assert.equal(restartedEffective.cursorStyle.pointerShape, 'star');
+      assert.equal(restartedEffective.cursorStyle.pointerColor, '#00f0ff');
+      assert.equal(restartedEffective.cursorStyle.pointerScale, 1.4);
+      assert.equal(restartedEffective.takeoverHotkey, 'F7');
+
+      const trailTool = persistHost2.registeredTools.get('browser_set_cursor_trail')!;
+      const trailSaveRes: any = await trailTool.execute(
+        { preset: 'comet-gold', pointer_shape: 'ring' },
+        fakeExec
+      );
+      assert.equal(trailSaveRes.persisted, true);
+      const reloadedDisk = loadPersistedSettings(settingsPath);
+      assert.equal(reloadedDisk?.cursorStyle?.preset, 'comet-gold');
+      assert.equal(reloadedDisk?.cursorStyle?.pointerShape, 'ring');
+      savePersistedSettings(settingsPath, { cursorStyle: { pointerShape: 'dot' } });
+      assert.equal(loadPersistedSettings(settingsPath)?.cursorStyle?.pointerShape, 'dot');
+    } finally {
+      await new Promise<void>((r) => httpSrv.close(() => r()));
+      await persistRes1.runner.closeAllSessions();
+    }
+    console.log('[Strict DSH 0.2 Contract] 0k Verified settings.json persistence, restart survival & HTTP settings API!');
+
+    // 5m. TASK-v1.2.5 A1/A2/A3: beforeunload guard, browser.on('disconnected') cleanup, and graceful SESSION_LOST / SESSION_NOT_FOUND resume
+    const guardSession = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+    }).start();
+    try {
+      await guardSession.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded');
+      await guardSession.motion.setUnloadGuard(true);
+      const preventedOn = await safeEvaluate(
+        guardSession.page,
+        () => {
+          const ev = new Event('beforeunload', { cancelable: true });
+          window.dispatchEvent(ev);
+          return {
+            defaultPrevented: ev.defaultPrevented,
+            active: (window as any).__dshCursorAPI?.isUnloadGuardActive?.(),
+          };
+        },
+        { defaultPrevented: false, active: false },
+        0
+      );
+      assert.equal(preventedOn.defaultPrevented, true, 'beforeunload must be prevented when unloadGuard is ON');
+      assert.equal(preventedOn.active, true);
+
+      // Navigating while unloadGuard is enabled must NOT hang or block programmatic navigation
+      await guardSession.navigate(`${srv.url}__layer-fixture.html?nav2=1`, 'domcontentloaded');
+      await guardSession.motion.setUnloadGuard(false);
+      const preventedOff = await safeEvaluate(
+        guardSession.page,
+        () => {
+          const ev = new Event('beforeunload', { cancelable: true });
+          window.dispatchEvent(ev);
+          return {
+            defaultPrevented: ev.defaultPrevented,
+            active: (window as any).__dshCursorAPI?.isUnloadGuardActive?.(),
+          };
+        },
+        { defaultPrevented: true, active: true },
+        0
+      );
+      assert.equal(preventedOff.defaultPrevented, false, 'beforeunload must NOT be prevented after setUnloadGuard(false)');
+      assert.equal(preventedOff.active, false);
+    } finally {
+      await guardSession.close();
+    }
+
+    // Simulated browser.emit('disconnected') while PAUSED -> clears pausedSessions, sharedSession, updates diagnostics.json, and resume returns SESSION_LOST
+    const lossArtifactDir = path.join(artifactDir, 'session-loss-check');
+    fs.rmSync(lossArtifactDir, { recursive: true, force: true });
+    fs.mkdirSync(lossArtifactDir, { recursive: true });
+    const lossHost = createCordisStrictCtx({ validateSchemas: false });
+    let lossSessionCaptured: BrowserSession | null = null;
+    const lossRes = apply(lossHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      artifactDir: lossArtifactDir,
+      customPlanner: async () => {
+        lossSessionCaptured = lossRes.runner.getSharedSession();
+        return {
+          type: 'pause_for_takeover',
+          blockReason: 'USER_TAKEOVER',
+          message: 'Pause to test browser disconnect handling',
+        };
+      },
+    });
+    allDisposers.push(...lossHost.effectDisposers);
+    const lossRunDef = lossHost.registeredTools.get('browser_subagent_run')!;
+    const lossResumeDef = lossHost.registeredTools.get('browser_subagent_resume')!;
+    try {
+      const pausedRun: any = await lossRunDef.execute(
+        { url: srv.url, role: 'Disconnect QA', task_prompt: 'Pause then simulate close', max_steps: 3, window_mode: 'headless' },
+        fakeExec
+      );
+      assert.equal(pausedRun.status, 'PAUSED_FOR_TAKEOVER');
+      assert.equal(lossRes.runner.getPausedSessionCount(), 1);
+      assert.ok(lossSessionCaptured);
+
+      // Guard must be active during PAUSED state
+      const pausedGuardActive = await safeEvaluate(
+        lossSessionCaptured!.page,
+        () => Boolean((window as any).__dshCursorAPI?.isUnloadGuardActive?.()),
+        false,
+        0
+      );
+      assert.equal(pausedGuardActive, true, 'Unload guard must be active while PAUSED_FOR_TAKEOVER');
+
+      // Disable guard before test disconnects synthetic event and emit 'disconnected' on real browser EventEmitter
+      await lossSessionCaptured!.motion.setUnloadGuard(false);
+      (lossSessionCaptured!.browser as any).emit('disconnected');
+
+      assert.equal(lossRes.runner.getPausedSessionCount(), 0, 'pausedSessions must clear on browser disconnected');
+      assert.equal(lossRes.runner.getSharedSession(), null, 'sharedSession must clear on browser disconnected');
+
+      const lostDiagPath = path.join(lossArtifactDir, pausedRun.subagent_id, 'diagnostics.json');
+      assert.ok(fs.existsSync(lostDiagPath), 'diagnostics.json must exist after disconnect');
+      const lostDiag = JSON.parse(fs.readFileSync(lostDiagPath, 'utf8'));
+      assert.equal(lostDiag.status, 'SESSION_LOST');
+      assert.ok(
+        Array.isArray(lostDiag.events) &&
+          lostDiag.events.some((e: any) => e.event === 'browser_disconnected' && e.reason === 'user_closed_window'),
+        'Expected browser_disconnected event inside diagnostics.json'
+      );
+
+      // Resume after disconnect must NOT throw and must pass output schema validation
+      const lostResumeVal: any = await lossResumeDef.execute({ subagent_id: pausedRun.subagent_id }, fakeExec);
+      assert.equal(validateJsonSchemaValue(lossResumeDef.output.schema, lostResumeVal).length, 0);
+      assert.equal(lostResumeVal.status, 'SESSION_LOST');
+      assert.equal(lostResumeVal.reason, 'browser_window_closed');
+      assert.ok(String(lostResumeVal.hint || '').includes('已关闭'));
+
+      // Direct paused entry with dead session (isAlive() === false) must also return SESSION_LOST cleanly
+      const fakeDeadSubId = 'subagent-dead-unit';
+      (lossRes.runner as any).pausedSessions.set(fakeDeadSubId, {
+        subagentId: fakeDeadSubId,
+        req: { role: 'Dead Stub', artifactDir: lossArtifactDir },
+        session: { isAlive: () => false },
+        tools: {},
+        hostFacts: {
+          getFacts: () => ({
+            subagentId: fakeDeadSubId,
+            role: 'Dead Stub',
+            visitedOrigins: [],
+            blockedOrigins: [],
+            screenshots: [],
+            latestScreenshot: null,
+            totalStepsExecuted: 0,
+            consoleErrorsCount: 0,
+            failedRequestsCount: 0,
+          }),
+          formatHostFactsBlock: () => '[BROWSER_HOST_FACTS]',
+        },
+        history: {
+          getStats: () => ({
+            maxRecentImages: 3,
+            totalSteps: 0,
+            totalImagesCaptured: 0,
+            activeImagesInContext: 0,
+            evictedImagesCount: 0,
+            totalImageBytesCaptured: 0,
+            activeImageBytesInContext: 0,
+            savedImageBytes: 0,
+            savingsPercent: 0,
+          }),
+        },
+        planner: async () => ({ type: 'complete', report: 'x' }),
+        nextStep: 1,
+        maxSteps: 3,
+      });
+      const deadResumeVal: any = await lossResumeDef.execute({ subagent_id: fakeDeadSubId }, fakeExec);
+      assert.equal(deadResumeVal.status, 'SESSION_LOST');
+      assert.equal(validateJsonSchemaValue(lossResumeDef.output.schema, deadResumeVal).length, 0);
+
+      // Unknown subagent_id must return SESSION_NOT_FOUND without throwing
+      const notFoundVal: any = await lossResumeDef.execute({ subagent_id: 'subagent-does-not-exist' }, fakeExec);
+      assert.equal(notFoundVal.status, 'SESSION_NOT_FOUND');
+      assert.equal(validateJsonSchemaValue(lossResumeDef.output.schema, notFoundVal).length, 0);
+      console.log('[Strict DSH 0.2 Contract] 5m Verified beforeunload guard, disconnect cleanup & SESSION_LOST/SESSION_NOT_FOUND!');
+    } finally {
+      await lossSessionCaptured?.browser.close().catch(() => {});
+      await lossRes.runner.closeAllSessions();
+    }
+
+    // 5n. B1 + B7: Runtime setStyle() persists across navigate() and HUD Virtual Cursor syncs with page badge on navigation
+    const styleSyncSession = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+    }).start();
+    try {
+      await styleSyncSession.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded');
+      await safeEvaluate(
+        styleSyncSession.page,
+        () => {
+          (window as any).__dshCursorAPI.setStyle({
+            pointerShape: 'star',
+            pointerColor: '#00f0ff',
+            pointerScale: 1.4,
+          });
+          (window as any).__dshCursorAPI.update(700, 80, 'PRE-NAV');
+        },
+        undefined,
+        0
+      );
+      await styleSyncSession.motion.setPosition(700, 80);
+
+      // Navigate to a different page -> star shape MUST persist and HUD coordinates MUST reset to match badge (120, 120)
+      await styleSyncSession.navigate(`${srv.url}__layer-fixture.html?page=2`, 'domcontentloaded');
+      const postNavState = await safeEvaluate(
+        styleSyncSession.page,
+        () => ({
+          d: document.getElementById('__dsh_vc_arrow_path__')?.getAttribute('d') ?? '',
+          badgeText: document.getElementById('__dsh_vc_badge__')?.textContent ?? '',
+          st: (window as any).__dshCursorAPI?.getState?.() ?? null,
+        }),
+        { d: '', badgeText: '', st: null as any },
+        0
+      );
+      assert.ok(postNavState.d.startsWith('M14 2 L17.2'), `Expected star path to survive navigation, got ${postNavState.d}`);
+      const sampler = new PageSnapshotSampler(styleSyncSession, path.join(artifactDir, 'hud-sync'));
+      const obs = await sampler.captureSnapshot('after_nav_sync');
+      assert.ok(
+        Math.abs(obs.cursorPosition.x - Math.round(postNavState.st.x)) <= 2 &&
+          Math.abs(obs.cursorPosition.y - Math.round(postNavState.st.y)) <= 2,
+        `HUD cursorPosition (${obs.cursorPosition.x},${obs.cursorPosition.y}) must match page cursor (${postNavState.st.x},${postNavState.st.y})`
+      );
+      assert.ok(postNavState.badgeText.includes(`(${obs.cursorPosition.x}, ${obs.cursorPosition.y})`), `Badge "${postNavState.badgeText}" must match synced coordinates`);
+      console.log('[Strict DSH 0.2 Contract] 5n Verified cross-navigation cursor style persistence & HUD/badge coordinate sync!');
+    } finally {
+      await styleSyncSession.close();
+    }
+
+    // 5o. B5 + B6: drag 3-state visuals + subagent drag execution & scroll ↕ pulse indicator + auto-restore
+    const motionVisSession = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+    }).start();
+    try {
+      await motionVisSession.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded');
+      await safeEvaluate(
+        motionVisSession.page,
+        () => {
+          (window as any).__dragEvents = { down: 0, move: 0, up: 0 };
+          window.addEventListener('mousedown', () => { (window as any).__dragEvents.down++; });
+          window.addEventListener('mousemove', () => { (window as any).__dragEvents.move++; });
+          window.addEventListener('mouseup', () => { (window as any).__dragEvents.up++; });
+        },
+        undefined,
+        0
+      );
+
+      let downState: any = null;
+      let draggingState: any = null;
+      let upState: any = null;
+      const readVisualState = async () =>
+        safeEvaluate(
+          motionVisSession.page,
+          () => {
+            const ptr = document.getElementById('__dsh_vc_pointer__');
+            const anchor = document.getElementById('__dsh_vc_anchor__');
+            const badge = document.getElementById('__dsh_vc_badge__');
+            const trail = document.getElementById('__dsh_vc_trail__');
+            return {
+              transform: ptr?.style.transform ?? '',
+              hasAnchor: Boolean(anchor),
+              anchorOpacity: anchor ? getComputedStyle(anchor).opacity : '',
+              badge: badge?.textContent ?? '',
+              trailStroke: trail?.getAttribute('stroke') ?? '',
+              trailWidth: trail?.getAttribute('stroke-width') ?? '',
+            };
+          },
+          { transform: '', hasAnchor: false, anchorOpacity: '', badge: '', trailStroke: '', trailWidth: '' },
+          0
+        );
+
+      const dragOut = await motionVisSession.motion.drag(
+        { x: 360, y: 300 },
+        { x: 760, y: 460 },
+        {
+          steps: 8,
+          durationMs: 140,
+          onPhase: async (phase) => {
+            const snap = await readVisualState();
+            if (phase === 'down') downState = snap;
+            else if (phase === 'dragging') draggingState = snap;
+            else if (phase === 'up') upState = snap;
+          },
+        }
+      );
+      assert.equal(dragOut.ok, true);
+      assert.ok(downState?.transform.includes('scale(0.86'), `Expected scale(0.86 on mousedown, got ${downState?.transform}`);
+      assert.equal(downState?.hasAnchor, true, 'Expected #__dsh_vc_anchor__ during drag down');
+      assert.ok(draggingState?.transform.includes('scale(0.86'), `Expected scale(0.86 during drag, got ${draggingState?.transform}`);
+      assert.equal(draggingState?.hasAnchor, true);
+      assert.ok(draggingState?.badge.includes('DRAG'), `Expected DRAG badge during drag, got ${draggingState?.badge}`);
+      assert.ok(String(draggingState?.trailStroke).includes('__dsh_drag_grad__'), 'Expected reversed drag gradient');
+      assert.ok(upState?.badge.includes('DROP'), `Expected DROP badge after drag release, got ${upState?.badge}`);
+      assert.ok(!upState?.transform.includes('scale(0.86'), 'Scale must restore after drag release');
+
+      // Wait for anchor fade-out cleanup (> 420ms)
+      await motionVisSession.page.waitForTimeout(480);
+      const afterAnchorFade = await readVisualState();
+      assert.equal(afterAnchorFade.hasAnchor, false, 'Expected #__dsh_vc_anchor__ to remove after fade-out');
+
+      const dragEvents = await safeEvaluate(
+        motionVisSession.page,
+        () => (window as any).__dragEvents,
+        { down: 0, move: 0, up: 0 },
+        0
+      );
+      assert.ok(dragEvents.down >= 1 && dragEvents.move >= 6 && dragEvents.up >= 1, `Expected real mouse drag events, got ${JSON.stringify(dragEvents)}`);
+
+      // Test scroll ↕ visual indicator & vertical pulse + 400ms auto-restore
+      const motionTools = new AtomicBrowserToolset(motionVisSession, path.join(artifactDir, 'motion-vis'));
+      const scrollRes = await motionTools.scroll(500, 120);
+      assert.ok(scrollRes.action.includes('Scrolled by 500'));
+      const duringScroll = await safeEvaluate(
+        motionVisSession.page,
+        () => {
+          const ind = document.getElementById('__dsh_vc_scroll_ind__');
+          const pulse = document.getElementById('__dsh_vc_scroll_pulse__');
+          const badge = document.getElementById('__dsh_vc_badge__');
+          return {
+            indDisplay: ind ? getComputedStyle(ind).display : 'none',
+            indText: ind?.textContent?.trim() ?? '',
+            pulseLines: pulse ? pulse.querySelectorAll('line').length : 0,
+            badge: badge?.textContent ?? '',
+          };
+        },
+        { indDisplay: 'none', indText: '', pulseLines: 0, badge: '' },
+        0
+      );
+      assert.notEqual(duringScroll.indDisplay, 'none', 'Expected ↕ indicator visible during scroll');
+      assert.equal(duringScroll.indText, '↕');
+      assert.ok(duringScroll.pulseLines >= 3, `Expected vertical scroll pulse lines, got ${duringScroll.pulseLines}`);
+      assert.ok(duringScroll.badge.includes('SCROLL'), `Expected SCROLL badge, got ${duringScroll.badge}`);
+
+      await motionVisSession.page.waitForTimeout(450);
+      const afterScrollRestore = await safeEvaluate(
+        motionVisSession.page,
+        () => {
+          const ind = document.getElementById('__dsh_vc_scroll_ind__');
+          const pulse = document.getElementById('__dsh_vc_scroll_pulse__');
+          return {
+            indDisplay: ind ? getComputedStyle(ind).display : 'none',
+            pulseLines: pulse ? pulse.querySelectorAll('line').length : 0,
+          };
+        },
+        { indDisplay: 'none', pulseLines: 0 },
+        0
+      );
+      assert.equal(afterScrollRestore.indDisplay, 'none', 'Expected ↕ indicator hidden after 400ms');
+      assert.equal(afterScrollRestore.pulseLines, 0, 'Expected scroll pulse cleared after 400ms');
+
+      // Subagent runner end-to-end with { type: 'drag' }
+      const subagentDragRunner = new BrowserSubagentRunner();
+      let subStep = 0;
+      const subDragRes = await subagentDragRunner.runTask({
+        startUrl: `${srv.url}__layer-fixture.html`,
+        role: 'Drag Subagent',
+        taskPrompt: 'Execute drag decision then complete',
+        maxSteps: 3,
+        artifactDir,
+        sessionOptions: { mode: 'auto', windowMode: 'headless' },
+        planner: async () => {
+          subStep++;
+          if (subStep === 1) {
+            return {
+              type: 'drag',
+              from: { x: 360, y: 300 },
+              to: { x: 700, y: 420 },
+              steps: 6,
+              reason: 'Test subagent drag action',
+            };
+          }
+          return { type: 'complete', report: 'DRAG_SUBAGENT_OK' };
+        },
+      });
+      assert.equal(subDragRes.status, 'COMPLETED');
+      assert.ok(subDragRes.subagentReport.includes('DRAG_SUBAGENT_OK'));
+      await subagentDragRunner.closeAllSessions();
+      console.log('[Strict DSH 0.2 Contract] 5o Verified drag 3-state visuals, subagent drag action & scroll ↕ pulse!');
+    } finally {
+      await motionVisSession.close();
     }
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');

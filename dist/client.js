@@ -223,7 +223,11 @@ window.__ModuleLoader__.load({
       save: "Save Changes",
       saving: "Saving…",
       saved: "Saved! Active shared browser windows updated.",
+      savedLocal: "Saved to settings.json and synced live to open browser windows (persists across DSH restarts).",
       saveFailed: "Failed to persist configuration changes.",
+      saveUnavailable: "Neither host configForm nor local plugin settings endpoint is writable here; use the export buttons or open cordis.yml.",
+      localReadyTitle: "Connected to plugin local persistence (settings.json)",
+      localReadyDesc: "Host did not inject a writable configForm here, so the panel automatically uses the plugin's own persistence channel. Changes preview live and clicking \"Save Changes\" persists across DSH restarts.",
       discard: "Discard",
       resetDefaults: "Reset Defaults",
       readOnly: "Settings are read-only in this deployment.",
@@ -308,7 +312,11 @@ window.__ModuleLoader__.load({
       save: "保存设置",
       saving: "保存中…",
       saved: "已保存！已实时同步到当前打开的共享浏览器窗口。",
+      savedLocal: "已保存至 settings.json 并实时同步到浏览器窗口（重启 DSH 后仍生效）。",
       saveFailed: "宿主拒绝或保存失败，请检查输入参数。",
+      saveUnavailable: "当前宿主既未注入可写表单也未开放插件本地配置端点，无法直接保存；请使用下方复制或「打开配置文件」。",
+      localReadyTitle: "已连接插件本地持久化通道（settings.json）",
+      localReadyDesc: "当前宿主未注入可写 configForm，面板已自动接管持久化：调整控件会实时预览到已打开的浏览器窗口，点击「保存设置」将写入 settings.json 并在重启 DSH 后继续生效。",
       discard: "放弃修改",
       resetDefaults: "恢复默认",
       readOnly: "当前部署配置为只读，无法在线写入。",
@@ -335,6 +343,8 @@ window.__ModuleLoader__.load({
 .dshvb_card{border:1px solid var(--dsw-alias-border-l2,rgba(148,163,184,0.22));background:var(--dsw-alias-bg-base,rgba(15,23,42,0.35));border-radius:var(--dsw-radius-md,10px);padding:14px 16px;display:flex;flex-direction:column;gap:12px}
 .dshvb_banner{border:1px solid rgba(245,158,11,0.45);background:rgba(245,158,11,0.1);border-radius:var(--dsw-radius-md,10px);padding:12px 14px;display:flex;flex-direction:column;gap:8px}
 .dshvb_bannerTitle{margin:0;font-size:13px;font-weight:600;color:#fbbf24}
+.dshvb_banner.info{border-color:rgba(56,189,248,0.45);background:rgba(56,189,248,0.08)}
+.dshvb_banner.info .dshvb_bannerTitle{color:#38bdf8}
 .dshvb_bannerText{margin:0;font-size:12px;color:var(--dsw-alias-label-secondary,#cbd5e1);line-height:1.55}
 .dshvb_diag{margin:0;padding:8px 10px;border-radius:6px;background:rgba(15,23,42,0.45);border:1px dashed var(--dsw-alias-border-l2,rgba(148,163,184,0.22));font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--dsw-alias-label-tertiary,#94a3b8);word-break:break-all}
 .dshvb_cardTitle{margin:0;font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary,#f1f5f9);display:flex;align-items:center;justify-content:space-between;gap:8px}
@@ -640,10 +650,11 @@ window.__ModuleLoader__.load({
             e("div", {
               style: {
                 position: "absolute",
-                left: "-7px",
-                top: "-7px",
-                width: "14px",
-                height: "14px",
+                left: "-9px",
+                top: "-9px",
+                width: "18px",
+                height: "18px",
+                boxSizing: "border-box",
                 borderRadius: "50%",
                 border: "2px solid " + style.rippleColor,
                 boxShadow: style.trailGlow ? "0 0 10px " + style.rippleColor : "none",
@@ -840,6 +851,35 @@ window.__ModuleLoader__.load({
       return lines.join("\n");
     }
 
+    function resolvePluginSettingsEndpoint() {
+      const transportBase =
+        typeof globalThis !== "undefined" &&
+        globalThis.__DSH_TRANSPORT__ &&
+        typeof globalThis.__DSH_TRANSPORT__.streamBaseUrl === "string"
+          ? globalThis.__DSH_TRANSPORT__.streamBaseUrl.replace(/\/+$/, "")
+          : "";
+      return transportBase + "/__dsh_visual_browser/settings";
+    }
+
+    async function requestPluginSettings(method, payload) {
+      if (typeof fetch !== "function") return null;
+      try {
+        const res = await fetch(resolvePluginSettingsEndpoint(), {
+          method,
+          ...(payload !== undefined
+            ? {
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+              }
+            : {}),
+        });
+        if (!res || !res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    }
+
     function VisualBrowserSettingsBody(props) {
       const t = props.t;
       const formSnap = props.liveSnap;
@@ -847,6 +887,9 @@ window.__ModuleLoader__.load({
       const rawStatus = formSnap?.status;
 
       const [loadingTimedOut, setLoadingTimedOut] = React.useState(false);
+      const [localApiReady, setLocalApiReady] = React.useState(false);
+      const [localSettingsFile, setLocalSettingsFile] = React.useState("");
+      const localBaselineRef = React.useRef(null);
 
       React.useEffect(() => {
         if (!hasProvider || (rawStatus && rawStatus !== "loading")) {
@@ -873,6 +916,34 @@ window.__ModuleLoader__.load({
       }, [formSnap?.value, formSnap?.revision, dirty]);
 
       React.useEffect(() => {
+        let cancelled = false;
+        requestPluginSettings("GET").then((data) => {
+          if (cancelled || !data || !data.ok) return;
+          const hydrated = buildDraftFromServer(data);
+          localBaselineRef.current = hydrated;
+          setLocalApiReady(true);
+          if (typeof data.settingsFile === "string") {
+            setLocalSettingsFile(data.settingsFile);
+          }
+          setDraft((prev) => (dirty ? prev : hydrated));
+        });
+        return () => {
+          cancelled = true;
+        };
+      }, []);
+
+      React.useEffect(() => {
+        if (!localApiReady || !dirty) return;
+        const timer = setTimeout(() => {
+          void requestPluginSettings("POST", {
+            cursorStyle: draft.cursorStyle,
+            persist: false,
+          });
+        }, 180);
+        return () => clearTimeout(timer);
+      }, [localApiReady, dirty, draft.cursorStyle]);
+
+      React.useEffect(() => {
         if (!recordingKey || typeof window === "undefined") return;
         const onKey = (ev) => {
           ev.preventDefault();
@@ -888,18 +959,19 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener("keydown", onKey, true);
       }, [recordingKey]);
 
-      if (rawStatus === "unavailable") {
+      if (rawStatus === "unavailable" && !localApiReady) {
         return e("div", { className: "dshvb_wrap" }, e("p", { className: "dshvb_status err" }, t("unavailable")));
       }
 
-      if (hasProvider && (!formSnap || rawStatus === "loading") && !loadingTimedOut) {
+      if (hasProvider && (!formSnap || rawStatus === "loading") && !loadingTimedOut && !localApiReady) {
         return e("div", { className: "dshvb_wrap" }, e("p", { className: "dshvb_status" }, t("loading")));
       }
 
       const isDegraded =
         !hasProvider || !formSnap || rawStatus === "loading" || rawStatus === "degraded";
       const liveWritable = Boolean(formSnap?.writable) && !isDegraded;
-      const controlsEditable = liveWritable || isDegraded;
+      const canPersist = liveWritable || localApiReady;
+      const controlsEditable = liveWritable || isDegraded || localApiReady;
       const writable = controlsEditable;
       const cs = draft.cursorStyle;
       const imgUrl = (cs.customPointerImageUrl || "").trim();
@@ -955,23 +1027,52 @@ window.__ModuleLoader__.load({
       };
 
       const onSave = async () => {
-        if (!liveWritable || saving || imageUrlError) return;
+        if (saving || imageUrlError) return;
         const mutateFn = props.form?.mutate || props.saveMutation;
-        if (typeof mutateFn !== "function") return;
+        const hasHostSave = liveWritable && typeof mutateFn === "function";
+
+        if (!hasHostSave && !localApiReady) {
+          setStatusMsg({ kind: "err", text: t("saveUnavailable") });
+          return;
+        }
+
         setSaving(true);
         setStatusMsg(null);
         try {
-          const ops = [
-            { op: "set", path: ["cursorStyle"], value: draft.cursorStyle },
-            { op: "set", path: ["windowMode"], value: draft.windowMode },
-            { op: "set", path: ["keepWindowOpen"], value: draft.keepWindowOpen },
-            { op: "set", path: ["showTakeoverControl"], value: draft.showTakeoverControl },
-            { op: "set", path: ["takeoverHotkey"], value: draft.takeoverHotkey },
-          ];
-          const ok = await mutateFn(ops, formSnap?.revision);
-          if (ok) {
+          if (hasHostSave) {
+            const ops = [
+              { op: "set", path: ["cursorStyle"], value: draft.cursorStyle },
+              { op: "set", path: ["windowMode"], value: draft.windowMode },
+              { op: "set", path: ["keepWindowOpen"], value: draft.keepWindowOpen },
+              { op: "set", path: ["showTakeoverControl"], value: draft.showTakeoverControl },
+              { op: "set", path: ["takeoverHotkey"], value: draft.takeoverHotkey },
+            ];
+            const ok = await mutateFn(ops, formSnap?.revision);
+            if (ok) {
+              if (localApiReady) {
+                const mirrorRes = await requestPluginSettings("POST", { ...draft, persist: true });
+                if (mirrorRes && mirrorRes.ok) {
+                  localBaselineRef.current = buildDraftFromServer(mirrorRes);
+                }
+              }
+              setDirty(false);
+              setStatusMsg({ kind: "ok", text: t("saved") });
+            } else {
+              setStatusMsg({ kind: "err", text: t("saveFailed") });
+            }
+            return;
+          }
+
+          const res = await requestPluginSettings("POST", { ...draft, persist: true });
+          if (res && res.ok) {
+            const savedDraft = buildDraftFromServer(res);
+            localBaselineRef.current = savedDraft;
+            setDraft(savedDraft);
+            if (typeof res.settingsFile === "string") {
+              setLocalSettingsFile(res.settingsFile);
+            }
             setDirty(false);
-            setStatusMsg({ kind: "ok", text: t("saved") });
+            setStatusMsg({ kind: "ok", text: t("savedLocal") });
           } else {
             setStatusMsg({ kind: "err", text: t("saveFailed") });
           }
@@ -1012,9 +1113,17 @@ window.__ModuleLoader__.load({
       };
 
       const onDiscard = () => {
-        setDraft(buildDraftFromServer(formSnap?.value));
+        const baseline =
+          localBaselineRef.current || buildDraftFromServer(formSnap?.value);
+        setDraft(baseline);
         setDirty(false);
         setStatusMsg(null);
+        if (localApiReady) {
+          void requestPluginSettings("POST", {
+            cursorStyle: baseline.cursorStyle,
+            persist: false,
+          });
+        }
       };
 
       const onResetDefaults = () => {
@@ -1060,6 +1169,16 @@ window.__ModuleLoader__.load({
           e("p", null, t("subtitle"))
         ),
         isDegraded &&
+          localApiReady &&
+          e(
+            "div",
+            { className: "dshvb_banner info", role: "status" },
+            e("div", { className: "dshvb_bannerTitle" }, t("localReadyTitle")),
+            e("p", { className: "dshvb_bannerText" }, t("localReadyDesc")),
+            localSettingsFile && e("p", { className: "dshvb_diag" }, localSettingsFile)
+          ),
+        isDegraded &&
+          !localApiReady &&
           e(
             "div",
             { className: "dshvb_banner", role: "status" },
@@ -1602,53 +1721,54 @@ window.__ModuleLoader__.load({
               },
               t("resetDefaults")
             ),
-            isDegraded
-              ? e(
-                  React.Fragment,
-                  null,
-                  e(
-                    "button",
-                    {
-                      type: "button",
-                      className: "dshvb_btn primary",
-                      onClick: () => onCopySnippet(buildToolCallSnippet(draft)),
-                    },
-                    t("copyToolCall")
-                  ),
-                  e(
-                    "button",
-                    {
-                      type: "button",
-                      className: "dshvb_btn",
-                      onClick: () => onCopySnippet(buildCordisYamlSnippet(draft)),
-                    },
-                    t("copyYamlSnippet")
-                  )
+            canPersist &&
+              e(
+                React.Fragment,
+                null,
+                e(
+                  "button",
+                  {
+                    type: "button",
+                    className: "dshvb_btn",
+                    disabled: !dirty || saving,
+                    onClick: onDiscard,
+                  },
+                  t("discard")
+                ),
+                e(
+                  "button",
+                  {
+                    type: "button",
+                    className: "dshvb_btn primary",
+                    disabled: !canPersist || !dirty || saving || Boolean(imageUrlError),
+                    onClick: onSave,
+                  },
+                  saving ? t("saving") : t("save")
                 )
-              : e(
-                  React.Fragment,
-                  null,
-                  e(
-                    "button",
-                    {
-                      type: "button",
-                      className: "dshvb_btn",
-                      disabled: !dirty || saving,
-                      onClick: onDiscard,
-                    },
-                    t("discard")
-                  ),
-                  e(
-                    "button",
-                    {
-                      type: "button",
-                      className: "dshvb_btn primary",
-                      disabled: !liveWritable || !dirty || saving || Boolean(imageUrlError),
-                      onClick: onSave,
-                    },
-                    saving ? t("saving") : t("save")
-                  )
+              ),
+            isDegraded &&
+              e(
+                React.Fragment,
+                null,
+                e(
+                  "button",
+                  {
+                    type: "button",
+                    className: "dshvb_btn",
+                    onClick: () => onCopySnippet(buildToolCallSnippet(draft)),
+                  },
+                  t("copyToolCall")
+                ),
+                e(
+                  "button",
+                  {
+                    type: "button",
+                    className: "dshvb_btn",
+                    onClick: () => onCopySnippet(buildCordisYamlSnippet(draft)),
+                  },
+                  t("copyYamlSnippet")
                 )
+              )
           )
         ),
         snippetText &&

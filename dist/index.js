@@ -9,6 +9,7 @@ import { BrowserSession } from './driver/browser-session.js';
 import { resolveBrowserWindowMode } from './driver/window-manager.js';
 import { resolveCursorStyle } from './injected/virtual-cursor.js';
 import { AtomicBrowserToolset } from './tools/atomic-tools.js';
+import { loadPersistedSettings, mergeCursorStyleConfig, resolveSettingsFilePath, savePersistedSettings, } from './settings-store.js';
 import { BrowserSubagentRunner, createBuiltinInspectorPlanner, createDshHostLlmPlanner, createOpenAIVisionPlanner, summarizeDecisionAction, } from './subagent/runner.js';
 export * from './driver/types.js';
 export * from './driver/browser-session.js';
@@ -18,6 +19,7 @@ export * from './injected/virtual-cursor.js';
 export * from './sampler/telemetry-collector.js';
 export * from './sampler/page-snapshot.js';
 export * from './tools/atomic-tools.js';
+export * from './settings-store.js';
 export * from './subagent/host-facts.js';
 export * from './subagent/sliding-context.js';
 export * from './subagent/runner.js';
@@ -41,33 +43,56 @@ async function loadSchemastery() {
         return mod?.default ?? mod;
     }
     catch {
-        try {
-            const req = createRequire(import.meta.url);
-            let toolsEntry;
-            const metaResolve = import.meta.resolve;
-            if (typeof metaResolve === 'function') {
-                try {
-                    const resolvedUrl = metaResolve.call(import.meta, '@deepseek-ai/dsh-tools');
-                    if (typeof resolvedUrl === 'string' && resolvedUrl.startsWith('file:')) {
-                        toolsEntry = fileURLToPath(resolvedUrl);
+        const candidateHosts = ['@deepseek-ai/dsh-tools', '@deepseek-ai/cordis'];
+        const req = createRequire(import.meta.url);
+        const metaResolve = import.meta.resolve;
+        for (const hostPkg of candidateHosts) {
+            try {
+                let hostEntry;
+                if (typeof metaResolve === 'function') {
+                    try {
+                        const resolvedUrl = metaResolve.call(import.meta, hostPkg);
+                        if (typeof resolvedUrl === 'string' && resolvedUrl.startsWith('file:')) {
+                            hostEntry = fileURLToPath(resolvedUrl);
+                        }
+                    }
+                    catch {
+                        // fall back to createRequire
                     }
                 }
+                if (!hostEntry) {
+                    hostEntry = req.resolve(hostPkg);
+                }
+                const realHostEntry = fs.realpathSync(hostEntry);
+                try {
+                    const nestedReq = createRequire(realHostEntry);
+                    const schemaPath = nestedReq.resolve('@deepseek-ai/schemastery');
+                    const mod = await import(pathToFileURL(schemaPath).href);
+                    return mod?.default ?? mod;
+                }
                 catch {
-                    // fall back to createRequire
+                    // Probe sibling pnpm store entries (`.../.pnpm/@deepseek-ai+schemastery@*/node_modules/@deepseek-ai/schemastery`)
+                    const pnpmIdx = realHostEntry.lastIndexOf(`${path.sep}.pnpm${path.sep}`);
+                    if (pnpmIdx >= 0) {
+                        const pnpmRoot = realHostEntry.slice(0, pnpmIdx + 6);
+                        const entries = fs.readdirSync(pnpmRoot).filter((d) => d.startsWith('@deepseek-ai+schemastery@')).sort().reverse();
+                        for (const entry of entries) {
+                            const candidatePkg = path.join(pnpmRoot, entry, 'node_modules', '@deepseek-ai', 'schemastery', 'package.json');
+                            if (fs.existsSync(candidatePkg)) {
+                                const siblingReq = createRequire(candidatePkg);
+                                const schemaPath = siblingReq.resolve('@deepseek-ai/schemastery');
+                                const mod = await import(pathToFileURL(schemaPath).href);
+                                return mod?.default ?? mod;
+                            }
+                        }
+                    }
                 }
             }
-            if (!toolsEntry) {
-                toolsEntry = req.resolve('@deepseek-ai/dsh-tools');
+            catch {
+                // try next host package
             }
-            const realToolsEntry = fs.realpathSync(toolsEntry);
-            const nestedReq = createRequire(realToolsEntry);
-            const schemaPath = nestedReq.resolve('@deepseek-ai/schemastery');
-            const mod = await import(pathToFileURL(schemaPath).href);
-            return mod?.default ?? mod;
         }
-        catch {
-            return null;
-        }
+        return null;
     }
 }
 export function buildPluginConfigSchema(z) {
@@ -187,10 +212,10 @@ function safeRead(read) {
  * (`ctx.inject([serviceName], callback)`) so missing optional services remain pending cleanly
  * without blocking top-level plugin activation or throwing on uninjected Cordis 4.x property getters.
  */
-function bindOptionalHostServices(ctx, hostServices) {
+function bindOptionalHostServices(ctx, hostServices, onServiceBound) {
     if (!ctx)
         return;
-    const serviceNames = ['llm', 'attachments'];
+    const serviceNames = ['llm', 'attachments', 'webServer'];
     const injectFn = safeRead(() => ctx.inject);
     if (typeof injectFn === 'function') {
         for (const serviceName of serviceNames) {
@@ -199,8 +224,17 @@ function bindOptionalHostServices(ctx, hostServices) {
                     const service = safeRead(() => sub?.[serviceName]);
                     if (service !== undefined) {
                         hostServices[serviceName] = service;
+                        const boundDisposer = onServiceBound?.(serviceName, service, sub);
                         if (typeof sub?.effect === 'function') {
                             sub.effect(() => () => {
+                                if (typeof boundDisposer === 'function') {
+                                    try {
+                                        boundDisposer();
+                                    }
+                                    catch {
+                                        // ignore disposer error
+                                    }
+                                }
                                 if (hostServices[serviceName] === service) {
                                     hostServices[serviceName] = undefined;
                                 }
@@ -220,13 +254,14 @@ function bindOptionalHostServices(ctx, hostServices) {
         const service = safeRead(() => ctx?.[serviceName]);
         if (service !== undefined) {
             hostServices[serviceName] = service;
+            onServiceBound?.(serviceName, service, ctx);
         }
     }
 }
 function getEffectiveHostServices(hostServices, ctx) {
     const result = {};
     const hasInjectApi = typeof safeRead(() => ctx?.inject) === 'function';
-    for (const serviceName of ['llm', 'attachments']) {
+    for (const serviceName of ['llm', 'attachments', 'webServer']) {
         result[serviceName] =
             hostServices[serviceName] ??
                 safeRead(() => ctx?.get?.(serviceName)) ??
@@ -384,6 +419,109 @@ function resolveSubagentPlanner(hostServices, ctx, config, exec) {
         effectiveServices,
     };
 }
+const MAX_HTTP_BODY_BYTES = 512 * 1024;
+function readJsonRequestBody(req) {
+    if (req && typeof req.body === 'object' && req.body !== null) {
+        return Promise.resolve(req.body);
+    }
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let total = 0;
+        req.on('data', (chunk) => {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+            total += buf.byteLength;
+            if (total > MAX_HTTP_BODY_BYTES) {
+                reject(new Error('PAYLOAD_TOO_LARGE'));
+                req.destroy?.();
+                return;
+            }
+            chunks.push(buf);
+        });
+        req.on('end', () => {
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8').trim();
+                const parsed = raw ? JSON.parse(raw) : {};
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    reject(new Error('INVALID_JSON_OBJECT'));
+                    return;
+                }
+                resolve(parsed);
+            }
+            catch {
+                reject(new Error('INVALID_JSON'));
+            }
+        });
+        req.on('error', (err) => reject(err));
+    });
+}
+/**
+ * Builds the Node HTTP handler mounted at `/__dsh_visual_browser` (serving `/settings`)
+ * so the DSH browser settings panel can read and persist settings.json even when the host
+ * does not inject a writable configForm provider.
+ */
+export function createSettingsHttpHandler(bridge) {
+    return async (req, res) => {
+        const headers = {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        };
+        const send = (status, body) => {
+            res.writeHead(status, headers);
+            res.end(body === undefined ? '' : JSON.stringify(body));
+        };
+        const method = String(req?.method || 'GET').toUpperCase();
+        const rawUrl = String(req?.url || '/');
+        const pathname = rawUrl.split('?')[0] || '/';
+        const isSettingsRoute = pathname === '/settings' ||
+            pathname === '/__dsh_visual_browser/settings' ||
+            pathname.endsWith('/settings');
+        if (method === 'OPTIONS') {
+            send(204);
+            return;
+        }
+        if (!isSettingsRoute) {
+            send(404, { ok: false, error: 'Not found' });
+            return;
+        }
+        if (method === 'GET') {
+            send(200, { ok: true, writable: true, ...bridge.getEffectiveSettings() });
+            return;
+        }
+        if (method === 'POST') {
+            try {
+                const body = await readJsonRequestBody(req);
+                const persist = body.persist !== false;
+                const patch = {};
+                if (body.cursorStyle && typeof body.cursorStyle === 'object') {
+                    patch.cursorStyle = body.cursorStyle;
+                }
+                if (typeof body.windowMode === 'string') {
+                    patch.windowMode = body.windowMode;
+                }
+                if (typeof body.keepWindowOpen === 'boolean') {
+                    patch.keepWindowOpen = body.keepWindowOpen;
+                }
+                if (typeof body.showTakeoverControl === 'boolean') {
+                    patch.showTakeoverControl = body.showTakeoverControl;
+                }
+                if (typeof body.takeoverHotkey === 'string') {
+                    patch.takeoverHotkey = body.takeoverHotkey;
+                }
+                const effective = bridge.saveSettings(patch, { persist });
+                send(200, { ok: true, persisted: persist, ...effective });
+            }
+            catch (err) {
+                const msg = String(err?.message ?? err);
+                send(msg === 'PAYLOAD_TOO_LARGE' ? 413 : 400, { ok: false, error: msg });
+            }
+            return;
+        }
+        send(405, { ok: false, error: `Method ${method} not allowed` });
+    };
+}
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */
@@ -393,46 +531,85 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
         bindOptionalHostServices(ctx, resolvedServices);
     }
     const artifactRoot = resolveDefaultArtifactDir(config.artifactDir);
+    const settingsFilePath = resolveSettingsFilePath(artifactRoot);
+    let persistedSettings = loadPersistedSettings(settingsFilePath);
     let toolCursorOverride = null;
     const getLiveCursorStyle = () => {
         const baseCfg = readVolatileValue(config.cursorStyle) ?? {};
-        if (toolCursorOverride) {
-            return resolveCursorStyle({ ...baseCfg, ...toolCursorOverride });
-        }
-        return resolveCursorStyle({
+        const withBase = resolveCursorStyle({
             preset: 'cyber-neon',
             ...baseCfg,
         });
+        const withPersisted = persistedSettings?.cursorStyle
+            ? mergeCursorStyleConfig(withBase, persistedSettings.cursorStyle)
+            : withBase;
+        if (toolCursorOverride) {
+            return mergeCursorStyleConfig(withPersisted, toolCursorOverride);
+        }
+        return withPersisted;
     };
     const getLiveWindowMode = (override) => {
         return resolveBrowserWindowMode({
-            windowMode: override ?? readVolatileValue(config.windowMode),
+            windowMode: override ?? persistedSettings?.windowMode ?? readVolatileValue(config.windowMode),
             backgroundSilent: config.backgroundSilent,
         });
     };
     const getLiveKeepWindowOpen = (effectiveMode) => {
-        return readVolatileValue(config.keepWindowOpen) ?? effectiveMode !== 'headless';
+        return (persistedSettings?.keepWindowOpen ??
+            readVolatileValue(config.keepWindowOpen) ??
+            effectiveMode !== 'headless');
     };
     const getLiveShowTakeoverControl = (effectiveMode) => {
-        return readVolatileValue(config.showTakeoverControl) ?? effectiveMode !== 'headless';
+        return (persistedSettings?.showTakeoverControl ??
+            readVolatileValue(config.showTakeoverControl) ??
+            effectiveMode !== 'headless');
     };
     const getLiveTakeoverHotkey = () => {
-        const raw = readVolatileValue(config.takeoverHotkey);
-        return typeof raw === 'string' ? raw : 'F8';
+        const raw = persistedSettings?.takeoverHotkey ?? readVolatileValue(config.takeoverHotkey);
+        return typeof raw === 'string' && raw.trim() ? raw.trim() : 'F8';
+    };
+    const applyLiveSettingsToSessions = (nextStyle, nextHotkey) => {
+        for (const sess of runner.getAllActiveSessions()) {
+            void sess.motion.setCursorStyle(nextStyle).catch(() => { });
+            void sess.motion.setTakeoverHotkey(nextHotkey).catch(() => { });
+        }
+    };
+    const localBridge = {
+        syncFromSettingsDocument: () => {
+            toolCursorOverride = null;
+            persistedSettings = null;
+            const nextStyle = getLiveCursorStyle();
+            const nextHotkey = getLiveTakeoverHotkey();
+            applyLiveSettingsToSessions(nextStyle, nextHotkey);
+        },
+        getEffectiveSettings: () => {
+            const effectiveMode = getLiveWindowMode();
+            return {
+                cursorStyle: resolveCursorStyle(getLiveCursorStyle()),
+                windowMode: effectiveMode,
+                keepWindowOpen: getLiveKeepWindowOpen(effectiveMode),
+                showTakeoverControl: getLiveShowTakeoverControl(effectiveMode),
+                takeoverHotkey: getLiveTakeoverHotkey(),
+                settingsFile: settingsFilePath.replace(/\\/g, '/'),
+            };
+        },
+        saveSettings: (patch, opts = {}) => {
+            if (opts.persist === false) {
+                if (patch.cursorStyle) {
+                    toolCursorOverride = mergeCursorStyleConfig(getLiveCursorStyle(), patch.cursorStyle);
+                }
+            }
+            else {
+                toolCursorOverride = null;
+                persistedSettings = savePersistedSettings(settingsFilePath, patch, persistedSettings ?? undefined);
+            }
+            const effective = localBridge.getEffectiveSettings();
+            applyLiveSettingsToSessions(effective.cursorStyle, effective.takeoverHotkey);
+            return effective;
+        },
     };
     if (bridgeOut) {
-        bridgeOut.bridge = {
-            syncFromSettingsDocument: () => {
-                toolCursorOverride = null;
-                const shared = runner.getSharedSession();
-                if (shared?.isAlive()) {
-                    const nextStyle = getLiveCursorStyle();
-                    const nextHotkey = getLiveTakeoverHotkey();
-                    void shared.motion.setCursorStyle(nextStyle).catch(() => { });
-                    void shared.motion.setTakeoverHotkey(nextHotkey).catch(() => { });
-                }
-            },
-        };
+        bridgeOut.bridge = localBridge;
     }
     // 1. browser_subagent_run
     const subagentRunTool = defineTool({
@@ -600,6 +777,21 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     steps: res.contextStats,
                     host_facts: res.hostFacts,
                 });
+                if (res.status === 'PAUSED_FOR_TAKEOVER') {
+                    try {
+                        const notifySvc = safeRead(() => ctx?.get?.('notify'));
+                        const msg = '子代理已暂停，窗口保持打开；关闭窗口会结束该任务';
+                        if (typeof notifySvc === 'function') {
+                            notifySvc(msg);
+                        }
+                        else if (notifySvc && typeof notifySvc.info === 'function') {
+                            notifySvc.info(msg);
+                        }
+                    }
+                    catch {
+                        // optional host notification failure must never block tool result
+                    }
+                }
                 return toLosslessJson({
                     status: res.status,
                     subagent_id: res.subagentId,
@@ -655,7 +847,14 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 properties: {
                     status: {
                         type: 'string',
-                        enum: ['COMPLETED', 'BLOCKED', 'PAUSED_FOR_TAKEOVER', 'MAX_STEPS_REACHED'],
+                        enum: [
+                            'COMPLETED',
+                            'BLOCKED',
+                            'PAUSED_FOR_TAKEOVER',
+                            'MAX_STEPS_REACHED',
+                            'SESSION_LOST',
+                            'SESSION_NOT_FOUND',
+                        ],
                     },
                     subagent_id: { type: 'string' },
                     host_facts_block: { type: 'string' },
@@ -663,8 +862,9 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 },
             },
             render(_args, value) {
-                const text = `${value.host_facts_block}\n\n${value.subagent_report}`;
-                return renderToolContent(text, value.image_attachment);
+                const body = value?.subagent_report ?? value?.hint ?? '';
+                const text = `${value?.host_facts_block ?? ''}\n\n${body}`;
+                return renderToolContent(text, value?.image_attachment);
             },
         },
         async execute(args, exec) {
@@ -673,6 +873,8 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             return toLosslessJson({
                 status: res.status,
                 subagent_id: res.subagentId,
+                ...(res.reason ? { reason: res.reason } : {}),
+                ...(res.hint ? { hint: res.hint } : {}),
                 host_facts_block: res.hostFactsBlock,
                 subagent_report: res.subagentReport,
                 approval_card: res.approvalCard ?? null,
@@ -774,8 +976,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             },
         },
         async execute(args) {
-            const nextPatch = {
-                ...getLiveCursorStyle(),
+            const explicitPatch = {
                 ...(args.preset ? { preset: args.preset } : {}),
                 ...(args.pointer_shape ? { pointerShape: args.pointer_shape } : {}),
                 ...(args.pointer_color ? { pointerColor: String(args.pointer_color) } : {}),
@@ -801,14 +1002,13 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     ? { badgeTextPrefix: String(args.badge_text_prefix) }
                     : {}),
             };
-            toolCursorOverride = resolveCursorStyle(nextPatch);
-            const shared = runner.getSharedSession();
-            if (shared?.isAlive()) {
-                await shared.motion.setCursorStyle(toolCursorOverride).catch(() => { });
-            }
+            const mergedStyle = mergeCursorStyleConfig(getLiveCursorStyle(), explicitPatch);
+            const effective = localBridge.saveSettings({ cursorStyle: mergedStyle }, { persist: true });
             return toLosslessJson({
                 updated: true,
-                active_cursor_style: toolCursorOverride,
+                persisted: true,
+                settings_file: effective.settingsFile,
+                active_cursor_style: effective.cursorStyle,
             });
         },
     });
@@ -908,9 +1108,43 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
 export function apply(ctx, config = {}) {
     const runner = new BrowserSubagentRunner();
     const hostServices = {};
-    bindOptionalHostServices(ctx, hostServices);
     const bridgeHolder = {};
+    let webServerRouteDisposer;
+    const attachWebServerRoute = (ws) => {
+        if (!ws || typeof ws.register !== 'function' || !bridgeHolder.bridge)
+            return undefined;
+        if (typeof webServerRouteDisposer === 'function') {
+            try {
+                webServerRouteDisposer();
+            }
+            catch {
+                // ignore prior route cleanup error
+            }
+            webServerRouteDisposer = undefined;
+        }
+        try {
+            const reg = ws.register({
+                kind: 'prefix',
+                path: '/__dsh_visual_browser',
+                handler: createSettingsHttpHandler(bridgeHolder.bridge),
+            });
+            webServerRouteDisposer = typeof reg === 'function' ? reg : undefined;
+            return webServerRouteDisposer;
+        }
+        catch {
+            return undefined;
+        }
+    };
+    bindOptionalHostServices(ctx, hostServices, (svcName, svc) => {
+        if (svcName === 'webServer') {
+            return attachWebServerRoute(svc);
+        }
+        return undefined;
+    });
     const tools = createVisualBrowserTools(ctx, config, runner, hostServices, bridgeHolder);
+    if (hostServices.webServer && !webServerRouteDisposer) {
+        attachWebServerRoute(hostServices.webServer);
+    }
     for (const tool of tools) {
         ctx.tools.register(tool);
     }
@@ -923,6 +1157,15 @@ export function apply(ctx, config = {}) {
     const disposeAll = () => {
         if (typeof unsubSettings === 'function') {
             unsubSettings();
+        }
+        if (typeof webServerRouteDisposer === 'function') {
+            try {
+                webServerRouteDisposer();
+            }
+            catch {
+                // ignore route disposer error
+            }
+            webServerRouteDisposer = undefined;
         }
         void runner.closeAllSessions();
     };

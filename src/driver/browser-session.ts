@@ -42,6 +42,8 @@ export class BrowserSession {
   public resolvedWindowMode: BrowserWindowMode = 'visible-background';
   public launchedPid?: number;
   public launchedHwnd?: number;
+  public disconnected = false;
+  public onDisconnected?: () => void;
   public browser!: Browser;
   public context!: BrowserContext;
   public page!: Page;
@@ -51,6 +53,11 @@ export class BrowserSession {
   private ephemeralProfileDir?: string;
   private humanTakeoverRequested = false;
   private takeoverBindingInstalled = false;
+  private styleBindingInstalled = false;
+  private closingIntentionally = false;
+  private navigatingViaSession = false;
+  private lastMainFrameDocUrl = '';
+  private disconnectListeners = new Set<() => void>();
 
   constructor(opts: BrowserSessionOptions = {}) {
     const resolvedWindowMode = resolveBrowserWindowMode(opts);
@@ -65,9 +72,46 @@ export class BrowserSession {
 
   public isAlive(): boolean {
     try {
+      if (this.disconnected) return false;
       return Boolean(this.browser && this.browser.isConnected() && this.page && !this.page.isClosed());
     } catch {
       return false;
+    }
+  }
+
+  public addDisconnectListener(listener: () => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => {
+      this.disconnectListeners.delete(listener);
+    };
+  }
+
+  private handleBrowserDisconnected(): void {
+    if (this.disconnected) return;
+    this.disconnected = true;
+    if (this.closingIntentionally) return;
+    try {
+      this.onDisconnected?.();
+    } catch {
+      // ignore listener errors
+    }
+    for (const cb of [...this.disconnectListeners]) {
+      try {
+        cb();
+      } catch {
+        // ignore listener errors
+      }
+    }
+  }
+
+  private stripUrlHash(rawUrl: string): string {
+    try {
+      const parsed = new URL(rawUrl);
+      parsed.hash = '';
+      return parsed.href;
+    } catch {
+      const idx = rawUrl.indexOf('#');
+      return idx >= 0 ? rawUrl.slice(0, idx) : rawUrl;
     }
   }
 
@@ -173,9 +217,16 @@ export class BrowserSession {
       this.page = await this.context.newPage();
     }
 
+    this.disconnected = false;
+    this.closingIntentionally = false;
+    this.browser?.on('disconnected', () => {
+      this.handleBrowserDisconnected();
+    });
+
     const initScript = buildVirtualCursorInitScript(this.options.cursorStyle, {
       showTakeoverControl: showTakeover,
       takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
+      unloadGuard: this.options.unloadGuard,
     });
     await this.context.addInitScript(initScript);
     if (!this.takeoverBindingInstalled) {
@@ -188,13 +239,48 @@ export class BrowserSession {
       }
       this.takeoverBindingInstalled = true;
     }
+    if (!this.styleBindingInstalled) {
+      try {
+        await this.context.exposeBinding('__dshSyncCursorStyle', (_source: unknown, styleObj: unknown) => {
+          if (styleObj && typeof styleObj === 'object') {
+            this.motion?.updateActiveStyleFromPage(styleObj as any);
+          }
+        });
+      } catch {
+        /* ignore if binding already registered on reused external CDP context */
+      }
+      this.styleBindingInstalled = true;
+    }
 
     this.motion = new HumanMotionController(this.page, this.options.cursorStyle, {
       showTakeoverControl: showTakeover,
       takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
+      unloadGuard: this.options.unloadGuard,
       shouldAbort: () => this.humanTakeoverRequested,
     });
     this.telemetry = new TelemetryCollector(this.page);
+
+    this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
+    this.page.on('framenavigated', (frame) => {
+      try {
+        if (frame !== this.page.mainFrame()) return;
+        const nextDoc = this.stripUrlHash(frame.url());
+        if (nextDoc !== this.lastMainFrameDocUrl) {
+          this.lastMainFrameDocUrl = nextDoc;
+          this.motion?.resetPosition(120, 120);
+          if (!this.navigatingViaSession) {
+            void this.motion?.ensureCursorHUD(true).catch(() => {});
+          }
+        }
+      } catch {
+        // ignore navigation race inspection error
+      }
+    });
+    this.page.on('domcontentloaded', () => {
+      if (!this.navigatingViaSession) {
+        void this.motion?.ensureCursorHUD(true).catch(() => {});
+      }
+    });
     return this;
   }
 
@@ -203,15 +289,56 @@ export class BrowserSession {
     waitUntil: 'load' | 'domcontentloaded' | 'networkidle' = 'load'
   ): Promise<void> {
     this.telemetry.recordOrigin(url);
-    await this.page.goto(url, { waitUntil, timeout: 30000 });
-    await this.motion.ensureCursorHUD();
+    const curDoc = this.stripUrlHash(this.page.url());
+    const nextDoc = this.stripUrlHash(url);
+
+    // Pull any synchronous runtime setStyle() changes made directly via window.__dshCursorAPI before leaving the page.
+    const dirtyStyle = await safeEvaluate<any>(
+      this.page,
+      () => {
+        if ((window as any).__dshStyleDirty && (window as any).__dshCursorAPI) {
+          return (window as any).__dshCursorAPI.getState?.()?.style ?? null;
+        }
+        return null;
+      },
+      null,
+      0
+    ).catch(() => null);
+    if (dirtyStyle && typeof dirtyStyle === 'object') {
+      this.motion.updateActiveStyleFromPage(dirtyStyle);
+    }
+
+    // Temporarily disable beforeunload guard on the outgoing page so programmatic navigation is never blocked.
+    if (this.motion.isUnloadGuardEnabled()) {
+      await safeEvaluate(
+        this.page,
+        () => {
+          (window as any).__dshCursorAPI?.setUnloadGuard?.(false);
+        },
+        undefined,
+        0
+      ).catch(() => {});
+    }
+
+    if (curDoc !== nextDoc) {
+      this.motion.resetPosition(120, 120);
+    }
+
+    this.navigatingViaSession = true;
+    try {
+      await this.page.goto(url, { waitUntil, timeout: 30000 });
+      this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
+    } finally {
+      this.navigatingViaSession = false;
+    }
+    await this.motion.ensureCursorHUD(true);
   }
 
   public async screenshot(outputPath: string, retries = 2): Promise<string> {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        await this.motion.ensureCursorHUD();
+        await this.motion.ensureCursorHUD(false);
         await this.page.screenshot({ path: outputPath, fullPage: false });
         return outputPath;
       } catch (err) {
@@ -226,6 +353,10 @@ export class BrowserSession {
   }
 
   public async close(): Promise<void> {
+    this.closingIntentionally = true;
+    if (this.isAlive()) {
+      await this.motion?.setUnloadGuard(false).catch(() => {});
+    }
     if (this.launchedPid) {
       try {
         if (this.browser?.isConnected()) {

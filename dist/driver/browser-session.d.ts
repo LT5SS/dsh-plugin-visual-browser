@@ -9,6 +9,8 @@ export declare class BrowserSession {
     resolvedWindowMode: BrowserWindowMode;
     launchedPid?: number;
     launchedHwnd?: number;
+    disconnected: boolean;
+    onDisconnected?: () => void;
     browser: Browser;
     context: BrowserContext;
     page: Page;
@@ -18,8 +20,16 @@ export declare class BrowserSession {
     private ephemeralProfileDir?;
     private humanTakeoverRequested;
     private takeoverBindingInstalled;
+    private styleBindingInstalled;
+    private closingIntentionally;
+    private navigatingViaSession;
+    private lastMainFrameDocUrl;
+    private disconnectListeners;
     constructor(opts?: BrowserSessionOptions);
     isAlive(): boolean;
+    addDisconnectListener(listener: () => void): () => void;
+    private handleBrowserDisconnected;
+    private stripUrlHash;
     checkHumanTakeoverRequested(): Promise<boolean>;
     resetHumanTakeoverRequest(): Promise<void>;
     start(): Promise<this>;

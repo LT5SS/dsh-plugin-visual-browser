@@ -31,6 +31,8 @@ export class BrowserSession {
     resolvedWindowMode = 'visible-background';
     launchedPid;
     launchedHwnd;
+    disconnected = false;
+    onDisconnected;
     browser;
     context;
     page;
@@ -40,6 +42,11 @@ export class BrowserSession {
     ephemeralProfileDir;
     humanTakeoverRequested = false;
     takeoverBindingInstalled = false;
+    styleBindingInstalled = false;
+    closingIntentionally = false;
+    navigatingViaSession = false;
+    lastMainFrameDocUrl = '';
+    disconnectListeners = new Set();
     constructor(opts = {}) {
         const resolvedWindowMode = resolveBrowserWindowMode(opts);
         this.resolvedWindowMode = resolvedWindowMode;
@@ -52,10 +59,50 @@ export class BrowserSession {
     }
     isAlive() {
         try {
+            if (this.disconnected)
+                return false;
             return Boolean(this.browser && this.browser.isConnected() && this.page && !this.page.isClosed());
         }
         catch {
             return false;
+        }
+    }
+    addDisconnectListener(listener) {
+        this.disconnectListeners.add(listener);
+        return () => {
+            this.disconnectListeners.delete(listener);
+        };
+    }
+    handleBrowserDisconnected() {
+        if (this.disconnected)
+            return;
+        this.disconnected = true;
+        if (this.closingIntentionally)
+            return;
+        try {
+            this.onDisconnected?.();
+        }
+        catch {
+            // ignore listener errors
+        }
+        for (const cb of [...this.disconnectListeners]) {
+            try {
+                cb();
+            }
+            catch {
+                // ignore listener errors
+            }
+        }
+    }
+    stripUrlHash(rawUrl) {
+        try {
+            const parsed = new URL(rawUrl);
+            parsed.hash = '';
+            return parsed.href;
+        }
+        catch {
+            const idx = rawUrl.indexOf('#');
+            return idx >= 0 ? rawUrl.slice(0, idx) : rawUrl;
         }
     }
     async checkHumanTakeoverRequested() {
@@ -146,9 +193,15 @@ export class BrowserSession {
             });
             this.page = await this.context.newPage();
         }
+        this.disconnected = false;
+        this.closingIntentionally = false;
+        this.browser?.on('disconnected', () => {
+            this.handleBrowserDisconnected();
+        });
         const initScript = buildVirtualCursorInitScript(this.options.cursorStyle, {
             showTakeoverControl: showTakeover,
             takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
+            unloadGuard: this.options.unloadGuard,
         });
         await this.context.addInitScript(initScript);
         if (!this.takeoverBindingInstalled) {
@@ -162,24 +215,89 @@ export class BrowserSession {
             }
             this.takeoverBindingInstalled = true;
         }
+        if (!this.styleBindingInstalled) {
+            try {
+                await this.context.exposeBinding('__dshSyncCursorStyle', (_source, styleObj) => {
+                    if (styleObj && typeof styleObj === 'object') {
+                        this.motion?.updateActiveStyleFromPage(styleObj);
+                    }
+                });
+            }
+            catch {
+                /* ignore if binding already registered on reused external CDP context */
+            }
+            this.styleBindingInstalled = true;
+        }
         this.motion = new HumanMotionController(this.page, this.options.cursorStyle, {
             showTakeoverControl: showTakeover,
             takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
+            unloadGuard: this.options.unloadGuard,
             shouldAbort: () => this.humanTakeoverRequested,
         });
         this.telemetry = new TelemetryCollector(this.page);
+        this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
+        this.page.on('framenavigated', (frame) => {
+            try {
+                if (frame !== this.page.mainFrame())
+                    return;
+                const nextDoc = this.stripUrlHash(frame.url());
+                if (nextDoc !== this.lastMainFrameDocUrl) {
+                    this.lastMainFrameDocUrl = nextDoc;
+                    this.motion?.resetPosition(120, 120);
+                    if (!this.navigatingViaSession) {
+                        void this.motion?.ensureCursorHUD(true).catch(() => { });
+                    }
+                }
+            }
+            catch {
+                // ignore navigation race inspection error
+            }
+        });
+        this.page.on('domcontentloaded', () => {
+            if (!this.navigatingViaSession) {
+                void this.motion?.ensureCursorHUD(true).catch(() => { });
+            }
+        });
         return this;
     }
     async navigate(url, waitUntil = 'load') {
         this.telemetry.recordOrigin(url);
-        await this.page.goto(url, { waitUntil, timeout: 30000 });
-        await this.motion.ensureCursorHUD();
+        const curDoc = this.stripUrlHash(this.page.url());
+        const nextDoc = this.stripUrlHash(url);
+        // Pull any synchronous runtime setStyle() changes made directly via window.__dshCursorAPI before leaving the page.
+        const dirtyStyle = await safeEvaluate(this.page, () => {
+            if (window.__dshStyleDirty && window.__dshCursorAPI) {
+                return window.__dshCursorAPI.getState?.()?.style ?? null;
+            }
+            return null;
+        }, null, 0).catch(() => null);
+        if (dirtyStyle && typeof dirtyStyle === 'object') {
+            this.motion.updateActiveStyleFromPage(dirtyStyle);
+        }
+        // Temporarily disable beforeunload guard on the outgoing page so programmatic navigation is never blocked.
+        if (this.motion.isUnloadGuardEnabled()) {
+            await safeEvaluate(this.page, () => {
+                window.__dshCursorAPI?.setUnloadGuard?.(false);
+            }, undefined, 0).catch(() => { });
+        }
+        if (curDoc !== nextDoc) {
+            this.motion.resetPosition(120, 120);
+        }
+        this.navigatingViaSession = true;
+        try {
+            await this.page.goto(url, { waitUntil, timeout: 30000 });
+            this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
+        }
+        finally {
+            this.navigatingViaSession = false;
+        }
+        await this.motion.ensureCursorHUD(true);
     }
     async screenshot(outputPath, retries = 2) {
         fs.mkdirSync(path.dirname(outputPath), { recursive: true });
         for (let attempt = 0; attempt <= retries; attempt++) {
             try {
-                await this.motion.ensureCursorHUD();
+                await this.motion.ensureCursorHUD(false);
                 await this.page.screenshot({ path: outputPath, fullPage: false });
                 return outputPath;
             }
@@ -194,6 +312,10 @@ export class BrowserSession {
         return outputPath;
     }
     async close() {
+        this.closingIntentionally = true;
+        if (this.isAlive()) {
+            await this.motion?.setUnloadGuard(false).catch(() => { });
+        }
         if (this.launchedPid) {
             try {
                 if (this.browser?.isConnected()) {

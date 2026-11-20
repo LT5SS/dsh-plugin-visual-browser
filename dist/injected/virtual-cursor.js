@@ -181,6 +181,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
         showTakeoverControl: Boolean(opts.showTakeoverControl),
         roleLabel: opts.roleLabel || '',
         takeoverHotkey: typeof opts.takeoverHotkey === 'string' ? opts.takeoverHotkey : 'F8',
+        unloadGuard: Boolean(opts.unloadGuard),
     });
     return `
 (() => {
@@ -198,7 +199,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
 
   if (window.__dshVirtualCursorInstalled) {
     if (window.__dshCursorAPI && INITIAL_STYLE) {
-      window.__dshCursorAPI.setStyle(INITIAL_STYLE);
+      window.__dshCursorAPI.setStyle(INITIAL_STYLE, { fromHost: true });
     }
     if (window.__dshCursorAPI && window.__dshCursorAPI.setTakeoverHotkey) {
       window.__dshCursorAPI.setTakeoverHotkey(INITIAL_OPTS.takeoverHotkey);
@@ -206,9 +207,29 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     if (window.__dshCursorAPI && INITIAL_OPTS.showTakeoverControl && window.__dshCursorAPI.setTakeoverState) {
       window.__dshCursorAPI.setTakeoverState('running', INITIAL_OPTS.roleLabel);
     }
+    if (window.__dshCursorAPI && window.__dshCursorAPI.setUnloadGuard) {
+      window.__dshCursorAPI.setUnloadGuard(Boolean(INITIAL_OPTS.unloadGuard));
+    }
     return;
   }
   window.__dshVirtualCursorInstalled = true;
+
+  let unloadGuardOn = false;
+  const unloadGuardHandler = (ev) => {
+    ev.preventDefault();
+    ev.returnValue = '';
+  };
+  function applyUnloadGuard(on) {
+    const next = Boolean(on);
+    if (next && !unloadGuardOn) {
+      window.addEventListener('beforeunload', unloadGuardHandler);
+      unloadGuardOn = true;
+    } else if (!next && unloadGuardOn) {
+      window.removeEventListener('beforeunload', unloadGuardHandler);
+      unloadGuardOn = false;
+    }
+    return unloadGuardOn;
+  }
 
   const state = {
     x: 120,
@@ -220,8 +241,15 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     takeoverLabel: INITIAL_OPTS.roleLabel || '',
     takeoverHotkey: INITIAL_OPTS.takeoverHotkey || 'F8',
     takeoverPending: Boolean(window.__dshTakeoverRequested),
+    dragActive: false,
+    dragOrigin: null,
+    dragTarget: null,
+    scrollActive: false,
+    scrollDir: 1,
   };
 
+  let scrollResetTimer = null;
+  let anchorFadeTimer = null;
   let badgeMeasurePending = false;
   function placeBadge(x, y) {
     const badge = document.getElementById('__dsh_vc_badge__');
@@ -317,10 +345,16 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       'inset:0',
       'width:100vw',
       'height:100vh',
+      'min-width:0',
+      'max-width:none',
+      'min-height:0',
+      'max-height:none',
       'margin:0',
       'padding:0',
       'border:0',
       'background:transparent',
+      'opacity:1',
+      'box-sizing:border-box',
       'pointer-events:none',
       'z-index:2147483647',
       'overflow:hidden',
@@ -328,30 +362,77 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     ].join(';');
 
     root.innerHTML = \`
-      <svg id="__dsh_vc_svg__" style="position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none">
+      <style id="__dsh_vc_style__">
+        #__dsh_vc_root__,
+        #__dsh_vc_root__ div,
+        #__dsh_vc_root__ span,
+        #__dsh_vc_root__ button,
+        #__dsh_vc_root__ img {
+          margin: 0;
+          padding: 0;
+          border: 0;
+          width: auto;
+          height: auto;
+          min-width: 0;
+          max-width: none;
+          min-height: 0;
+          max-height: none;
+          opacity: 1;
+          box-sizing: border-box;
+          float: none;
+          clear: none;
+          vertical-align: baseline;
+          line-height: normal;
+          text-indent: 0;
+          text-transform: none;
+          letter-spacing: normal;
+        }
+        #__dsh_vc_root__ svg {
+          margin: 0;
+          padding: 0;
+          border: 0;
+          min-width: 0;
+          max-width: none;
+          min-height: 0;
+          max-height: none;
+          opacity: 1;
+          box-sizing: border-box;
+          float: none;
+          clear: none;
+          vertical-align: baseline;
+          overflow: visible;
+        }
+      </style>
+      <svg id="__dsh_vc_svg__" style="position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;display:block;opacity:1;overflow:visible;pointer-events:none">
         <defs>
           <linearGradient id="__dsh_trail_grad__" x1="0%" y1="0%" x2="100%" y2="0%">
             <stop id="__dsh_grad_stop0__" offset="0%" stop-color="#ff3b28" stop-opacity="0.2"/>
             <stop id="__dsh_grad_stop1__" offset="100%" stop-color="#00f0ff" stop-opacity="0.95"/>
           </linearGradient>
+          <linearGradient id="__dsh_drag_grad__" gradientUnits="userSpaceOnUse" x1="120" y1="120" x2="120" y2="120">
+            <stop id="__dsh_drag_stop0__" offset="0%" stop-color="#00f0ff" stop-opacity="0.98"/>
+            <stop id="__dsh_drag_stop1__" offset="100%" stop-color="#ff3b28" stop-opacity="0.45"/>
+          </linearGradient>
         </defs>
         <path id="__dsh_vc_trail_glow__" fill="none" stroke="rgba(0,240,255,0.28)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"/>
         <path id="__dsh_vc_trail__" fill="none" stroke="url(#__dsh_trail_grad__)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"/>
         <g id="__dsh_vc_dots__" style="pointer-events:none"></g>
+        <g id="__dsh_vc_scroll_pulse__" style="pointer-events:none"></g>
         <g id="__dsh_vc_ripples__" style="pointer-events:none"></g>
       </svg>
-      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;max-width:calc(100vw - 16px);box-sizing:border-box;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #00f0ff;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);pointer-events:none;backdrop-filter:blur(8px);user-select:none">
-        <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;border-radius:50%;background:#00f0ff;box-shadow:0 0 8px #00f0ff;flex-shrink:0;pointer-events:none"></span>
-        <span id="__dsh_vc_status_text__" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none">DSH Agent 运行中</span>
-        <button id="__dsh_vc_takeover_btn__" type="button" style="border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;pointer-events:none;white-space:nowrap;flex-shrink:0">按 F8 接管</button>
+      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;width:auto;height:auto;max-width:calc(100vw - 16px);margin:0;box-sizing:border-box;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #00f0ff;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);opacity:1;pointer-events:none;backdrop-filter:blur(8px);user-select:none">
+        <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;margin:0;padding:0;border:0;border-radius:50%;background:#00f0ff;box-shadow:0 0 8px #00f0ff;flex-shrink:0;opacity:1;pointer-events:none"></span>
+        <span id="__dsh_vc_status_text__" style="min-width:0;width:auto;height:auto;margin:0;padding:0;border:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:1;pointer-events:none">DSH Agent 运行中</span>
+        <button id="__dsh_vc_takeover_btn__" type="button" style="width:auto;height:auto;margin:0;border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;opacity:1;pointer-events:none;white-space:nowrap;flex-shrink:0">按 F8 接管</button>
       </div>
-      <div id="__dsh_vc_pointer__" style="position:absolute;left:0;top:0;transform:translate3d(120px,120px,0);will-change:transform;pointer-events:none">
-        <div id="__dsh_vc_ring__" style="position:absolute;left:-7px;top:-7px;width:14px;height:14px;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8);pointer-events:none"></div>
-        <svg id="__dsh_vc_arrow_svg__" width="28" height="28" viewBox="0 0 28 28" style="position:absolute;left:-3px;top:-3px;transform-origin:3px 3px;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.65));pointer-events:none">
+      <div id="__dsh_vc_pointer__" style="position:absolute;left:0;top:0;width:0;height:0;margin:0;padding:0;border:0;background:transparent;opacity:1;overflow:visible;box-sizing:border-box;transform:translate3d(120px,120px,0);transform-origin:0 0;will-change:transform;pointer-events:none">
+        <div id="__dsh_vc_ring__" style="position:absolute;left:-9px;top:-9px;width:18px;height:18px;margin:0;padding:0;box-sizing:border-box;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8);opacity:1;pointer-events:none"></div>
+        <svg id="__dsh_vc_arrow_svg__" width="28" height="28" viewBox="0 0 28 28" style="position:absolute;left:-3px;top:-3px;width:28px;height:28px;margin:0;padding:0;border:0;display:block;opacity:1;overflow:visible;box-sizing:border-box;transform-origin:3px 3px;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.65));pointer-events:none">
           <path id="__dsh_vc_arrow_path__" d="M3 3 L11 24 L14.8 15.2 L23.5 11.5 Z" fill="#ff3b28" stroke="#ffffff" stroke-width="2" stroke-linejoin="round" fill-rule="evenodd" style="pointer-events:none"/>
         </svg>
-        <img id="__dsh_vc_custom_img__" alt="" style="position:absolute;left:-3px;top:-3px;width:28px;height:28px;object-fit:contain;display:none;pointer-events:none;transform-origin:top left;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.55))" />
-        <div id="__dsh_vc_badge__" style="position:absolute;left:22px;top:18px;padding:3px 9px;border-radius:999px;background:rgba(12,14,20,0.92);border:1.3px solid #00f0ff;color:#f5f8ff;font-size:10.5px;font-weight:700;letter-spacing:0.06em;white-space:nowrap;box-shadow:0 6px 16px rgba(0,0,0,0.45);pointer-events:none">
+        <img id="__dsh_vc_custom_img__" alt="" style="position:absolute;left:-3px;top:-3px;width:28px;height:28px;margin:0;padding:0;border:0;object-fit:contain;display:none;opacity:1;box-sizing:border-box;pointer-events:none;transform-origin:top left;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.55))" />
+        <div id="__dsh_vc_scroll_ind__" style="position:absolute;left:-26px;top:-9px;width:18px;height:20px;margin:0;padding:0;box-sizing:border-box;display:none;align-items:center;justify-content:center;border-radius:6px;background:rgba(12,14,20,0.92);border:1.5px solid #00f0ff;color:#00f0ff;font-size:13px;font-weight:900;line-height:1;box-shadow:0 0 10px rgba(0,240,255,0.75);opacity:1;pointer-events:none">↕</div>
+        <div id="__dsh_vc_badge__" style="position:absolute;left:22px;top:18px;width:auto;height:auto;margin:0;padding:3px 9px;box-sizing:border-box;border-radius:999px;background:rgba(12,14,20,0.92);border:1.3px solid #00f0ff;color:#f5f8ff;font-size:10.5px;font-weight:700;line-height:1.3;letter-spacing:0.06em;white-space:nowrap;box-shadow:0 6px 16px rgba(0,0,0,0.45);opacity:1;pointer-events:none">
           DSH · (120, 120) · READY
         </div>
       </div>
@@ -368,6 +449,50 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     }
     try { if (root.showPopover) root.showPopover(); } catch {}
     return root;
+  }
+
+  function mountDragAnchor(x, y) {
+    const root = ensureDOM();
+    if (!root) return;
+    if (anchorFadeTimer) {
+      clearTimeout(anchorFadeTimer);
+      anchorFadeTimer = null;
+    }
+    const prev = document.getElementById('__dsh_vc_anchor__');
+    if (prev) prev.remove();
+    const anchor = document.createElement('div');
+    anchor.id = '__dsh_vc_anchor__';
+    const rc = state.style.rippleColor || '#00f0ff';
+    anchor.style.cssText = [
+      'position:fixed',
+      'left:' + Math.round(x - 9) + 'px',
+      'top:' + Math.round(y - 9) + 'px',
+      'width:18px',
+      'height:18px',
+      'margin:0',
+      'padding:0',
+      'box-sizing:border-box',
+      'border-radius:50%',
+      'border:2px dashed ' + rc,
+      'background:rgba(0,240,255,0.16)',
+      'box-shadow:0 0 10px ' + rc,
+      'opacity:1',
+      'transition:opacity 0.35s ease',
+      'pointer-events:none'
+    ].join(';');
+    root.appendChild(anchor);
+  }
+
+  function fadeOutDragAnchor() {
+    const anchor = document.getElementById('__dsh_vc_anchor__');
+    if (!anchor) return;
+    anchor.style.opacity = '0';
+    if (anchorFadeTimer) clearTimeout(anchorFadeTimer);
+    anchorFadeTimer = setTimeout(() => {
+      anchorFadeTimer = null;
+      const el = document.getElementById('__dsh_vc_anchor__');
+      if (el) el.remove();
+    }, 420);
   }
 
   function renderTakeoverPanel() {
@@ -511,21 +636,34 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     const arrowSvg = document.getElementById('__dsh_vc_arrow_svg__');
     const arrowPath = document.getElementById('__dsh_vc_arrow_path__');
     const customImg = document.getElementById('__dsh_vc_custom_img__');
+    const scrollInd = document.getElementById('__dsh_vc_scroll_ind__');
     const badge = document.getElementById('__dsh_vc_badge__');
     const trail = document.getElementById('__dsh_vc_trail__');
     const trailGlow = document.getElementById('__dsh_vc_trail_glow__');
     const dotsG = document.getElementById('__dsh_vc_dots__');
+    const scrollPulseG = document.getElementById('__dsh_vc_scroll_pulse__');
     const stop0 = document.getElementById('__dsh_grad_stop0__');
     const stop1 = document.getElementById('__dsh_grad_stop1__');
+    const dragGrad = document.getElementById('__dsh_drag_grad__');
+    const dragStop0 = document.getElementById('__dsh_drag_stop0__');
+    const dragStop1 = document.getElementById('__dsh_drag_stop1__');
 
     const hotX = Number.isFinite(s.customPointerHotspotX) ? s.customPointerHotspotX : 3;
     const hotY = Number.isFinite(s.customPointerHotspotY) ? s.customPointerHotspotY : 3;
     const scale = Number.isFinite(s.pointerScale) ? s.pointerScale : 1;
+    const rotDeg = state.scrollActive && !state.dragActive ? (state.scrollDir >= 0 ? 12 : -12) : 0;
 
     if (pointer) {
-      pointer.style.transform = 'translate3d(' + state.x.toFixed(1) + 'px,' + state.y.toFixed(1) + 'px,0)';
+      pointer.style.transform =
+        'translate3d(' +
+        state.x.toFixed(1) +
+        'px,' +
+        state.y.toFixed(1) +
+        'px,0)' +
+        (state.dragActive ? ' scale(0.86)' : '');
     }
 
+    const shapeTransform = 'scale(' + scale + ')' + (rotDeg ? ' rotate(' + rotDeg + 'deg)' : '');
     const safeImg = s.pointerShape === 'custom-image' ? sanitizeImgUrl(s.customPointerImageUrl) : '';
     if (safeImg && customImg && arrowSvg) {
       arrowSvg.style.display = 'none';
@@ -536,7 +674,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       customImg.style.left = '-' + hotX + 'px';
       customImg.style.top = '-' + hotY + 'px';
       customImg.style.transformOrigin = hotX + 'px ' + hotY + 'px';
-      customImg.style.transform = 'scale(' + scale + ')';
+      customImg.style.transform = shapeTransform;
     } else if (arrowSvg && arrowPath) {
       if (customImg) {
         customImg.style.display = 'none';
@@ -547,7 +685,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       arrowSvg.style.left = '-' + svgOriginX + 'px';
       arrowSvg.style.top = '-' + svgOriginY + 'px';
       arrowSvg.style.transformOrigin = svgOriginX + 'px ' + svgOriginY + 'px';
-      arrowSvg.style.transform = 'scale(' + scale + ')';
+      arrowSvg.style.transform = shapeTransform;
       const customPath = typeof s.customPointerSvgPath === 'string' ? s.customPointerSvgPath.trim() : '';
       const d = s.pointerShape === 'custom-svg' && customPath
         ? customPath
@@ -557,18 +695,31 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       if (s.pointerShape === 'crosshair') {
         arrowPath.setAttribute('fill', 'none');
         arrowPath.setAttribute('stroke', s.pointerColor);
-        arrowPath.setAttribute('stroke-width', '2.4');
+        arrowPath.setAttribute('stroke-width', state.dragActive ? '3.6' : '2.4');
       } else {
         arrowPath.setAttribute('fill', s.pointerColor);
         arrowPath.setAttribute('stroke', s.pointerBorderColor);
-        arrowPath.setAttribute('stroke-width', '2');
+        arrowPath.setAttribute('stroke-width', state.dragActive ? '3.4' : '2');
       }
     }
 
     if (ring) {
       ring.style.borderColor = s.rippleColor;
-      ring.style.boxShadow = s.trailGlow ? '0 0 12px ' + s.rippleColor : 'none';
+      ring.style.borderWidth = state.dragActive ? '3px' : '2px';
+      ring.style.boxShadow = s.trailGlow ? '0 0 ' + (state.dragActive ? '16px ' : '12px ') + s.rippleColor : 'none';
     }
+
+    if (scrollInd) {
+      if (state.scrollActive && !state.dragActive) {
+        scrollInd.style.display = 'flex';
+        scrollInd.style.borderColor = s.rippleColor;
+        scrollInd.style.color = s.rippleColor;
+        scrollInd.style.boxShadow = s.trailGlow ? '0 0 10px ' + s.rippleColor : 'none';
+      } else {
+        scrollInd.style.display = 'none';
+      }
+    }
+
     if (badge) {
       badge.style.display = s.showBadge ? 'block' : 'none';
       badge.style.borderColor = s.rippleColor;
@@ -580,6 +731,63 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     if (stop1) stop1.setAttribute('stop-color', s.trailColorEnd);
 
     if (dotsG) dotsG.innerHTML = '';
+    if (scrollPulseG) scrollPulseG.innerHTML = '';
+
+    if (state.scrollActive && !state.dragActive && scrollPulseG) {
+      if (trail) trail.setAttribute('d', '');
+      if (trailGlow) trailGlow.setAttribute('d', '');
+      const NS = 'http://www.w3.org/2000/svg';
+      const dir = state.scrollDir >= 0 ? 1 : -1;
+      const pulseColor = s.trailColorEnd && s.trailColorEnd !== 'transparent' ? s.trailColorEnd : s.rippleColor;
+      const segments = [
+        { a: 16, b: 27, op: '0.95' },
+        { a: 31, b: 40, op: '0.62' },
+        { a: 44, b: 51, op: '0.30' },
+      ];
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        const line = document.createElementNS(NS, 'line');
+        line.setAttribute('x1', state.x.toFixed(1));
+        line.setAttribute('x2', state.x.toFixed(1));
+        line.setAttribute('y1', (state.y + dir * seg.a).toFixed(1));
+        line.setAttribute('y2', (state.y + dir * seg.b).toFixed(1));
+        line.setAttribute('stroke', pulseColor);
+        line.setAttribute('stroke-width', String(Math.max(2.6, (s.trailWidth || 2.8) * 1.15)));
+        line.setAttribute('stroke-linecap', 'round');
+        line.setAttribute('stroke-opacity', seg.op);
+        line.style.pointerEvents = 'none';
+        scrollPulseG.appendChild(line);
+      }
+      return;
+    }
+
+    if (state.dragActive && state.trail.length >= 2) {
+      const origin = state.dragOrigin || state.trail[0];
+      if (dragGrad) {
+        dragGrad.setAttribute('x1', state.x.toFixed(1));
+        dragGrad.setAttribute('y1', state.y.toFixed(1));
+        dragGrad.setAttribute('x2', origin.x.toFixed(1));
+        dragGrad.setAttribute('y2', origin.y.toFixed(1));
+      }
+      if (dragStop0) dragStop0.setAttribute('stop-color', s.trailColorEnd && s.trailColorEnd !== 'transparent' ? s.trailColorEnd : s.rippleColor);
+      if (dragStop1) dragStop1.setAttribute('stop-color', s.trailColorStart && s.trailColorStart !== 'transparent' ? s.trailColorStart : s.pointerColor);
+      const dragD = buildTrailPath(state.trail);
+      const dragWidth = Math.max(2.4, (s.trailWidth || 2.8) * 1.8);
+      if (trail) {
+        trail.setAttribute('d', dragD);
+        trail.setAttribute('stroke', 'url(#__dsh_drag_grad__)');
+        trail.setAttribute('stroke-width', dragWidth.toFixed(2));
+        trail.setAttribute('stroke-opacity', '0.96');
+        trail.setAttribute('stroke-dasharray', 'none');
+      }
+      if (trailGlow) {
+        trailGlow.setAttribute('d', dragD);
+        trailGlow.setAttribute('stroke', s.trailColorEnd && s.trailColorEnd !== 'transparent' ? s.trailColorEnd : s.rippleColor);
+        trailGlow.setAttribute('stroke-opacity', '0.52');
+        trailGlow.setAttribute('stroke-width', (dragWidth * 2.2).toFixed(2));
+      }
+      return;
+    }
 
     if (s.trailVariant === 'none' || state.trail.length < 2) {
       if (trail) trail.setAttribute('d', '');
@@ -608,6 +816,8 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     const d = buildTrailPath(state.trail);
     if (trail) {
       trail.setAttribute('d', d);
+      trail.setAttribute('stroke', 'url(#__dsh_trail_grad__)');
+      trail.setAttribute('stroke-opacity', '1');
       trail.setAttribute('stroke-width', String(s.trailVariant === 'comet' ? s.trailWidth * 1.35 : s.trailWidth));
       trail.setAttribute('stroke-dasharray', s.trailVariant === 'dashed' ? '5 3' : 'none');
     }
@@ -652,6 +862,8 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     }, 900);
   }
 
+  applyUnloadGuard(INITIAL_OPTS.unloadGuard);
+
   window.__dshCursorAPI = {
     update(x, y, action) {
       state.x = x;
@@ -669,8 +881,71 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       this.update(x, y, label);
       spawnRipple(x, y);
     },
-    setStyle(cfg = {}) {
-      const base = cfg.preset && PRESETS[cfg.preset] ? PRESETS[cfg.preset] : state.style;
+    dragStart(x, y, label) {
+      state.scrollActive = false;
+      state.dragActive = true;
+      state.dragOrigin = { x, y };
+      state.x = x;
+      state.y = y;
+      state.trail = [{ x, y }];
+      state.action = label || ('DRAG (' + Math.round(x) + ',' + Math.round(y) + ')');
+      mountDragAnchor(x, y);
+      render();
+    },
+    dragMove(x, y, toX, toY) {
+      state.scrollActive = false;
+      state.dragActive = true;
+      if (!state.dragOrigin) {
+        state.dragOrigin = { x, y };
+        mountDragAnchor(x, y);
+      }
+      state.x = x;
+      state.y = y;
+      const last = state.trail[state.trail.length - 1];
+      const maxLen = Math.max(state.style.trailLength || 22, 24);
+      if (!last || Math.hypot(x - last.x, y - last.y) > 2.0) {
+        state.trail.push({ x, y });
+        while (state.trail.length > maxLen) state.trail.shift();
+      }
+      const ox = Math.round(state.dragOrigin.x);
+      const oy = Math.round(state.dragOrigin.y);
+      const tx = Math.round(typeof toX === 'number' ? toX : x);
+      const ty = Math.round(typeof toY === 'number' ? toY : y);
+      state.action = 'DRAG (' + ox + ',' + oy + ') → (' + tx + ',' + ty + ')';
+      render();
+    },
+    dragEnd(x, y, label) {
+      state.dragActive = false;
+      state.x = x;
+      state.y = y;
+      state.action = label || ('DROP (' + Math.round(x) + ',' + Math.round(y) + ')');
+      spawnRipple(x, y);
+      fadeOutDragAnchor();
+      render();
+      state.dragOrigin = null;
+    },
+    scrollEffect(deltaY = 0, label) {
+      state.scrollActive = true;
+      state.scrollDir = deltaY >= 0 ? 1 : -1;
+      if (label) state.action = label;
+      if (scrollResetTimer) clearTimeout(scrollResetTimer);
+      scrollResetTimer = setTimeout(() => {
+        scrollResetTimer = null;
+        state.scrollActive = false;
+        render();
+      }, 400);
+      render();
+    },
+    setUnloadGuard(on) {
+      return applyUnloadGuard(on);
+    },
+    isUnloadGuardActive() {
+      return unloadGuardOn;
+    },
+    setStyle(cfg = {}, opts = {}) {
+      const base = cfg.preset && PRESETS[cfg.preset] && cfg.preset !== 'custom' && cfg.preset !== state.style.preset
+        ? PRESETS[cfg.preset]
+        : state.style;
       const next = {
         ...base,
         ...cfg,
@@ -682,6 +957,16 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
         state.trail.shift();
       }
       render();
+      if (!opts || !opts.fromHost) {
+        window.__dshStyleDirty = true;
+        try {
+          if (typeof window.__dshSyncCursorStyle === 'function') {
+            window.__dshSyncCursorStyle(state.style);
+          }
+        } catch {}
+      } else {
+        window.__dshStyleDirty = false;
+      }
       return state.style;
     },
     clearTrail() {

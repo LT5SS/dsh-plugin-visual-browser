@@ -138,7 +138,43 @@ export class AtomicBrowserToolset {
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };
     }
-    async scroll(directionOrDelta = 'down', waitMs = 300) {
+    async drag(from, to, steps = 12, waitMs = 200) {
+        const fromTarget = typeof from === 'string' ? resolveTargetSelector(from) : from;
+        const toTarget = typeof to === 'string' ? resolveTargetSelector(to) : to;
+        const fromPt = await this.session.motion.resolvePoint(fromTarget);
+        const toPt = await this.session.motion.resolvePoint(toTarget);
+        const dragRes = await this.session.motion.drag(fromPt, toPt, { steps });
+        if (!dragRes.ok && dragRes.blocked === 'PLUGIN_UI_LAYER') {
+            const observation = await this.sampler.captureSnapshot('drag_blocked');
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: dragRes.blocked,
+                at: dragRes.at,
+                hit: dragRes.hit,
+                hint: dragRes.hint,
+            });
+            return {
+                ok: false,
+                blocked: dragRes.blocked,
+                hit: dragRes.hit,
+                at: dragRes.at,
+                hint: dragRes.hint,
+                action: `Blocked drag start at (${Math.round(dragRes.at?.x ?? fromPt.x)},${Math.round(dragRes.at?.y ?? fromPt.y)}) by ${dragRes.blocked} (${dragRes.hit ?? 'overlay'})`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        if (waitMs > 0)
+            await this.session.page.waitForTimeout(waitMs);
+        const observation = await this.sampler.captureSnapshot('drag');
+        return {
+            ok: true,
+            action: `Dragged from (${Math.round(fromPt.x)},${Math.round(fromPt.y)}) to (${Math.round(toPt.x)},${Math.round(toPt.y)})`,
+            observation,
+            llmSummary: this.sampler.formatObservationForLLM(observation),
+        };
+    }
+    async scroll(directionOrDelta = 'down', waitMs = 220) {
         const deltaY = typeof directionOrDelta === 'number'
             ? directionOrDelta
             : directionOrDelta === 'down'
