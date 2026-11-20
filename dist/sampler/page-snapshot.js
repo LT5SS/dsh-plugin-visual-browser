@@ -99,6 +99,7 @@ export class PageSnapshotSampler {
             document.querySelectorAll('[data-dsh-ref]').forEach((el) => el.removeAttribute('data-dsh-ref'));
             const selectorQuery = [
                 'a[href]',
+                'area[href]',
                 'button',
                 'input',
                 'select',
@@ -148,6 +149,18 @@ export class PageSnapshotSampler {
                     if (firstCls)
                         selectorHint += `.${firstCls}`;
                 }
+                const rawHref = el.getAttribute('href')?.trim();
+                const href = rawHref ? rawHref.slice(0, 200) : undefined;
+                const rawValue = 'value' in el &&
+                    ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) &&
+                    el.type !== 'password' &&
+                    typeof el.value === 'string' &&
+                    el.value.length > 0
+                    ? el.value.slice(0, 80)
+                    : undefined;
+                const title = el.getAttribute('title')?.trim().slice(0, 120) || undefined;
+                const ariaLabel = el.getAttribute('aria-label')?.trim().slice(0, 120) || undefined;
+                const alt = el.getAttribute('alt')?.trim().slice(0, 120) || undefined;
                 nodes.push({
                     ref: refId,
                     tag: el.tagName.toLowerCase(),
@@ -164,6 +177,11 @@ export class PageSnapshotSampler {
                         width: Math.round(r.width),
                         height: Math.round(r.height),
                     },
+                    ...(href ? { href } : {}),
+                    ...(rawValue !== undefined ? { value: rawValue } : {}),
+                    ...(title ? { title } : {}),
+                    ...(ariaLabel ? { ariaLabel } : {}),
+                    ...(alt ? { alt } : {}),
                 });
             }
             const htmlEl = document.documentElement;
@@ -257,7 +275,17 @@ export class PageSnapshotSampler {
             `#### Visible Interactive Controls (${interactiveElements.length} in viewport):`,
         ];
         for (const el of interactiveElements.slice(0, 20)) {
-            lines.push(`  - \`${el.ref}\` [${el.tag}] "${el.label}" @ (${el.center.x}, ${el.center.y}) (${el.selectorHint})`);
+            const attrs = [];
+            if (el.href)
+                attrs.push(`href=\`${el.href}\``);
+            if (el.value !== undefined && el.value !== '')
+                attrs.push(`value=${JSON.stringify(el.value)}`);
+            if (el.title && el.title !== el.label)
+                attrs.push(`title=${JSON.stringify(el.title)}`);
+            if (el.alt && el.alt !== el.label)
+                attrs.push(`alt=${JSON.stringify(el.alt)}`);
+            const attrSuffix = attrs.length > 0 ? ` ${attrs.join(' ')}` : '';
+            lines.push(`  - \`${el.ref}\` [${el.tag}] "${el.label}"${attrSuffix} @ (${el.center.x}, ${el.center.y}) (${el.selectorHint})`);
         }
         return lines.join('\n');
     }

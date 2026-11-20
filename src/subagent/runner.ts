@@ -99,7 +99,17 @@ Respond ONLY with a single valid JSON object matching one of these actions:
 - {"type":"scroll","deltaY":800,"reason":"..."}
 - {"type":"navigate","url":"https://...","reason":"..."}
 - {"type":"pause_for_takeover","blockReason":"LOGIN_REQUIRED","message":"..."}
-- {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}`;
+- {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}
+
+事实纪律（违反即为报告失败）：
+1. 只能报告 HUD / 工具返回值里**实际出现**的字段。HUD 没有暴露的字段（例如未暴露 href 或 value），必须明确写「HUD 未暴露该字段」，禁止用你对站点的先验知识或训练记忆补全，也禁止写"依据标准结构推断"。
+2. 报告里每个关键事实后面必须标注来源，例如 \`href=... (来源: #1 HUD)\` 或 \`标题=... (来源: page title)\`。
+3. 不确定就明说不确定，绝不为了完成报告而编造或猜测未观测到的内容。
+
+动作效率与步数预算规则：
+1. \`move_mouse\` 的装饰性轨迹动作（如 jiggle、slow approach、probe）**仅在用户明确要求演示鼠标轨迹时使用**；否则直接使用 \`hover\` / \`click\` / \`scroll\` / \`type_text\` / \`navigate\` 等语义动作，或直接汇总结果。
+2. 当现有 HUD 已包含任务所需的全部事实时，立即返回 \`complete\`，不要"再摸一下确认"。
+3. 时刻关注剩余步数预算（\`stepIndex / maxSteps\`）：若剩余步数 <= 1，必须在本步直接返回 \`complete\` 收尾。`;
 
 export interface PlannerStepDiagnostic {
   step: number;
@@ -348,7 +358,14 @@ export function createDshHostLlmPlanner(opts: {
     const entries = ctx.history.getEntries();
     const archived = entries.filter((e) => e.imageBase64 === null).map((e) => `- ${e.compactText}`);
 
-    let promptText = `## Task Goal\n${ctx.taskPrompt}\n`;
+    const remainingSteps = Math.max(0, ctx.maxSteps - ctx.stepIndex);
+    let promptText =
+      `## Task Goal\n${ctx.taskPrompt}\n\n` +
+      `## Step Budget\nCurrent decision step: ${ctx.stepIndex} / ${ctx.maxSteps} (remaining after this step: ${remainingSteps})` +
+      (remainingSteps <= 1
+        ? ' — FINAL STEP BUDGET: return {"type":"complete",...} now with all verified facts.'
+        : '') +
+      `\n`;
     if (archived.length > 0) {
       promptText += `\n## Archived Earlier Steps\n${archived.join('\n')}\n`;
     }

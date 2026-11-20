@@ -1,6 +1,24 @@
 import type { BrowserSession } from '../driver/browser-session.js';
 import type { Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
-import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
+import { PageSnapshotSampler, safeEvaluate, type PageObservation } from '../sampler/page-snapshot.js';
+
+export interface DomInspectSample {
+  tag: string;
+  text: string;
+  classes: string;
+  href?: string;
+  value?: string;
+  title?: string;
+  alt?: string;
+  computedStyle: Record<string, string>;
+}
+
+export interface DomInspectResult {
+  count: number;
+  samples: DomInspectSample[];
+  degraded?: boolean;
+  degradedReason?: string;
+}
 
 export interface AtomicToolResult {
   action: string;
@@ -137,37 +155,59 @@ export class AtomicBrowserToolset {
 
   /**
    * Read-only DOM & computed style inspection query for the agent.
+   * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
    */
-  public async inspectDom(selector: string): Promise<{
-    count: number;
-    samples: Array<{
-      tag: string;
-      text: string;
-      classes: string;
-      computedStyle: Record<string, string>;
-    }>;
-  }> {
-    return this.session.page.evaluate((sel) => {
-      const els = Array.from(document.querySelectorAll(sel));
-      return {
-        count: els.length,
-        samples: els.slice(0, 5).map((el) => {
-          const cs = window.getComputedStyle(el);
-          return {
-            tag: el.tagName.toLowerCase(),
-            text: ((el as HTMLElement).innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80),
-            classes: typeof el.className === 'string' ? el.className : '',
-            computedStyle: {
-              color: cs.color,
-              backgroundColor: cs.backgroundColor,
-              fontFamily: cs.fontFamily,
-              fontSize: cs.fontSize,
-              position: cs.position,
-              transform: cs.transform,
-            },
-          };
-        }),
-      };
-    }, selector);
+  public async inspectDom(selector: string): Promise<DomInspectResult> {
+    const fallback: DomInspectResult = {
+      count: 0,
+      samples: [],
+      degraded: true,
+      degradedReason: 'inspectDom degraded: navigation race',
+    };
+
+    return safeEvaluate<DomInspectResult, string>(
+      this.session.page,
+      (sel: string): DomInspectResult => {
+        const els = Array.from(document.querySelectorAll(sel));
+        return {
+          count: els.length,
+          samples: els.slice(0, 5).map((el) => {
+            const cs = window.getComputedStyle(el);
+            const rawHref = el.getAttribute('href')?.trim();
+            const href = rawHref ? rawHref.slice(0, 200) : undefined;
+            const value =
+              'value' in el &&
+              ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) &&
+              (el as HTMLInputElement).type !== 'password' &&
+              typeof (el as HTMLInputElement).value === 'string' &&
+              (el as HTMLInputElement).value.length > 0
+                ? (el as HTMLInputElement).value.slice(0, 80)
+                : undefined;
+            const title = el.getAttribute('title')?.trim().slice(0, 120) || undefined;
+            const alt = el.getAttribute('alt')?.trim().slice(0, 120) || undefined;
+
+            return {
+              tag: el.tagName.toLowerCase(),
+              text: ((el as HTMLElement).innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+              classes: typeof el.className === 'string' ? el.className : '',
+              ...(href ? { href } : {}),
+              ...(value !== undefined ? { value } : {}),
+              ...(title ? { title } : {}),
+              ...(alt ? { alt } : {}),
+              computedStyle: {
+                color: cs.color,
+                backgroundColor: cs.backgroundColor,
+                fontFamily: cs.fontFamily,
+                fontSize: cs.fontSize,
+                position: cs.position,
+                transform: cs.transform,
+              },
+            };
+          }),
+        };
+      },
+      fallback,
+      { arg: selector, retries: 2 }
+    );
   }
 }

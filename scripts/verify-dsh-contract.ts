@@ -11,7 +11,10 @@ import {
   type ToolDefinition,
 } from '@deepseek-ai/dsh-tools';
 import {
+  AtomicBrowserToolset,
+  BrowserSession,
   PageSnapshotSampler,
+  SUBAGENT_SYSTEM_PROMPT,
   apply,
   extractHostStreamChunk,
   parseJsonDecision,
@@ -36,6 +39,21 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const cleanUrl = (req.url || '/').split('?')[0];
+      if (cleanUrl === '/__hud-fixture.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>HUD Fixture</title></head>
+<body style="font-family: sans-serif; padding: 24px;">
+  <h1>HUD Attribute Fixture</h1>
+  <p><a id="ext-link" href="https://x.example/y" title="External target">Learn more</a></p>
+  <p><input id="email-box" aria-label="Email" value="abc" /></p>
+  <p><input id="pwd-box" type="password" aria-label="Password" value="secret123" /></p>
+  <p><button id="plain-btn">Plain Action</button></p>
+</body>
+</html>`);
+        return;
+      }
       const relPath = cleanUrl === '/' ? 'index.html' : cleanUrl.replace(/^\/+/, '');
       const fullPath = path.join(rootDir, decodeURIComponent(relPath));
 
@@ -414,6 +432,79 @@ async function main() {
   assert.equal(degradedObs.degradedReason, 'sampler degraded: navigation race');
   assert.ok(degradedSampler.formatObservationForLLM(degradedObs).includes('sampler degraded: navigation race'));
   console.log('[Strict DSH 0.2 Contract] 0e Verified safeEvaluate() navigation-race fallback & strict rethrow!');
+
+  // 0f. TASK-v1.1.8 Acceptance #2: AtomicBrowserToolset.inspectDom() safeEvaluate fallback & rethrow
+  const navInspectToolset = new AtomicBrowserToolset(
+    {
+      page: navPage as any,
+      motion: { getPosition: () => ({ x: 0, y: 0 }) } as any,
+      telemetry: { getHealthReport: () => ({}) } as any,
+      screenshot: async (p: string) => p,
+    } as any,
+    path.join(pkgRoot, 'artifacts/contract-test')
+  );
+  const navInspectRes = await navInspectToolset.inspectDom('a');
+  assert.equal(navInspectRes.count, 0);
+  assert.deepEqual(navInspectRes.samples, []);
+  assert.equal(navInspectRes.degraded, true);
+  assert.ok((navInspectRes.degradedReason ?? '').length > 0);
+
+  const bugInspectToolset = new AtomicBrowserToolset(
+    {
+      page: {
+        async evaluate() {
+          throw new TypeError('Unexpected inspectDom bug');
+        },
+        async waitForLoadState() {},
+        async waitForTimeout() {},
+      } as any,
+      motion: { getPosition: () => ({ x: 0, y: 0 }) } as any,
+      telemetry: { getHealthReport: () => ({}) } as any,
+      screenshot: async (p: string) => p,
+    } as any,
+    path.join(pkgRoot, 'artifacts/contract-test')
+  );
+  await assert.rejects(
+    () => bugInspectToolset.inspectDom('a'),
+    /Unexpected inspectDom bug/
+  );
+  console.log('[Strict DSH 0.2 Contract] 0f Verified inspectDom() navigation-race fallback & strict rethrow!');
+
+  // 0g. TASK-v1.1.8 Acceptance #3: verify dist/**/*.js has NO bare .evaluate( outside safeEvaluate()
+  const collectJsFiles = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...collectJsFiles(full));
+      else if (entry.name.endsWith('.js')) out.push(full);
+    }
+    return out;
+  };
+  const distJsFiles = collectJsFiles(path.join(pkgRoot, 'dist'));
+  assert.ok(distJsFiles.length > 0, 'Expected built dist/*.js files to exist before running contract checks');
+  for (const file of distJsFiles) {
+    const rel = path.relative(pkgRoot, file).replace(/\\/g, '/');
+    const code = fs.readFileSync(file, 'utf8');
+    const matches = code.match(/\.evaluate\s*\(/g) ?? [];
+    if (rel === 'dist/sampler/page-snapshot.js') {
+      assert.ok(
+        matches.length <= 2,
+        `Expected .evaluate( in ${rel} only inside safeEvaluate(), found ${matches.length}`
+      );
+    } else {
+      assert.equal(
+        matches.length,
+        0,
+        `Found bare .evaluate( in built ${rel}; all page evaluations must use safeEvaluate()`
+      );
+    }
+  }
+  console.log(`[Strict DSH 0.2 Contract] 0g Verified 0 bare page.evaluate() across ${distJsFiles.length} dist JS files!`);
+
+  // 0h. TASK-v1.1.9 P0.5/P1: verify factual discipline & step-budget rules in SUBAGENT_SYSTEM_PROMPT
+  assert.ok(SUBAGENT_SYSTEM_PROMPT.includes('HUD 未暴露该字段'));
+  assert.ok(SUBAGENT_SYSTEM_PROMPT.includes('剩余步数') && SUBAGENT_SYSTEM_PROMPT.includes('complete'));
+  console.log('[Strict DSH 0.2 Contract] 0h Verified SUBAGENT_SYSTEM_PROMPT factual discipline & step budget rules!');
 
   // Checks 1-5: End-to-end tool execution with headless Chromium & local static server
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
@@ -838,6 +929,50 @@ async function main() {
     assert.ok(String(failDiagJson.error?.message ?? '').includes('Synthetic step crash for diagnostics check'));
     assert.equal(failDiagJson.planner_mode, 'custom');
     console.log('[Strict DSH 0.2 Contract] 5f Verified FAILED runTask() still persists diagnostics.json!');
+
+    // 5g. TASK-v1.1.9 Acceptance #2: real Chromium HUD + inspectDom() expose href/value without undefined/secrets
+    const hudSession = await new BrowserSession({
+      mode: 'auto',
+      backgroundSilent: true,
+    }).start();
+    try {
+      const hudTools = new AtomicBrowserToolset(hudSession, path.join(artifactDir, 'hud-fixture'));
+      const hudNav = await hudTools.navigate(`${srv.url}__hud-fixture.html`, 400);
+      const els = hudNav.observation.interactiveElements;
+
+      const linkEl = els.find((e) => e.label === 'Learn more');
+      assert.ok(linkEl, 'Expected Learn more anchor in interactiveElements');
+      assert.equal(linkEl.href, 'https://x.example/y');
+      assert.equal(linkEl.title, 'External target');
+      assert.ok(hudNav.llmSummary.includes('href=`https://x.example/y`'));
+
+      const emailEl = els.find((e) => e.label === 'Email');
+      assert.ok(emailEl, 'Expected Email input in interactiveElements');
+      assert.equal(emailEl.value, 'abc');
+      assert.ok(hudNav.llmSummary.includes('value="abc"'));
+
+      const pwdEl = els.find((e) => e.label === 'Password');
+      assert.ok(pwdEl, 'Expected Password input in interactiveElements');
+      assert.equal(pwdEl.value, undefined, 'Password input values must never be exposed in HUD');
+      assert.ok(!hudNav.llmSummary.includes('secret123'), 'HUD text must not leak password values');
+
+      const btnEl = els.find((e) => e.label === 'Plain Action');
+      assert.ok(btnEl, 'Expected Plain Action button in interactiveElements');
+      assert.equal(btnEl.href, undefined);
+      const btnLine = hudNav.llmSummary.split('\n').find((l) => l.includes('Plain Action')) ?? '';
+      assert.ok(!btnLine.includes('href=') && !btnLine.includes('undefined'), `Unexpected attrs on plain button line: ${btnLine}`);
+
+      const domLinkRes = await hudTools.inspectDom('a#ext-link');
+      assert.equal(domLinkRes.count, 1);
+      assert.equal(domLinkRes.samples[0]?.href, 'https://x.example/y');
+      assert.equal(domLinkRes.samples[0]?.title, 'External target');
+
+      const domInputRes = await hudTools.inspectDom('input#email-box');
+      assert.equal(domInputRes.samples[0]?.value, 'abc');
+      console.log('[Strict DSH 0.2 Contract] 5g Verified HUD & inspectDom() href/value exposure + password masking!');
+    } finally {
+      await hudSession.close();
+    }
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

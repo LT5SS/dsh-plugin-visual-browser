@@ -1,6 +1,22 @@
 import type { BrowserSession } from '../driver/browser-session.js';
 import type { Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
+export interface DomInspectSample {
+    tag: string;
+    text: string;
+    classes: string;
+    href?: string;
+    value?: string;
+    title?: string;
+    alt?: string;
+    computedStyle: Record<string, string>;
+}
+export interface DomInspectResult {
+    count: number;
+    samples: DomInspectSample[];
+    degraded?: boolean;
+    degradedReason?: string;
+}
 export interface AtomicToolResult {
     action: string;
     observation: PageObservation;
@@ -26,14 +42,7 @@ export declare class AtomicBrowserToolset {
     scroll(directionOrDelta?: 'down' | 'up' | number, waitMs?: number): Promise<AtomicToolResult>;
     /**
      * Read-only DOM & computed style inspection query for the agent.
+     * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
      */
-    inspectDom(selector: string): Promise<{
-        count: number;
-        samples: Array<{
-            tag: string;
-            text: string;
-            classes: string;
-            computedStyle: Record<string, string>;
-        }>;
-    }>;
+    inspectDom(selector: string): Promise<DomInspectResult>;
 }

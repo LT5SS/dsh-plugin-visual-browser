@@ -40,6 +40,11 @@ export interface InteractiveElementNode {
         width: number;
         height: number;
     };
+    href?: string;
+    value?: string;
+    title?: string;
+    ariaLabel?: string;
+    alt?: string;
 }
 export interface DomTechStats {
     title: string;

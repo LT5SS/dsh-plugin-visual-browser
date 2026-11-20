@@ -1,4 +1,4 @@
-import { PageSnapshotSampler } from '../sampler/page-snapshot.js';
+import { PageSnapshotSampler, safeEvaluate } from '../sampler/page-snapshot.js';
 /**
  * Normalizes a target string:
  * - "#4" (when matching a sampled ref ID) -> '[data-dsh-ref="4"]'
@@ -112,18 +112,40 @@ export class AtomicBrowserToolset {
     }
     /**
      * Read-only DOM & computed style inspection query for the agent.
+     * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
      */
     async inspectDom(selector) {
-        return this.session.page.evaluate((sel) => {
+        const fallback = {
+            count: 0,
+            samples: [],
+            degraded: true,
+            degradedReason: 'inspectDom degraded: navigation race',
+        };
+        return safeEvaluate(this.session.page, (sel) => {
             const els = Array.from(document.querySelectorAll(sel));
             return {
                 count: els.length,
                 samples: els.slice(0, 5).map((el) => {
                     const cs = window.getComputedStyle(el);
+                    const rawHref = el.getAttribute('href')?.trim();
+                    const href = rawHref ? rawHref.slice(0, 200) : undefined;
+                    const value = 'value' in el &&
+                        ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) &&
+                        el.type !== 'password' &&
+                        typeof el.value === 'string' &&
+                        el.value.length > 0
+                        ? el.value.slice(0, 80)
+                        : undefined;
+                    const title = el.getAttribute('title')?.trim().slice(0, 120) || undefined;
+                    const alt = el.getAttribute('alt')?.trim().slice(0, 120) || undefined;
                     return {
                         tag: el.tagName.toLowerCase(),
                         text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80),
                         classes: typeof el.className === 'string' ? el.className : '',
+                        ...(href ? { href } : {}),
+                        ...(value !== undefined ? { value } : {}),
+                        ...(title ? { title } : {}),
+                        ...(alt ? { alt } : {}),
                         computedStyle: {
                             color: cs.color,
                             backgroundColor: cs.backgroundColor,
@@ -135,6 +157,6 @@ export class AtomicBrowserToolset {
                     };
                 }),
             };
-        }, selector);
+        }, fallback, { arg: selector, retries: 2 });
     }
 }
