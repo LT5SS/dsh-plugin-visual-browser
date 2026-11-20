@@ -133,6 +133,7 @@ export declare function createDshHostLlmPlanner(opts: {
     attachments?: any;
     provider: string;
     model: string;
+    sessionId?: string;
     fallbackPlanner?: SubagentPlanner;
     onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner;

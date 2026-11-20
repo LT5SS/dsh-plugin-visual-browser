@@ -334,13 +334,15 @@ async function main() {
 
   const srv = await startSilentStaticServer(distDir);
   let hostLlmCalls = 0;
+  const capturedStreamOptions: any[] = [];
 
   const strictHost = createCordisStrictCtx({
     validateSchemas: true,
     services: {
       attachments: createAttachmentsStub(),
       llm: {
-        async *stream(_options: any) {
+        async *stream(options: any) {
+          capturedStreamOptions.push(options);
           hostLlmCalls++;
           if (hostLlmCalls === 1) {
             yield {
@@ -420,7 +422,7 @@ async function main() {
       throw new Error('Expected browser_quick_snapshot output.render to include an image ContentBlock from ctx.attachments');
     }
 
-    // 3. Verify browser_subagent_run using Cordis-injected ctx.llm + ctx.attachments
+    // 3. Verify browser_subagent_run using Cordis-injected ctx.llm + ctx.attachments + sessionId & system forwarding
     const runDef = strictHost.registeredTools.get('browser_subagent_run')!;
     const runVal: any = await runDef.execute(
       {
@@ -429,7 +431,7 @@ async function main() {
         task_prompt: 'Test host ctx.llm integration and output schema compliance.',
         max_steps: 4,
       },
-      fakeExec
+      { ...fakeExec, agent: { sessionId: 'sess-contract-123' } } as any
     );
     const runViolations = validateJsonSchemaValue(runDef.output.schema, runVal);
     if (runViolations.length > 0) {
@@ -441,6 +443,15 @@ async function main() {
     assert.equal(runVal.host_services?.llm, true);
     assert.equal(runVal.host_services?.attachments, true);
     assert.equal(runVal.planner_detail?.fallback_count, 0);
+    assert.ok(capturedStreamOptions.length >= 1, 'Expected ctx.llm.stream to receive call options');
+    assert.equal(capturedStreamOptions[0].sessionId, 'sess-contract-123');
+    assert.equal(typeof capturedStreamOptions[0].system, 'string');
+    assert.ok(capturedStreamOptions[0].system.length > 0);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(capturedStreamOptions[0], 'systemPrompt'),
+      false,
+      'ctx.llm.stream options must not use legacy systemPrompt field'
+    );
 
     const runRenderedText = runBlocks.find((b: any) => b.type === 'text')?.text ?? '';
     assert.ok(runRenderedText.includes('— planner: host-ctx-llm'));
@@ -657,6 +668,50 @@ async function main() {
     assert.equal(finishErrCalls, 1, 'Expected config error NO_ADAPTER to skip redundant text-only retry');
     assert.equal(finishErrVal.planner_detail?.llm_steps?.[0]?.retried_text_only, undefined);
     console.log('[Strict DSH 0.2 Contract] 5d Verified finish error chunk (NO_ADAPTER) surfaced & retry skipped!');
+
+    // 5e. Issue #6 / TASK-v1.1.6: INVALID_REQUEST / MissingSessionID skips redundant text-only retry
+    let invalidReqCalls = 0;
+    const invalidReqHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream() {
+            invalidReqCalls++;
+            yield {
+              type: 'finish',
+              reason: {
+                kind: 'error',
+                failure: {
+                  code: 'INVALID_REQUEST',
+                  message: 'MissingSessionID',
+                },
+              },
+            };
+          },
+        },
+      },
+    });
+    apply(invalidReqHost.ctx, {
+      mode: 'auto',
+      backgroundSilent: true,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...invalidReqHost.effectDisposers);
+    const invalidReqRunDef = invalidReqHost.registeredTools.get('browser_subagent_run')!;
+    const invalidReqVal: any = await invalidReqRunDef.execute(
+      { url: srv.url, role: 'InvalidReq Verifier', task_prompt: 'Verify INVALID_REQUEST skips retry', max_steps: 1 },
+      fakeExec
+    );
+    assert.equal(invalidReqVal.status, 'COMPLETED');
+    assert.equal(invalidReqVal.planner_mode, 'host-ctx-llm-fallback');
+    assert.equal(invalidReqVal.planner_detail?.last_fallback_reason, 'HOST_LLM_ERROR_CHUNK');
+    assert.ok(String(invalidReqVal.planner_detail?.llm_steps?.[0]?.stream_error ?? '').includes('INVALID_REQUEST'));
+    assert.equal(invalidReqCalls, 1, 'Expected INVALID_REQUEST MissingSessionID to skip redundant text-only retry');
+    assert.equal(invalidReqVal.planner_detail?.llm_steps?.[0]?.retried_text_only, undefined);
+    console.log('[Strict DSH 0.2 Contract] 5e Verified INVALID_REQUEST MissingSessionID skips redundant retry!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

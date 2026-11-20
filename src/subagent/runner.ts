@@ -279,6 +279,7 @@ export function createDshHostLlmPlanner(opts: {
   attachments?: any;
   provider: string;
   model: string;
+  sessionId?: string;
   fallbackPlanner?: SubagentPlanner;
   onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner {
@@ -325,7 +326,8 @@ export function createDshHostLlmPlanner(opts: {
         const stream = await opts.llm.stream({
           provider: opts.provider,
           model: opts.model,
-          systemPrompt: SUBAGENT_SYSTEM_PROMPT,
+          ...(opts.sessionId ? { sessionId: opts.sessionId as any } : {}),
+          system: SUBAGENT_SYSTEM_PROMPT,
           messages: [
             {
               id: `msg-${crypto.randomUUID()}`,
@@ -366,9 +368,12 @@ export function createDshHostLlmPlanner(opts: {
     let attempt = await runStreamAttempt(imageBlock ? [textBlock, imageBlock] : [textBlock]);
     let decision = parseJsonDecision(attempt.fullText);
     let retriedTextOnly = false;
-    const isConfigError = /NO_ADAPTER|NO_API_KEY|UNAUTHORIZED|MODEL_NOT_FOUND/i.test(
-      attempt.streamError ?? ''
-    );
+    const isImageRejection = /image|vision|multimodal|attachment/i.test(attempt.streamError ?? '');
+    const isConfigError =
+      !isImageRejection &&
+      /NO_ADAPTER|NO_API_KEY|UNAUTHORIZED|MODEL_NOT_FOUND|INVALID_REQUEST|MissingSessionID/i.test(
+        attempt.streamError ?? ''
+      );
 
     if (!decision && imageBlock && !ctx.signal?.aborted && !isConfigError) {
       retriedTextOnly = true;

@@ -320,12 +320,19 @@ function resolveSubagentPlanner(
   }
 
   if (initialMode === 'host-ctx-llm' && effectiveServices.llm && route) {
+    const agentAny = exec?.agent as any;
+    const rawSessionId =
+      safeRead(() => agentAny?.sessionId) ?? safeRead(() => agentAny?.session?.id);
+    const sessionId =
+      typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined;
+
     return {
       planner: createDshHostLlmPlanner({
         llm: effectiveServices.llm,
         attachments: effectiveServices.attachments,
         provider: route.provider,
         model: route.model,
+        ...(sessionId ? { sessionId } : {}),
         onStepDiagnostic,
       }),
       tracker,
