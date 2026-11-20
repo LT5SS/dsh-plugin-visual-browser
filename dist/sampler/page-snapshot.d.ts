@@ -1,6 +1,23 @@
+import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
 import type { Point2D } from '../driver/types.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
+/** Returns true when a Playwright error stems from mid-evaluation navigation or frame detachment. */
+export declare function isNavigationRaceError(error: unknown): boolean;
+export type SafeEvaluatePage = Pick<Page, 'evaluate'> & Partial<Pick<Page, 'waitForLoadState' | 'waitForTimeout'>>;
+/**
+ * Runs `page.evaluate()` with automatic retries and fallback on navigation-race errors.
+ * Non-navigation errors always rethrow immediately so real bugs are never masked.
+ */
+export declare function safeEvaluate<T>(page: SafeEvaluatePage, fn: () => T, fallbackValue: T, retriesOrOptions?: number | {
+    retries?: number;
+    onDegraded?: (reason: string) => void;
+}): Promise<T>;
+export declare function safeEvaluate<T, Arg>(page: SafeEvaluatePage, fn: (arg: Arg) => T, fallbackValue: T, options: {
+    arg: Arg;
+    retries?: number;
+    onDegraded?: (reason: string) => void;
+}): Promise<T>;
 export interface ScrollMetrics {
     scrollX: number;
     scrollY: number;
@@ -51,6 +68,7 @@ export interface PageObservation {
     domStats: DomTechStats;
     interactiveElements: InteractiveElementNode[];
     health: TelemetryHealthReport;
+    degradedReason?: string;
 }
 export declare class PageSnapshotSampler {
     private session;

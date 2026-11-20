@@ -42,6 +42,7 @@ export interface SubagentPlannerContext {
 export type SubagentPlanner = (ctx: SubagentPlannerContext) => Promise<SubagentActionDecision>;
 
 export interface SubagentTaskRequest {
+  subagentId?: string;
   role: string;
   taskPrompt: string;
   startUrl: string;
@@ -111,6 +112,62 @@ export interface PlannerStepDiagnostic {
   retried_text_only?: boolean;
   stream_error?: string;
   fallback_reason?: string;
+  decision_source?: 'llm' | 'inspector';
+  action?: Record<string, unknown>;
+}
+
+/** Summarizes a SubagentActionDecision into a compact JSON-safe replay object for diagnostics. */
+export function summarizeDecisionAction(decision: SubagentActionDecision): Record<string, unknown> {
+  switch (decision.type) {
+    case 'navigate':
+      return { type: 'navigate', url: decision.url };
+    case 'move_mouse':
+      return {
+        type: 'move_mouse',
+        points_count: Array.isArray(decision.points) ? decision.points.length : 1,
+        ...(decision.label ? { label: decision.label } : {}),
+      };
+    case 'hover':
+    case 'click':
+      return {
+        type: decision.type,
+        target: decision.target,
+        ...(typeof decision.target === 'string' && decision.target.startsWith('#')
+          ? { ref: decision.target }
+          : {}),
+      };
+    case 'type_text':
+      return {
+        type: 'type_text',
+        target: decision.target,
+        text_length: decision.text.length,
+        ...(decision.pressEnter ? { pressEnter: true } : {}),
+      };
+    case 'scroll':
+      return { type: 'scroll', deltaY: decision.deltaY };
+    case 'set_cursor_style':
+      return {
+        type: 'set_cursor_style',
+        ...(decision.style.preset ? { preset: decision.style.preset } : {}),
+      };
+    case 'complete':
+      return { type: 'complete', report_length: decision.report.length };
+    case 'pause_for_takeover':
+      return { type: 'pause_for_takeover', blockReason: decision.blockReason };
+  }
+}
+
+async function runFallbackAndRecord(
+  diag: PlannerStepDiagnostic,
+  fallback: SubagentPlanner,
+  ctx: SubagentPlannerContext,
+  onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void
+): Promise<SubagentActionDecision> {
+  const fallbackDecision = await fallback(ctx);
+  diag.decision_source = 'inspector';
+  diag.action = summarizeDecisionAction(fallbackDecision);
+  onStepDiagnostic?.(diag);
+  return fallbackDecision;
 }
 
 function isPoint2D(value: unknown): value is Point2D {
@@ -191,6 +248,8 @@ const RECOGNIZED_NON_TEXT_CHUNK_TYPES = new Set([
   'thinking-delta',
   'thinking',
   'start',
+  'block-start',
+  'block-end',
   'step-start',
   'step-finish',
   'message-start',
@@ -393,6 +452,8 @@ export function createDshHostLlmPlanner(opts: {
     };
 
     if (decision) {
+      diag.decision_source = 'llm';
+      diag.action = summarizeDecisionAction(decision);
       opts.onStepDiagnostic?.(diag);
       return decision;
     }
@@ -411,9 +472,7 @@ export function createDshHostLlmPlanner(opts: {
       diag.text_preview = attempt.fullText.trim().slice(0, 200);
     }
     diag.fallback_reason = fallbackReason;
-    opts.onStepDiagnostic?.(diag);
-
-    return fallback(ctx);
+    return runFallbackAndRecord(diag, fallback, ctx, opts.onStepDiagnostic);
   };
 }
 
@@ -472,16 +531,20 @@ export function createOpenAIVisionPlanner(opts: {
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
-        opts.onStepDiagnostic?.({
-          step: ctx.stepIndex,
-          backend: 'external-vision-api',
-          chunk_count: 0,
-          chunk_types: {},
-          text_length: 0,
-          stream_error: `HTTP ${res.status} ${errBody}`.trim().slice(0, 300),
-          fallback_reason: 'VISION_API_HTTP_ERROR',
-        });
-        return fallback(ctx);
+        return runFallbackAndRecord(
+          {
+            step: ctx.stepIndex,
+            backend: 'external-vision-api',
+            chunk_count: 0,
+            chunk_types: {},
+            text_length: 0,
+            stream_error: `HTTP ${res.status} ${errBody}`.trim().slice(0, 300),
+            fallback_reason: 'VISION_API_HTTP_ERROR',
+          },
+          fallback,
+          ctx,
+          opts.onStepDiagnostic
+        );
       }
 
       const data = (await res.json()) as any;
@@ -494,33 +557,43 @@ export function createOpenAIVisionPlanner(opts: {
           chunk_count: 1,
           chunk_types: { completion: 1 },
           text_length: rawContent.length,
+          decision_source: 'llm',
+          action: summarizeDecisionAction(decision),
         });
         return decision;
       }
 
       const empty = rawContent.trim().length === 0;
-      opts.onStepDiagnostic?.({
-        step: ctx.stepIndex,
-        backend: 'external-vision-api',
-        chunk_count: 1,
-        chunk_types: { completion: 1 },
-        text_length: rawContent.length,
-        ...(!empty ? { text_preview: rawContent.trim().slice(0, 200) } : {}),
-        fallback_reason: empty ? 'EMPTY_TEXT_OUTPUT' : 'INVALID_JSON_DECISION',
-      });
-      return fallback(ctx);
+      return runFallbackAndRecord(
+        {
+          step: ctx.stepIndex,
+          backend: 'external-vision-api',
+          chunk_count: 1,
+          chunk_types: { completion: 1 },
+          text_length: rawContent.length,
+          ...(!empty ? { text_preview: rawContent.trim().slice(0, 200) } : {}),
+          fallback_reason: empty ? 'EMPTY_TEXT_OUTPUT' : 'INVALID_JSON_DECISION',
+        },
+        fallback,
+        ctx,
+        opts.onStepDiagnostic
+      );
     } catch (err: any) {
       if (ctx.signal?.aborted) throw err;
-      opts.onStepDiagnostic?.({
-        step: ctx.stepIndex,
-        backend: 'external-vision-api',
-        chunk_count: 0,
-        chunk_types: {},
-        text_length: 0,
-        stream_error: String(err?.message ?? err).slice(0, 300),
-        fallback_reason: 'VISION_API_REQUEST_ERROR',
-      });
-      return fallback(ctx);
+      return runFallbackAndRecord(
+        {
+          step: ctx.stepIndex,
+          backend: 'external-vision-api',
+          chunk_count: 0,
+          chunk_types: {},
+          text_length: 0,
+          stream_error: String(err?.message ?? err).slice(0, 300),
+          fallback_reason: 'VISION_API_REQUEST_ERROR',
+        },
+        fallback,
+        ctx,
+        opts.onStepDiagnostic
+      );
     }
   };
 }
@@ -620,7 +693,7 @@ export class BrowserSubagentRunner {
 
   public async runTask(req: SubagentTaskRequest): Promise<SubagentRunResult> {
     req.signal?.throwIfAborted();
-    const subagentId = `subagent-${crypto.randomUUID().slice(0, 8)}`;
+    const subagentId = req.subagentId || `subagent-${crypto.randomUUID().slice(0, 8)}`;
     const maxSteps = req.maxSteps ?? 10;
     const maxRecentImages = req.maxRecentImages ?? 3;
     const snapshotDir = path.join(req.artifactDir, subagentId);

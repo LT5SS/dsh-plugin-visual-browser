@@ -11,10 +11,12 @@ import {
   type ToolDefinition,
 } from '@deepseek-ai/dsh-tools';
 import {
+  PageSnapshotSampler,
   apply,
   extractHostStreamChunk,
   parseJsonDecision,
   resolvePlannerMode,
+  safeEvaluate,
   type DshCordisContext,
 } from '../src/index.js';
 
@@ -327,6 +329,92 @@ async function main() {
   assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'builtin-inspector');
   console.log('[Strict DSH 0.2 Contract] Verified async ctx.inject late-binding & child-fiber unbind!');
 
+  // 0e. TASK-v1.1.7 P0: safeEvaluate() navigation-race resilience & non-navigation error propagation
+  let navCalls = 0;
+  const degradedReasons: string[] = [];
+  const navPage = {
+    async evaluate() {
+      navCalls++;
+      throw new Error('page.evaluate: Execution context was destroyed, most likely because of a navigation');
+    },
+    async waitForLoadState() {},
+    async waitForTimeout() {},
+  };
+  const navResult = await safeEvaluate(navPage, () => ({ ok: true }), { ok: false }, {
+    retries: 2,
+    onDegraded: (r) => degradedReasons.push(r),
+  });
+  assert.deepEqual(navResult, { ok: false });
+  assert.equal(navCalls, 3, 'Expected safeEvaluate to retry retries=2 times (3 total attempts)');
+  assert.equal(degradedReasons.length, 1);
+
+  let transientCalls = 0;
+  let transientDegraded = false;
+  const transientNavPage = {
+    async evaluate() {
+      transientCalls++;
+      if (transientCalls === 1) {
+        throw new Error('Execution context was destroyed, most likely because of a navigation');
+      }
+      return { ok: true };
+    },
+    async waitForLoadState() {},
+    async waitForTimeout() {},
+  };
+  const transientResult = await safeEvaluate(transientNavPage, () => ({ ok: true }), { ok: false }, {
+    retries: 2,
+    onDegraded: () => {
+      transientDegraded = true;
+    },
+  });
+  assert.deepEqual(transientResult, { ok: true });
+  assert.equal(transientCalls, 2);
+  assert.equal(transientDegraded, false);
+
+  let bugCalls = 0;
+  const bugPage = {
+    async evaluate() {
+      bugCalls++;
+      throw new TypeError('Unexpected non-navigation bug');
+    },
+    async waitForLoadState() {},
+    async waitForTimeout() {},
+  };
+  await assert.rejects(
+    () => safeEvaluate(bugPage, () => 1, 0, 2),
+    /Unexpected non-navigation bug/
+  );
+  assert.equal(bugCalls, 1, 'Non-navigation errors must rethrow immediately without retry');
+
+  const degradedSampler = new PageSnapshotSampler(
+    {
+      page: {
+        ...navPage,
+        url: () => 'https://example.com',
+        viewportSize: () => ({ width: 1280, height: 720 }),
+      } as any,
+      motion: { getPosition: () => ({ x: 100, y: 120 }) } as any,
+      telemetry: {
+        getHealthReport: () => ({
+          consoleErrorsCount: 0,
+          consoleErrors: [],
+          pageErrorsCount: 0,
+          pageErrors: [],
+          failedRequestsCount: 0,
+          failedRequests: [],
+          totalRequests: 1,
+          trackedOrigins: ['https://example.com'],
+        }),
+      } as any,
+      screenshot: async (p: string) => p,
+    } as any,
+    path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test')
+  );
+  const degradedObs = await degradedSampler.captureSnapshot('nav_race');
+  assert.equal(degradedObs.degradedReason, 'sampler degraded: navigation race');
+  assert.ok(degradedSampler.formatObservationForLLM(degradedObs).includes('sampler degraded: navigation race'));
+  console.log('[Strict DSH 0.2 Contract] 0e Verified safeEvaluate() navigation-race fallback & strict rethrow!');
+
   // Checks 1-5: End-to-end tool execution with headless Chromium & local static server
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
   const artifactDir = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test');
@@ -470,6 +558,9 @@ async function main() {
     assert.equal(runDiagJson.planner_detail?.model, 'deepseek-chat');
     assert.equal(runDiagJson.host_services?.llm, true);
     assert.equal(runDiagJson.host_services?.attachments, true);
+    assert.equal(runDiagJson.planner_detail?.llm_steps?.[0]?.decision_source, 'llm');
+    assert.equal(runDiagJson.planner_detail?.llm_steps?.[0]?.action?.type, 'move_mouse');
+    assert.equal(runDiagJson.planner_detail?.llm_steps?.[1]?.action?.type, 'complete');
 
     // 3b. Acceptance #2 & boundary checks for output.render() formatting (v1.1.4)
     const fakeFallbackValue = {
@@ -548,6 +639,8 @@ async function main() {
     assert.equal(emptyDiagJson.planner_detail?.last_fallback_reason, 'EMPTY_STREAM');
     assert.equal(emptyDiagJson.planner_detail?.provider, 'opencode-go');
     assert.equal(emptyDiagJson.planner_detail?.model, 'deepseek-v4.1-flash');
+    assert.equal(emptyDiagJson.planner_detail?.llm_steps?.[0]?.decision_source, 'inspector');
+    assert.equal(emptyDiagJson.planner_detail?.llm_steps?.[0]?.action?.type, 'complete');
     console.log('[Strict DSH 0.2 Contract] 5a Verified empty llm.stream() graceful fallback (EMPTY_STREAM)!');
 
     // 5b. Issue #4 regression: error chunk on image attachment triggers automatic text-only retry
@@ -712,6 +805,39 @@ async function main() {
     assert.equal(invalidReqCalls, 1, 'Expected INVALID_REQUEST MissingSessionID to skip redundant text-only retry');
     assert.equal(invalidReqVal.planner_detail?.llm_steps?.[0]?.retried_text_only, undefined);
     console.log('[Strict DSH 0.2 Contract] 5e Verified INVALID_REQUEST MissingSessionID skips redundant retry!');
+
+    // 5f. TASK-v1.1.7 P1: runTask() throw STILL persists diagnostics.json with status=FAILED
+    const failArtifactDir = path.join(artifactDir, 'fail-diag-check');
+    fs.rmSync(failArtifactDir, { recursive: true, force: true });
+    fs.mkdirSync(failArtifactDir, { recursive: true });
+    const failHost = createCordisStrictCtx({ validateSchemas: false });
+    apply(failHost.ctx, {
+      mode: 'auto',
+      backgroundSilent: true,
+      artifactDir: failArtifactDir,
+      customPlanner: async () => {
+        throw new Error('Synthetic step crash for diagnostics check');
+      },
+    });
+    allDisposers.push(...failHost.effectDisposers);
+    const failRunDef = failHost.registeredTools.get('browser_subagent_run')!;
+    await assert.rejects(
+      () =>
+        failRunDef.execute(
+          { url: srv.url, role: 'Fail Verifier', task_prompt: 'Trigger crash', max_steps: 2 },
+          fakeExec
+        ),
+      /Synthetic step crash for diagnostics check/
+    );
+    const failSubdirs = fs.readdirSync(failArtifactDir).filter((d) => d.startsWith('subagent-'));
+    assert.equal(failSubdirs.length, 1, 'Expected subagent-* directory under failArtifactDir');
+    const failDiagFile = path.join(failArtifactDir, failSubdirs[0], 'diagnostics.json');
+    assert.ok(fs.existsSync(failDiagFile), 'Expected diagnostics.json to be written even when runTask() throws');
+    const failDiagJson = JSON.parse(fs.readFileSync(failDiagFile, 'utf8'));
+    assert.equal(failDiagJson.status, 'FAILED');
+    assert.ok(String(failDiagJson.error?.message ?? '').includes('Synthetic step crash for diagnostics check'));
+    assert.equal(failDiagJson.planner_mode, 'custom');
+    console.log('[Strict DSH 0.2 Contract] 5f Verified FAILED runTask() still persists diagnostics.json!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

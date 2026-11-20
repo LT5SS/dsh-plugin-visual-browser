@@ -1,6 +1,7 @@
 import type { Page } from 'playwright-core';
 import type { MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
 import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
+import { safeEvaluate } from '../sampler/page-snapshot.js';
 
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -39,11 +40,16 @@ export class HumanMotionController {
 
   public async ensureCursorHUD(): Promise<void> {
     const initScript = buildVirtualCursorInitScript(this.cursorStyle);
-    await this.page.evaluate((script) => {
-      if (!(window as any).__dshVirtualCursorInstalled) {
-        (0, eval)(script);
-      }
-    }, initScript);
+    await safeEvaluate(
+      this.page,
+      (script: string) => {
+        if (!(window as any).__dshVirtualCursorInstalled) {
+          (0, eval)(script);
+        }
+      },
+      undefined,
+      { arg: initScript, retries: 1 }
+    );
   }
 
   /**
@@ -52,16 +58,26 @@ export class HumanMotionController {
   public async setCursorStyle(style: VirtualCursorStyleConfig): Promise<void> {
     this.cursorStyle = { ...this.cursorStyle, ...style };
     await this.ensureCursorHUD();
-    await this.page.evaluate((cfg) => {
-      (window as any).__dshCursorAPI?.setStyle(cfg);
-    }, style);
+    await safeEvaluate(
+      this.page,
+      (cfg: VirtualCursorStyleConfig) => {
+        (window as any).__dshCursorAPI?.setStyle(cfg);
+      },
+      undefined,
+      { arg: style, retries: 1 }
+    );
   }
 
   public async clearTrail(): Promise<void> {
     await this.ensureCursorHUD();
-    await this.page.evaluate(() => {
-      (window as any).__dshCursorAPI?.clearTrail();
-    });
+    await safeEvaluate(
+      this.page,
+      () => {
+        (window as any).__dshCursorAPI?.clearTrail();
+      },
+      undefined,
+      1
+    );
   }
 
   /**
@@ -145,11 +161,13 @@ export class HumanMotionController {
   public async clickAt(x: number, y: number, opts: MotionOptions = {}): Promise<Point2D> {
     await this.moveTo(x, y, { ...opts, label: opts.label ?? 'AIM' });
     await this.page.mouse.down();
-    await this.page.evaluate(
-      ({ px, py, lbl }) => {
+    await safeEvaluate(
+      this.page,
+      ({ px, py, lbl }: { px: number; py: number; lbl: string }) => {
         (window as any).__dshCursorAPI?.clickEffect(px, py, lbl);
       },
-      { px: x, py: y, lbl: opts.label ?? 'CLICK' }
+      undefined,
+      { arg: { px: x, py: y, lbl: opts.label ?? 'CLICK' }, retries: 0 }
     );
     await this.page.waitForTimeout(55);
     await this.page.mouse.up();
@@ -188,11 +206,13 @@ export class HumanMotionController {
   }
 
   private async syncHUD(x: number, y: number, label: string): Promise<void> {
-    await this.page.evaluate(
-      ({ px, py, lbl }) => {
+    await safeEvaluate(
+      this.page,
+      ({ px, py, lbl }: { px: number; py: number; lbl: string }) => {
         (window as any).__dshCursorAPI?.update(px, py, lbl);
       },
-      { px: x, py: y, lbl: label }
+      undefined,
+      { arg: { px: x, py: y, lbl: label }, retries: 0 }
     );
   }
 }

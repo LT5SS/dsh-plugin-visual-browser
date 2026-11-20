@@ -1,3 +1,4 @@
+import { safeEvaluate } from '../sampler/page-snapshot.js';
 const DEFAULT_SENSITIVE_PATTERNS = [
     /\.bank\b/i,
     /paypal\.com/i,
@@ -23,7 +24,7 @@ export async function detectPageGate(page, opts = {}) {
             };
         }
     }
-    const domGate = await page.evaluate((checkLogin) => {
+    const domGate = await safeEvaluate(page, (checkLogin) => {
         const title = (document.title || '').toLowerCase();
         const bodyText = (document.body?.innerText || '').slice(0, 1500).toLowerCase();
         // 1. CAPTCHA / Anti-Bot gate detection (never solve or bypass!)
@@ -85,7 +86,7 @@ export async function detectPageGate(page, opts = {}) {
             }
         }
         return { detected: false };
-    }, opts.pauseOnLoginWall ?? true);
+    }, { detected: false }, { retries: 2, arg: opts.pauseOnLoginWall ?? true });
     if (domGate.detected && domGate.reason) {
         return {
             detected: true,

@@ -1,7 +1,70 @@
 import path from 'node:path';
+import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
 import type { Point2D } from '../driver/types.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
+
+const NAVIGATION_RACE_PATTERN =
+  /Execution context was destroyed|Cannot find context with specified id|most likely because of a navigation|Frame was detached|Target closed/i;
+
+/** Returns true when a Playwright error stems from mid-evaluation navigation or frame detachment. */
+export function isNavigationRaceError(error: unknown): boolean {
+  const message = String((error as any)?.message ?? error);
+  return NAVIGATION_RACE_PATTERN.test(message);
+}
+
+export type SafeEvaluatePage = Pick<Page, 'evaluate'> &
+  Partial<Pick<Page, 'waitForLoadState' | 'waitForTimeout'>>;
+
+/**
+ * Runs `page.evaluate()` with automatic retries and fallback on navigation-race errors.
+ * Non-navigation errors always rethrow immediately so real bugs are never masked.
+ */
+export async function safeEvaluate<T>(
+  page: SafeEvaluatePage,
+  fn: () => T,
+  fallbackValue: T,
+  retriesOrOptions?: number | { retries?: number; onDegraded?: (reason: string) => void }
+): Promise<T>;
+export async function safeEvaluate<T, Arg>(
+  page: SafeEvaluatePage,
+  fn: (arg: Arg) => T,
+  fallbackValue: T,
+  options: { arg: Arg; retries?: number; onDegraded?: (reason: string) => void }
+): Promise<T>;
+export async function safeEvaluate<T, Arg = undefined>(
+  page: SafeEvaluatePage,
+  fn: any,
+  fallbackValue: T,
+  retriesOrOptions?:
+    | number
+    | { retries?: number; arg?: Arg; onDegraded?: (reason: string) => void }
+): Promise<T> {
+  const isOpts = typeof retriesOrOptions === 'object' && retriesOrOptions !== null;
+  const retries = isOpts ? (retriesOrOptions.retries ?? 2) : (retriesOrOptions ?? 2);
+  const hasArg = isOpts && Object.prototype.hasOwnProperty.call(retriesOrOptions, 'arg');
+  const arg = isOpts ? retriesOrOptions.arg : undefined;
+  const onDegraded = isOpts ? retriesOrOptions.onDegraded : undefined;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return hasArg
+        ? await (page as any).evaluate(fn, arg)
+        : await (page as any).evaluate(fn);
+    } catch (error) {
+      if (!isNavigationRaceError(error)) {
+        throw error;
+      }
+      if (attempt === retries) {
+        onDegraded?.(String((error as Error)?.message ?? error));
+        return fallbackValue;
+      }
+      await page.waitForLoadState?.('domcontentloaded').catch(() => {});
+      await page.waitForTimeout?.(150 + attempt * 200).catch(() => {});
+    }
+  }
+  return fallbackValue;
+}
 
 export interface ScrollMetrics {
   scrollX: number;
@@ -51,6 +114,7 @@ export interface PageObservation {
   domStats: DomTechStats;
   interactiveElements: InteractiveElementNode[];
   health: TelemetryHealthReport;
+  degradedReason?: string;
 }
 
 export class PageSnapshotSampler {
@@ -71,7 +135,49 @@ export class PageSnapshotSampler {
     const screenshotPath = path.join(this.outputDir, filename);
 
     // 1. Extract Scroll Metrics, DOM/Tech Stats, and stamp visible interactive elements with [data-dsh-ref]
-    const extracted = await page.evaluate(() => {
+    let degradedReason: string | undefined;
+    const viewport = page.viewportSize?.() ?? { width: 1440, height: 900 };
+    const safeUrl = (() => {
+      try {
+        return page.url();
+      } catch {
+        return 'about:blank';
+      }
+    })();
+    const fallbackExtracted = {
+      scroll: {
+        scrollX: 0,
+        scrollY: 0,
+        scrollWidth: viewport.width,
+        scrollHeight: viewport.height,
+        viewportWidth: viewport.width,
+        viewportHeight: viewport.height,
+        scrollProgressPercent: 0,
+      },
+      domStats: {
+        title: '',
+        url: safeUrl,
+        htmlClasses: [] as string[],
+        htmlDataAttributes: {} as Record<string, string>,
+        counts: {
+          canvas: 0,
+          video: 0,
+          svg: 0,
+          img: 0,
+          section: 0,
+          article: 0,
+          button: 0,
+          a: 0,
+          openDialogs: 0,
+        },
+        detectedTechHints: [] as string[],
+      },
+      interactiveElements: [] as InteractiveElementNode[],
+    };
+
+    const extracted = await safeEvaluate(
+      page,
+      () => {
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const sx = Math.round(window.scrollX);
@@ -208,10 +314,23 @@ export class PageSnapshotSampler {
         },
         interactiveElements: nodes,
       };
-    });
+    },
+      fallbackExtracted,
+      {
+        retries: 2,
+        onDegraded: () => {
+          degradedReason = 'sampler degraded: navigation race';
+        },
+      }
+    );
 
     // 2. Capture viewport screenshot with the Virtual Cursor HUD & Custom Trail
-    await this.session.screenshot(screenshotPath);
+    try {
+      await this.session.screenshot(screenshotPath);
+    } catch (err) {
+      if (!isNavigationRaceError(err)) throw err;
+      degradedReason = 'sampler degraded: navigation race';
+    }
 
     return {
       stepIndex: this.stepCounter,
@@ -222,6 +341,7 @@ export class PageSnapshotSampler {
       domStats: extracted.domStats,
       interactiveElements: extracted.interactiveElements,
       health: this.session.telemetry.getHealthReport(),
+      ...(degradedReason ? { degradedReason } : {}),
     };
   }
 
@@ -229,6 +349,7 @@ export class PageSnapshotSampler {
     const { scroll, domStats, health, interactiveElements, cursorPosition } = obs;
     const lines: string[] = [
       `### [Step ${obs.stepIndex}] Page Observation HUD`,
+      ...(obs.degradedReason ? [`- **Notice**: ${obs.degradedReason}`] : []),
       `- **URL**: ${domStats.url} ("${domStats.title}")`,
       `- **Screenshot**: ${obs.screenshotPath}`,
       `- **Virtual Cursor**: (${Math.round(cursorPosition.x)}, ${Math.round(cursorPosition.y)})`,

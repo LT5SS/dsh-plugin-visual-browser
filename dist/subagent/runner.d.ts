@@ -55,6 +55,7 @@ export interface SubagentPlannerContext {
 }
 export type SubagentPlanner = (ctx: SubagentPlannerContext) => Promise<SubagentActionDecision>;
 export interface SubagentTaskRequest {
+    subagentId?: string;
     role: string;
     taskPrompt: string;
     startUrl: string;
@@ -105,7 +106,11 @@ export interface PlannerStepDiagnostic {
     retried_text_only?: boolean;
     stream_error?: string;
     fallback_reason?: string;
+    decision_source?: 'llm' | 'inspector';
+    action?: Record<string, unknown>;
 }
+/** Summarizes a SubagentActionDecision into a compact JSON-safe replay object for diagnostics. */
+export declare function summarizeDecisionAction(decision: SubagentActionDecision): Record<string, unknown>;
 /** Validates that a parsed JSON object matches one of the 9 supported SubagentActionDecision variants. */
 export declare function isValidSubagentDecision(value: unknown): value is SubagentActionDecision;
 /**

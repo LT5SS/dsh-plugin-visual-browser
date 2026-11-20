@@ -4,6 +4,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from 'playwrig
 import type { BrowserRuntimeMode, BrowserSessionOptions } from './types.js';
 import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
 import { HumanMotionController } from './human-motion.js';
+import { isNavigationRaceError } from '../sampler/page-snapshot.js';
 import { TelemetryCollector } from '../sampler/telemetry-collector.js';
 
 const LOCAL_BROWSER_CANDIDATES = [
@@ -115,10 +116,21 @@ export class BrowserSession {
     await this.motion.ensureCursorHUD();
   }
 
-  public async screenshot(outputPath: string): Promise<string> {
-    await this.motion.ensureCursorHUD();
+  public async screenshot(outputPath: string, retries = 2): Promise<string> {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    await this.page.screenshot({ path: outputPath, fullPage: false });
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        await this.motion.ensureCursorHUD();
+        await this.page.screenshot({ path: outputPath, fullPage: false });
+        return outputPath;
+      } catch (err) {
+        if (!isNavigationRaceError(err) || attempt === retries) {
+          throw err;
+        }
+        await this.page.waitForLoadState('domcontentloaded').catch(() => {});
+        await this.page.waitForTimeout(150 + attempt * 200).catch(() => {});
+      }
+    }
     return outputPath;
   }
 

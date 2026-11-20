@@ -15,6 +15,6 @@ export declare class BrowserSession {
     constructor(opts?: BrowserSessionOptions);
     start(): Promise<this>;
     navigate(url: string, waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'): Promise<void>;
-    screenshot(outputPath: string): Promise<string>;
+    screenshot(outputPath: string, retries?: number): Promise<string>;
     close(): Promise<void>;
 }

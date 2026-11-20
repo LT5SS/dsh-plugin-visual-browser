@@ -1,4 +1,36 @@
 import path from 'node:path';
+const NAVIGATION_RACE_PATTERN = /Execution context was destroyed|Cannot find context with specified id|most likely because of a navigation|Frame was detached|Target closed/i;
+/** Returns true when a Playwright error stems from mid-evaluation navigation or frame detachment. */
+export function isNavigationRaceError(error) {
+    const message = String(error?.message ?? error);
+    return NAVIGATION_RACE_PATTERN.test(message);
+}
+export async function safeEvaluate(page, fn, fallbackValue, retriesOrOptions) {
+    const isOpts = typeof retriesOrOptions === 'object' && retriesOrOptions !== null;
+    const retries = isOpts ? (retriesOrOptions.retries ?? 2) : (retriesOrOptions ?? 2);
+    const hasArg = isOpts && Object.prototype.hasOwnProperty.call(retriesOrOptions, 'arg');
+    const arg = isOpts ? retriesOrOptions.arg : undefined;
+    const onDegraded = isOpts ? retriesOrOptions.onDegraded : undefined;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return hasArg
+                ? await page.evaluate(fn, arg)
+                : await page.evaluate(fn);
+        }
+        catch (error) {
+            if (!isNavigationRaceError(error)) {
+                throw error;
+            }
+            if (attempt === retries) {
+                onDegraded?.(String(error?.message ?? error));
+                return fallbackValue;
+            }
+            await page.waitForLoadState?.('domcontentloaded').catch(() => { });
+            await page.waitForTimeout?.(150 + attempt * 200).catch(() => { });
+        }
+    }
+    return fallbackValue;
+}
 export class PageSnapshotSampler {
     session;
     outputDir;
@@ -14,7 +46,47 @@ export class PageSnapshotSampler {
         const filename = `step_${String(this.stepCounter).padStart(2, '0')}_${safeTag}.png`;
         const screenshotPath = path.join(this.outputDir, filename);
         // 1. Extract Scroll Metrics, DOM/Tech Stats, and stamp visible interactive elements with [data-dsh-ref]
-        const extracted = await page.evaluate(() => {
+        let degradedReason;
+        const viewport = page.viewportSize?.() ?? { width: 1440, height: 900 };
+        const safeUrl = (() => {
+            try {
+                return page.url();
+            }
+            catch {
+                return 'about:blank';
+            }
+        })();
+        const fallbackExtracted = {
+            scroll: {
+                scrollX: 0,
+                scrollY: 0,
+                scrollWidth: viewport.width,
+                scrollHeight: viewport.height,
+                viewportWidth: viewport.width,
+                viewportHeight: viewport.height,
+                scrollProgressPercent: 0,
+            },
+            domStats: {
+                title: '',
+                url: safeUrl,
+                htmlClasses: [],
+                htmlDataAttributes: {},
+                counts: {
+                    canvas: 0,
+                    video: 0,
+                    svg: 0,
+                    img: 0,
+                    section: 0,
+                    article: 0,
+                    button: 0,
+                    a: 0,
+                    openDialogs: 0,
+                },
+                detectedTechHints: [],
+            },
+            interactiveElements: [],
+        };
+        const extracted = await safeEvaluate(page, () => {
             const vw = window.innerWidth;
             const vh = window.innerHeight;
             const sx = Math.round(window.scrollX);
@@ -143,9 +215,21 @@ export class PageSnapshotSampler {
                 },
                 interactiveElements: nodes,
             };
+        }, fallbackExtracted, {
+            retries: 2,
+            onDegraded: () => {
+                degradedReason = 'sampler degraded: navigation race';
+            },
         });
         // 2. Capture viewport screenshot with the Virtual Cursor HUD & Custom Trail
-        await this.session.screenshot(screenshotPath);
+        try {
+            await this.session.screenshot(screenshotPath);
+        }
+        catch (err) {
+            if (!isNavigationRaceError(err))
+                throw err;
+            degradedReason = 'sampler degraded: navigation race';
+        }
         return {
             stepIndex: this.stepCounter,
             timestamp: new Date().toISOString(),
@@ -155,12 +239,14 @@ export class PageSnapshotSampler {
             domStats: extracted.domStats,
             interactiveElements: extracted.interactiveElements,
             health: this.session.telemetry.getHealthReport(),
+            ...(degradedReason ? { degradedReason } : {}),
         };
     }
     formatObservationForLLM(obs) {
         const { scroll, domStats, health, interactiveElements, cursorPosition } = obs;
         const lines = [
             `### [Step ${obs.stepIndex}] Page Observation HUD`,
+            ...(obs.degradedReason ? [`- **Notice**: ${obs.degradedReason}`] : []),
             `- **URL**: ${domStats.url} ("${domStats.title}")`,
             `- **Screenshot**: ${obs.screenshotPath}`,
             `- **Virtual Cursor**: (${Math.round(cursorPosition.x)}, ${Math.round(cursorPosition.y)})`,

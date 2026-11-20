@@ -1,4 +1,5 @@
 import type { Page } from 'playwright-core';
+import { safeEvaluate } from '../sampler/page-snapshot.js';
 
 export type GateReason =
   | 'CAPTCHA_DETECTED'
@@ -56,7 +57,9 @@ export async function detectPageGate(
     }
   }
 
-  const domGate = await page.evaluate((checkLogin) => {
+  const domGate = await safeEvaluate(
+    page,
+    (checkLogin: boolean) => {
     const title = (document.title || '').toLowerCase();
     const bodyText = (document.body?.innerText || '').slice(0, 1500).toLowerCase();
 
@@ -126,7 +129,10 @@ export async function detectPageGate(
     }
 
     return { detected: false };
-  }, opts.pauseOnLoginWall ?? true);
+  },
+    { detected: false } as { detected: boolean; reason?: GateReason; details?: string },
+    { retries: 2, arg: opts.pauseOnLoginWall ?? true }
+  );
 
   if (domGate.detected && domGate.reason) {
     return {

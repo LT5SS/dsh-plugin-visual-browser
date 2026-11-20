@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -439,6 +440,7 @@ export function createVisualBrowserTools(
         ? { ...activeCursorStyle, preset: args.cursor_preset as VirtualCursorPreset }
         : activeCursorStyle;
 
+      const subagentId = `subagent-${crypto.randomUUID().slice(0, 8)}`;
       const { planner, tracker, effectiveServices } = resolveSubagentPlanner(
         resolvedServices,
         ctx,
@@ -446,33 +448,7 @@ export function createVisualBrowserTools(
         exec
       );
 
-      const res = await runner.runTask({
-        role: String(args.role || 'Browser Subagent'),
-        taskPrompt: String(args.task_prompt),
-        startUrl: String(args.url),
-        artifactDir: artifactRoot,
-        maxSteps: Number(args.max_steps ?? config.maxSteps ?? 10),
-        maxRecentImages: config.maxRecentImages ?? 3,
-        allowedOrigins: config.allowedOrigins,
-        blockedOrigins: config.blockedOrigins,
-        signal: exec?.signal,
-        sessionOptions: {
-          mode: config.mode ?? 'auto',
-          cdpEndpoint: config.cdpEndpoint,
-          executablePath: config.executablePath,
-          backgroundSilent: config.backgroundSilent ?? true,
-          cursorStyle: style,
-        },
-        planner,
-      });
-
-      const imageAttachment = await tryRegisterImageAttachment(
-        resolvedServices,
-        ctx,
-        res.hostFacts.latestScreenshot
-      );
-
-      const plannerDetail = {
+      const buildPlannerDetail = () => ({
         initial_mode: tracker.initialMode,
         effective_mode: tracker.effectiveMode,
         ...(tracker.provider ? { provider: tracker.provider } : {}),
@@ -480,7 +456,7 @@ export function createVisualBrowserTools(
         fallback_count: tracker.fallbackCount,
         ...(tracker.lastFallbackReason ? { last_fallback_reason: tracker.lastFallbackReason } : {}),
         ...(tracker.steps.length > 0 ? { llm_steps: tracker.steps } : {}),
-      };
+      });
 
       const hostServicesStatus = {
         llm: Boolean(effectiveServices.llm && typeof effectiveServices.llm.stream === 'function'),
@@ -490,47 +466,93 @@ export function createVisualBrowserTools(
         ),
       };
 
-      let diagnosticsPath: string | undefined;
-      try {
-        const subagentDir = path.join(artifactRoot, res.subagentId);
-        const targetFile = path.join(subagentDir, 'diagnostics.json');
-        await fs.promises.mkdir(subagentDir, { recursive: true });
-        await fs.promises.writeFile(
-          targetFile,
-          JSON.stringify(
-            toLosslessJson({
-              timestamp: new Date().toISOString(),
-              status: res.status,
-              subagent_id: res.subagentId,
-              planner_mode: tracker.effectiveMode,
-              planner_detail: plannerDetail,
-              host_services: hostServicesStatus,
-              steps: res.contextStats,
-              host_facts: res.hostFacts,
-            }),
-            null,
-            2
-          ),
-          'utf8'
-        );
-        diagnosticsPath = targetFile.replace(/\\/g, '/');
-      } catch {
-        /* non-fatal: diagnostics write failure must not break main tool result */
-      }
+      const writeDiagnostics = async (
+        payload: Record<string, unknown>
+      ): Promise<string | undefined> => {
+        try {
+          const subagentDir = path.join(artifactRoot, subagentId);
+          const targetFile = path.join(subagentDir, 'diagnostics.json');
+          await fs.promises.mkdir(subagentDir, { recursive: true });
+          await fs.promises.writeFile(
+            targetFile,
+            JSON.stringify(toLosslessJson(payload), null, 2),
+            'utf8'
+          );
+          return targetFile.replace(/\\/g, '/');
+        } catch {
+          return undefined;
+        }
+      };
 
-      return toLosslessJson({
-        status: res.status,
-        subagent_id: res.subagentId,
-        planner_mode: tracker.effectiveMode,
-        planner_detail: plannerDetail,
-        host_services: hostServicesStatus,
-        ...(diagnosticsPath ? { diagnostics_path: diagnosticsPath } : {}),
-        host_facts_block: res.hostFactsBlock,
-        subagent_report: res.subagentReport,
-        approval_card: res.approvalCard ?? null,
-        sliding_window_stats: res.contextStats,
-        ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
-      });
+      try {
+        const res = await runner.runTask({
+          subagentId,
+          role: String(args.role || 'Browser Subagent'),
+          taskPrompt: String(args.task_prompt),
+          startUrl: String(args.url),
+          artifactDir: artifactRoot,
+          maxSteps: Number(args.max_steps ?? config.maxSteps ?? 10),
+          maxRecentImages: config.maxRecentImages ?? 3,
+          allowedOrigins: config.allowedOrigins,
+          blockedOrigins: config.blockedOrigins,
+          signal: exec?.signal,
+          sessionOptions: {
+            mode: config.mode ?? 'auto',
+            cdpEndpoint: config.cdpEndpoint,
+            executablePath: config.executablePath,
+            backgroundSilent: config.backgroundSilent ?? true,
+            cursorStyle: style,
+          },
+          planner,
+        });
+
+        const imageAttachment = await tryRegisterImageAttachment(
+          resolvedServices,
+          ctx,
+          res.hostFacts.latestScreenshot
+        );
+
+        const plannerDetail = buildPlannerDetail();
+        const diagnosticsPath = await writeDiagnostics({
+          timestamp: new Date().toISOString(),
+          status: res.status,
+          subagent_id: res.subagentId,
+          planner_mode: tracker.effectiveMode,
+          planner_detail: plannerDetail,
+          host_services: hostServicesStatus,
+          steps: res.contextStats,
+          host_facts: res.hostFacts,
+        });
+
+        return toLosslessJson({
+          status: res.status,
+          subagent_id: res.subagentId,
+          planner_mode: tracker.effectiveMode,
+          planner_detail: plannerDetail,
+          host_services: hostServicesStatus,
+          ...(diagnosticsPath ? { diagnostics_path: diagnosticsPath } : {}),
+          host_facts_block: res.hostFactsBlock,
+          subagent_report: res.subagentReport,
+          approval_card: res.approvalCard ?? null,
+          sliding_window_stats: res.contextStats,
+          ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
+        });
+      } catch (error: any) {
+        await writeDiagnostics({
+          timestamp: new Date().toISOString(),
+          status: 'FAILED',
+          subagent_id: subagentId,
+          error: {
+            name: error?.name || error?.constructor?.name || 'Error',
+            message: String(error?.message ?? error).slice(0, 400),
+          },
+          planner_mode: tracker.effectiveMode,
+          planner_detail: buildPlannerDetail(),
+          host_services: hostServicesStatus,
+          artifact_dir: artifactRoot,
+        });
+        throw error;
+      }
     },
   });
 

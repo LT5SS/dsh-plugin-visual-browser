@@ -1,4 +1,5 @@
 import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
+import { safeEvaluate } from '../sampler/page-snapshot.js';
 function easeInOutCubic(t) {
     return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
@@ -29,11 +30,11 @@ export class HumanMotionController {
     }
     async ensureCursorHUD() {
         const initScript = buildVirtualCursorInitScript(this.cursorStyle);
-        await this.page.evaluate((script) => {
+        await safeEvaluate(this.page, (script) => {
             if (!window.__dshVirtualCursorInstalled) {
                 (0, eval)(script);
             }
-        }, initScript);
+        }, undefined, { arg: initScript, retries: 1 });
     }
     /**
      * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).
@@ -41,15 +42,15 @@ export class HumanMotionController {
     async setCursorStyle(style) {
         this.cursorStyle = { ...this.cursorStyle, ...style };
         await this.ensureCursorHUD();
-        await this.page.evaluate((cfg) => {
+        await safeEvaluate(this.page, (cfg) => {
             window.__dshCursorAPI?.setStyle(cfg);
-        }, style);
+        }, undefined, { arg: style, retries: 1 });
     }
     async clearTrail() {
         await this.ensureCursorHUD();
-        await this.page.evaluate(() => {
+        await safeEvaluate(this.page, () => {
             window.__dshCursorAPI?.clearTrail();
-        });
+        }, undefined, 1);
     }
     /**
      * Moves the virtual mouse along a cubic Bezier arc with human-like acceleration/deceleration.
@@ -120,9 +121,9 @@ export class HumanMotionController {
     async clickAt(x, y, opts = {}) {
         await this.moveTo(x, y, { ...opts, label: opts.label ?? 'AIM' });
         await this.page.mouse.down();
-        await this.page.evaluate(({ px, py, lbl }) => {
+        await safeEvaluate(this.page, ({ px, py, lbl }) => {
             window.__dshCursorAPI?.clickEffect(px, py, lbl);
-        }, { px: x, py: y, lbl: opts.label ?? 'CLICK' });
+        }, undefined, { arg: { px: x, py: y, lbl: opts.label ?? 'CLICK' }, retries: 0 });
         await this.page.waitForTimeout(55);
         await this.page.mouse.up();
         await this.page.waitForTimeout(80);
@@ -155,8 +156,8 @@ export class HumanMotionController {
         }
     }
     async syncHUD(x, y, label) {
-        await this.page.evaluate(({ px, py, lbl }) => {
+        await safeEvaluate(this.page, ({ px, py, lbl }) => {
             window.__dshCursorAPI?.update(px, py, lbl);
-        }, { px: x, py: y, lbl: label });
+        }, undefined, { arg: { px: x, py: y, lbl: label }, retries: 0 });
     }
 }
