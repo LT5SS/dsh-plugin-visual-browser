@@ -10,7 +10,7 @@ export interface DshApprovalCardPayload {
     cardType: 'DSH_BROWSER_TAKEOVER_CARD';
     subagentId: string;
     role: string;
-    reason: GateReason | 'ORIGIN_BLOCKED';
+    reason: GateReason | 'ORIGIN_BLOCKED' | 'USER_TAKEOVER';
     url: string;
     screenshotPath: string;
     title: string;
@@ -28,7 +28,7 @@ export declare function detectPageGate(page: Page, opts?: {
 export declare function buildApprovalCard(params: {
     subagentId: string;
     role: string;
-    reason: GateReason | 'ORIGIN_BLOCKED';
+    reason: GateReason | 'ORIGIN_BLOCKED' | 'USER_TAKEOVER';
     url: string;
     screenshotPath: string;
     details?: string;

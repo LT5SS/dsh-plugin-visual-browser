@@ -18,9 +18,14 @@ export class HumanMotionController {
     page;
     pos = { x: 120, y: 120 };
     cursorStyle;
-    constructor(page, initialStyle = {}) {
+    showTakeoverControl;
+    shouldAbort;
+    takeoverRole = '';
+    constructor(page, initialStyle = {}, opts = {}) {
         this.page = page;
         this.cursorStyle = initialStyle;
+        this.showTakeoverControl = Boolean(opts.showTakeoverControl);
+        this.shouldAbort = opts.shouldAbort;
     }
     getPosition() {
         return { ...this.pos };
@@ -29,12 +34,30 @@ export class HumanMotionController {
         return { ...this.cursorStyle };
     }
     async ensureCursorHUD() {
-        const initScript = buildVirtualCursorInitScript(this.cursorStyle);
+        const initScript = buildVirtualCursorInitScript(this.cursorStyle, {
+            showTakeoverControl: this.showTakeoverControl,
+            roleLabel: this.takeoverRole,
+        });
         await safeEvaluate(this.page, (script) => {
             if (!window.__dshVirtualCursorInstalled) {
                 (0, eval)(script);
             }
         }, undefined, { arg: initScript, retries: 1 });
+    }
+    async setTakeoverState(mode, roleLabel) {
+        if (typeof roleLabel === 'string') {
+            this.takeoverRole = roleLabel;
+        }
+        this.showTakeoverControl = mode !== 'hidden';
+        await this.ensureCursorHUD();
+        await safeEvaluate(this.page, ({ m, role }) => {
+            window.__dshCursorAPI?.setTakeoverState(m, role);
+        }, undefined, { arg: { m: mode, role: this.takeoverRole }, retries: 0 });
+    }
+    async resetTakeoverRequest() {
+        await safeEvaluate(this.page, () => {
+            window.__dshCursorAPI?.resetTakeoverRequest();
+        }, undefined, 0);
     }
     /**
      * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).
@@ -83,6 +106,8 @@ export class HumanMotionController {
         };
         const stepDelay = Math.max(4, Math.round(durationMs / steps));
         for (let i = 1; i <= steps; i++) {
+            if (this.shouldAbort?.())
+                break;
             const progress = easeInOutCubic(i / steps);
             const pt = cubicBezier(p0, p1, p2, p3, progress);
             this.pos = pt;
@@ -94,6 +119,8 @@ export class HumanMotionController {
     }
     async sweepPath(waypoints, opts = {}) {
         for (let i = 0; i < waypoints.length; i++) {
+            if (this.shouldAbort?.())
+                break;
             const wp = waypoints[i];
             await this.moveTo(wp.x, wp.y, {
                 steps: opts.steps ?? 16,
@@ -146,6 +173,8 @@ export class HumanMotionController {
         const delay = Math.max(8, Math.round(durationMs / frames));
         let accumulated = 0;
         for (let i = 1; i <= frames; i++) {
+            if (this.shouldAbort?.())
+                break;
             const targetNow = deltaY * easeInOutCubic(i / frames);
             const stepDelta = targetNow - accumulated;
             accumulated = targetNow;

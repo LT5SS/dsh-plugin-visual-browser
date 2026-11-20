@@ -14,7 +14,9 @@
     name: 'dsh-plugin-visual-browser'
     config:
       mode: 'auto'
-      backgroundSilent: true
+      windowMode: 'visible-background'
+      keepWindowOpen: true
+      showTakeoverControl: true
       maxSteps: 12
       maxRecentImages: 3
       cursorStyle:

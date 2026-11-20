@@ -104,6 +104,7 @@ export function buildApprovalCard(params) {
         LOGIN_REQUIRED: '🔐 检测到登录认证页面 — 请完成登录后继续',
         SENSITIVE_DOMAIN_READONLY: '🛡️ 敏感站点只读保护触发',
         ORIGIN_BLOCKED: '🚫 目标域名已被宿主安全策略拦截',
+        USER_TAKEOVER: '✋ 用户已手动接管 — 子代理已暂停',
     };
     return {
         cardType: 'DSH_BROWSER_TAKEOVER_CARD',

@@ -69,6 +69,8 @@ export interface SubagentTaskRequest {
     blockedOrigins?: string[];
     /** Automatically pause for human takeover if CAPTCHA, payment, or login gate appears (default: true) */
     pauseOnGate?: boolean;
+    /** Keep a persistent visible window open after completion and reuse it across subsequent tasks */
+    keepWindowOpen?: boolean;
     /** Cooperative cancellation signal from DSH ToolRunContext (exec.signal) */
     signal?: AbortSignal;
     planner?: SubagentPlanner;
@@ -162,8 +164,20 @@ export declare function createOpenAIVisionPlanner(opts: {
 export declare function createBuiltinInspectorPlanner(): SubagentPlanner;
 export declare class BrowserSubagentRunner {
     private pausedSessions;
+    private sharedSession;
+    private sharedSessionBusy;
     isOriginPermitted(targetUrl: string, allowedOrigins?: string[], blockedOrigins?: string[]): boolean;
     getPausedSession(subagentId: string): PausedSubagentState | undefined;
+    getSharedSession(): BrowserSession | null;
+    isSharedSessionBusy(): boolean;
+    acquireReusableSession(opts: BrowserSessionOptions, allowReuse: boolean): Promise<{
+        session: BrowserSession;
+        isShared: boolean;
+        reused: boolean;
+    }>;
+    releaseReusableSession(session: BrowserSession, keepAlive: boolean): Promise<void>;
+    detachSharedSessionForTakeover(session: BrowserSession): void;
+    closeAllSessions(): Promise<void>;
     closeAllPausedSessions(): Promise<void>;
     runTask(req: SubagentTaskRequest): Promise<SubagentRunResult>;
     resumeTask(subagentId: string, userFollowupNote?: string, signal?: AbortSignal): Promise<SubagentRunResult>;

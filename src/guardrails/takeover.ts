@@ -18,7 +18,7 @@ export interface DshApprovalCardPayload {
   cardType: 'DSH_BROWSER_TAKEOVER_CARD';
   subagentId: string;
   role: string;
-  reason: GateReason | 'ORIGIN_BLOCKED';
+  reason: GateReason | 'ORIGIN_BLOCKED' | 'USER_TAKEOVER';
   url: string;
   screenshotPath: string;
   title: string;
@@ -149,17 +149,18 @@ export async function detectPageGate(
 export function buildApprovalCard(params: {
   subagentId: string;
   role: string;
-  reason: GateReason | 'ORIGIN_BLOCKED';
+  reason: GateReason | 'ORIGIN_BLOCKED' | 'USER_TAKEOVER';
   url: string;
   screenshotPath: string;
   details?: string;
 }): DshApprovalCardPayload {
-  const titleMap: Record<GateReason | 'ORIGIN_BLOCKED', string> = {
+  const titleMap: Record<GateReason | 'ORIGIN_BLOCKED' | 'USER_TAKEOVER', string> = {
     CAPTCHA_DETECTED: '🛑 检测到人机验证 (CAPTCHA) — 已暂停等待人工接管',
     PAYMENT_REQUIRED: '💳 检测到支付/结算页面 — 请人工确认操作',
     LOGIN_REQUIRED: '🔐 检测到登录认证页面 — 请完成登录后继续',
     SENSITIVE_DOMAIN_READONLY: '🛡️ 敏感站点只读保护触发',
     ORIGIN_BLOCKED: '🚫 目标域名已被宿主安全策略拦截',
+    USER_TAKEOVER: '✋ 用户已手动接管 — 子代理已暂停',
   };
 
   return {

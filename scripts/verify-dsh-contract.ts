@@ -13,11 +13,14 @@ import {
 import {
   AtomicBrowserToolset,
   BrowserSession,
+  BrowserSubagentRunner,
   PageSnapshotSampler,
   SUBAGENT_SYSTEM_PROMPT,
   apply,
+  computeDefaultBackgroundWindowBounds,
   extractHostStreamChunk,
   parseJsonDecision,
+  resolveBrowserWindowMode,
   resolvePlannerMode,
   safeEvaluate,
   type DshCordisContext,
@@ -218,7 +221,7 @@ async function main() {
   let hostileRes!: ReturnType<typeof apply>;
   assert.doesNotThrow(
     () => {
-      hostileRes = apply(hostile.ctx, {});
+      hostileRes = apply(hostile.ctx, { backgroundSilent: true });
     },
     'apply() must not read uninjected services directly on Cordis 4.x ctx'
   );
@@ -505,6 +508,41 @@ async function main() {
   assert.ok(SUBAGENT_SYSTEM_PROMPT.includes('HUD 未暴露该字段'));
   assert.ok(SUBAGENT_SYSTEM_PROMPT.includes('剩余步数') && SUBAGENT_SYSTEM_PROMPT.includes('complete'));
   console.log('[Strict DSH 0.2 Contract] 0h Verified SUBAGENT_SYSTEM_PROMPT factual discipline & step budget rules!');
+
+  // 0i. v1.2.0: verify resolveBrowserWindowMode() priority tiers & computeDefaultBackgroundWindowBounds()
+  const prevWinMode = process.env.DSH_BROWSER_WINDOW_MODE;
+  try {
+    delete process.env.DSH_BROWSER_WINDOW_MODE;
+    assert.equal(resolveBrowserWindowMode({}), 'visible-background');
+    assert.equal(resolveBrowserWindowMode({ backgroundSilent: true }), 'headless');
+    assert.equal(resolveBrowserWindowMode({ backgroundSilent: false }), 'visible-background');
+    assert.equal(resolveBrowserWindowMode({ windowMode: 'minimized', backgroundSilent: true }), 'minimized');
+    assert.equal(resolveBrowserWindowMode({ windowMode: 'headless', backgroundSilent: false }), 'headless');
+
+    process.env.DSH_BROWSER_WINDOW_MODE = 'minimized';
+    assert.equal(resolveBrowserWindowMode({ backgroundSilent: true }), 'minimized');
+    assert.equal(resolveBrowserWindowMode({ windowMode: 'headless' }), 'headless');
+
+    process.env.DSH_BROWSER_WINDOW_MODE = 'headless';
+    assert.equal(resolveBrowserWindowMode({}), 'headless');
+    assert.equal(resolveBrowserWindowMode({ windowMode: 'visible-background' }), 'visible-background');
+  } finally {
+    if (prevWinMode !== undefined) process.env.DSH_BROWSER_WINDOW_MODE = prevWinMode;
+    else delete process.env.DSH_BROWSER_WINDOW_MODE;
+  }
+  const defaultBounds = computeDefaultBackgroundWindowBounds({
+    left: 0,
+    top: 0,
+    right: 1536,
+    bottom: 864,
+  });
+  assert.deepEqual(defaultBounds, { x: 756, y: 12, width: 768, height: 840 });
+  const customBounds = computeDefaultBackgroundWindowBounds(
+    { left: 0, top: 0, right: 1536, bottom: 864 },
+    { x: 100, y: 20, width: 900, height: 700 }
+  );
+  assert.deepEqual(customBounds, { x: 100, y: 20, width: 900, height: 700 });
+  console.log('[Strict DSH 0.2 Contract] 0i Verified resolveBrowserWindowMode() & computeDefaultBackgroundWindowBounds()!');
 
   // Checks 1-5: End-to-end tool execution with headless Chromium & local static server
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
@@ -972,6 +1010,107 @@ async function main() {
       console.log('[Strict DSH 0.2 Contract] 5g Verified HUD & inspectDom() href/value exposure + password masking!');
     } finally {
       await hudSession.close();
+    }
+
+    // 5h. v1.2.0: In-page takeover button is excluded from HUD/counts, triggers USER_TAKEOVER pause, and resumes cleanly
+    const takeoverHost = createCordisStrictCtx({ validateSchemas: false });
+    let takeoverPlannerCalls = 0;
+    let takeoverRes!: ReturnType<typeof apply>;
+    takeoverRes = apply(takeoverHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      showTakeoverControl: true,
+      artifactDir,
+      customPlanner: async (ctx) => {
+        takeoverPlannerCalls++;
+        assert.ok(
+          !ctx.latestObservation.interactiveElements.some(
+            (e) => e.label.includes('暂停并接管') || e.selectorHint.includes('__dsh_vc_takeover_btn__')
+          ),
+          'Takeover overlay button must be excluded from interactiveElements HUD'
+        );
+        if (takeoverPlannerCalls === 1) {
+          const activeSession = takeoverRes.runner.getSharedSession();
+          assert.ok(activeSession, 'Expected shared session while runTask with keepWindowOpen is active');
+          await activeSession.page.locator('#__dsh_vc_takeover_btn__').click();
+          return { type: 'scroll', deltaY: 120, reason: 'Check in-page takeover signal' };
+        }
+        return { type: 'complete', report: 'RESUMED_AFTER_USER_TAKEOVER' };
+      },
+    });
+    allDisposers.push(...takeoverHost.effectDisposers);
+    const takeoverRunDef = takeoverHost.registeredTools.get('browser_subagent_run')!;
+    const takeoverResumeDef = takeoverHost.registeredTools.get('browser_subagent_resume')!;
+    try {
+      const pauseVal: any = await takeoverRunDef.execute(
+        {
+          url: srv.url,
+          role: 'Takeover Verifier',
+          task_prompt: 'Verify live takeover button pauses and resumes',
+          max_steps: 4,
+          window_mode: 'headless',
+        },
+        fakeExec
+      );
+      assert.equal(takeoverPlannerCalls, 1, 'Expected customPlanner to run step 1 before USER_TAKEOVER pause');
+      assert.equal(pauseVal.status, 'PAUSED_FOR_TAKEOVER');
+      assert.equal(pauseVal.approval_card?.reason, 'USER_TAKEOVER');
+      assert.equal(takeoverRes.runner.getSharedSession(), null, 'Paused takeover session must detach from shared pool');
+
+      const resumedVal: any = await takeoverResumeDef.execute(
+        {
+          subagent_id: pauseVal.subagent_id,
+          resume_note: 'Manual verification completed',
+        },
+        fakeExec
+      );
+      assert.equal(takeoverPlannerCalls, 2, 'Expected customPlanner to resume at step 2 after USER_TAKEOVER');
+      assert.equal(resumedVal.status, 'COMPLETED');
+      assert.ok(String(resumedVal.subagent_report).includes('RESUMED_AFTER_USER_TAKEOVER'));
+      console.log('[Strict DSH 0.2 Contract] 5h Verified in-page takeover button HUD exclusion, USER_TAKEOVER pause & resume!');
+    } finally {
+      await takeoverRes.runner.closeAllSessions();
+    }
+
+    // 5i. v1.2.0: Persistent reusable BrowserSession stays alive across keepWindowOpen runs and closes on closeAllSessions()
+    const reuseRunner = new BrowserSubagentRunner();
+    try {
+      const r1 = await reuseRunner.runTask({
+        startUrl: srv.url,
+        role: 'Reuse-1',
+        taskPrompt: 'First persistent session task',
+        maxSteps: 1,
+        artifactDir,
+        keepWindowOpen: true,
+        sessionOptions: { mode: 'auto', windowMode: 'headless', keepWindowOpen: true, showTakeoverControl: false },
+        planner: async () => ({ type: 'complete', report: 'FIRST_REUSE_OK' }),
+      });
+      assert.equal(r1.status, 'COMPLETED');
+      const firstSession = reuseRunner.getSharedSession();
+      assert.ok(firstSession && firstSession.isAlive(), 'Expected shared session to remain alive after keepWindowOpen run');
+      assert.equal(reuseRunner.isSharedSessionBusy(), false);
+
+      const r2 = await reuseRunner.runTask({
+        startUrl: `${srv.url}#reuse-2`,
+        role: 'Reuse-2',
+        taskPrompt: 'Second persistent session task',
+        maxSteps: 1,
+        artifactDir,
+        keepWindowOpen: true,
+        sessionOptions: { mode: 'auto', windowMode: 'headless', keepWindowOpen: true, showTakeoverControl: false },
+        planner: async () => ({ type: 'complete', report: 'SECOND_REUSE_OK' }),
+      });
+      assert.equal(r2.status, 'COMPLETED');
+      assert.equal(reuseRunner.getSharedSession(), firstSession, 'Expected exact same BrowserSession instance to be reused');
+      assert.equal(firstSession.isAlive(), true);
+
+      await reuseRunner.closeAllSessions();
+      assert.equal(reuseRunner.getSharedSession(), null);
+      assert.equal(firstSession.isAlive(), false);
+      console.log('[Strict DSH 0.2 Contract] 5i Verified persistent BrowserSession reuse & clean closeAllSessions() teardown!');
+    } finally {
+      await reuseRunner.closeAllSessions();
     }
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');

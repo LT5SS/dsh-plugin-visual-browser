@@ -89,19 +89,30 @@ export function resolveCursorStyle(
   };
 }
 
-export function buildVirtualCursorInitScript(initialStyle: VirtualCursorStyleConfig = {}): string {
+export function buildVirtualCursorInitScript(
+  initialStyle: VirtualCursorStyleConfig = {},
+  opts: { showTakeoverControl?: boolean; roleLabel?: string } = {}
+): string {
   const resolved = resolveCursorStyle(initialStyle);
   const presetsJson = JSON.stringify(CURSOR_STYLE_PRESETS);
   const initialJson = JSON.stringify(resolved);
+  const optionsJson = JSON.stringify({
+    showTakeoverControl: Boolean(opts.showTakeoverControl),
+    roleLabel: opts.roleLabel || '',
+  });
 
   return `
 (() => {
   const PRESETS = ${presetsJson};
   const INITIAL_STYLE = ${initialJson};
+  const INITIAL_OPTS = ${optionsJson};
 
   if (window.__dshVirtualCursorInstalled) {
     if (window.__dshCursorAPI && INITIAL_STYLE) {
       window.__dshCursorAPI.setStyle(INITIAL_STYLE);
+    }
+    if (window.__dshCursorAPI && INITIAL_OPTS.showTakeoverControl && window.__dshCursorAPI.setTakeoverState) {
+      window.__dshCursorAPI.setTakeoverState('running', INITIAL_OPTS.roleLabel);
     }
     return;
   }
@@ -113,6 +124,9 @@ export function buildVirtualCursorInitScript(initialStyle: VirtualCursorStyleCon
     action: 'READY',
     trail: [{ x: 120, y: 120 }],
     style: { ...INITIAL_STYLE },
+    takeoverMode: INITIAL_OPTS.showTakeoverControl ? 'running' : 'hidden',
+    takeoverLabel: INITIAL_OPTS.roleLabel || '',
+    takeoverPending: Boolean(window.__dshTakeoverRequested),
   };
 
   function ensureDOM() {
@@ -152,6 +166,11 @@ export function buildVirtualCursorInitScript(initialStyle: VirtualCursorStyleCon
         <g id="__dsh_vc_dots__"></g>
         <g id="__dsh_vc_ripples__"></g>
       </svg>
+      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #00f0ff;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);pointer-events:auto;backdrop-filter:blur(8px);user-select:none">
+        <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;border-radius:50%;background:#00f0ff;box-shadow:0 0 8px #00f0ff;flex-shrink:0"></span>
+        <span id="__dsh_vc_status_text__" style="white-space:nowrap">DSH Agent 运行中</span>
+        <button id="__dsh_vc_takeover_btn__" type="button" style="border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:pointer;pointer-events:auto;white-space:nowrap">暂停并接管</button>
+      </div>
       <div id="__dsh_vc_pointer__" style="position:absolute;left:0;top:0;transform:translate3d(120px,120px,0);will-change:transform">
         <div id="__dsh_vc_ring__" style="position:absolute;left:-7px;top:-7px;width:14px;height:14px;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8)"></div>
         <svg id="__dsh_vc_arrow_svg__" width="28" height="28" viewBox="0 0 28 28" style="position:absolute;left:-2px;top:-2px;transform-origin:3px 3px;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.65))">
@@ -164,8 +183,79 @@ export function buildVirtualCursorInitScript(initialStyle: VirtualCursorStyleCon
     \`;
 
     document.documentElement.appendChild(root);
+    const btn = root.querySelector('#__dsh_vc_takeover_btn__');
+    if (btn) {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        window.__dshTakeoverRequested = true;
+        state.takeoverPending = true;
+        renderTakeoverPanel();
+        try {
+          if (typeof window.__dshRequestTakeover === 'function') {
+            window.__dshRequestTakeover();
+          }
+        } catch {}
+      });
+    }
     try { if (root.showPopover) root.showPopover(); } catch {}
     return root;
+  }
+
+  function renderTakeoverPanel() {
+    const panel = document.getElementById('__dsh_vc_panel__');
+    const dot = document.getElementById('__dsh_vc_status_dot__');
+    const txt = document.getElementById('__dsh_vc_status_text__');
+    const btn = document.getElementById('__dsh_vc_takeover_btn__');
+    if (!panel || !dot || !txt || !btn) return;
+
+    if (state.takeoverMode === 'hidden') {
+      panel.style.display = 'none';
+      return;
+    }
+
+    panel.style.display = 'flex';
+    const roleSuffix = state.takeoverLabel ? ' · ' + state.takeoverLabel : '';
+
+    if (state.takeoverPending && state.takeoverMode === 'running') {
+      panel.style.borderColor = '#f59e0b';
+      dot.style.background = '#f59e0b';
+      dot.style.boxShadow = '0 0 8px #f59e0b';
+      txt.textContent = '已请求接管 · 正在暂停...';
+      btn.textContent = '正在暂停...';
+      btn.disabled = true;
+      btn.style.background = '#b45309';
+      btn.style.cursor = 'wait';
+      return;
+    }
+
+    if (state.takeoverMode === 'paused') {
+      panel.style.borderColor = '#f59e0b';
+      dot.style.background = '#f59e0b';
+      dot.style.boxShadow = '0 0 8px #f59e0b';
+      txt.textContent = '已暂停 · 人工接管中（可在 DSH 中恢复）';
+      btn.style.display = 'none';
+      return;
+    }
+
+    if (state.takeoverMode === 'idle') {
+      panel.style.borderColor = '#10b981';
+      dot.style.background = '#10b981';
+      dot.style.boxShadow = '0 0 8px #10b981';
+      txt.textContent = '已完成 · 窗口保持打开待命' + roleSuffix;
+      btn.style.display = 'none';
+      return;
+    }
+
+    panel.style.borderColor = '#00f0ff';
+    dot.style.background = '#00f0ff';
+    dot.style.boxShadow = '0 0 8px #00f0ff';
+    txt.textContent = 'DSH Agent 运行中' + roleSuffix;
+    btn.style.display = 'inline-block';
+    btn.disabled = false;
+    btn.textContent = '暂停并接管';
+    btn.style.background = '#ef4444';
+    btn.style.cursor = 'pointer';
   }
 
   function promoteToTopLayer(root) {
@@ -196,6 +286,7 @@ export function buildVirtualCursorInitScript(initialStyle: VirtualCursorStyleCon
     const root = ensureDOM();
     if (!root) return;
     promoteToTopLayer(root);
+    renderTakeoverPanel();
     const s = state.style;
 
     const pointer = document.getElementById('__dsh_vc_pointer__');
@@ -333,6 +424,17 @@ export function buildVirtualCursorInitScript(initialStyle: VirtualCursorStyleCon
     },
     clearTrail() {
       state.trail = [{ x: state.x, y: state.y }];
+      render();
+    },
+    setTakeoverState(mode = 'running', label = '') {
+      state.takeoverMode = mode;
+      if (typeof label === 'string') state.takeoverLabel = label;
+      if (mode !== 'running') state.takeoverPending = false;
+      render();
+    },
+    resetTakeoverRequest() {
+      window.__dshTakeoverRequested = false;
+      state.takeoverPending = false;
       render();
     },
     getState() {

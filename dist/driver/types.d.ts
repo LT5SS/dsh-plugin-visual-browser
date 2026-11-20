@@ -1,4 +1,11 @@
 export type BrowserRuntimeMode = 'auto' | 'dsh-electron-webview' | 'local-background' | 'cdp-attach';
+export type BrowserWindowMode = 'visible-background' | 'minimized' | 'headless';
+export interface BrowserWindowBounds {
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+}
 export interface ViewportSize {
     width: number;
     height: number;
@@ -38,8 +45,21 @@ export interface BrowserSessionOptions {
     userDataDir?: string;
     viewport?: ViewportSize;
     /**
-     * When true (default), runs 100% silently in the background (--headless=new with full GPU/Canvas pipeline)
-     * so no browser window pops up or steals focus from the user's active work.
+     * Window presentation mode for local Chrome/Edge sessions:
+     * - `'visible-background'` (default): visible window placed behind the active foreground window without stealing focus
+     * - `'minimized'`: starts minimized in the taskbar without stealing focus
+     * - `'headless'`: silent headless background mode (`--headless=new`, used when `backgroundSilent: true`)
+     */
+    windowMode?: BrowserWindowMode;
+    /** Keep a single visible browser window open and reuse it across subsequent runs (default: true for visible modes) */
+    keepWindowOpen?: boolean;
+    /** Show the floating in-page "暂停并接管" control pill so users can take over immediately */
+    showTakeoverControl?: boolean;
+    /** Optional explicit screen bounds for `'visible-background'` */
+    windowBounds?: BrowserWindowBounds;
+    /**
+     * Legacy flag preserved for backwards compatibility (`backgroundSilent: true` selects `'headless'`).
+     * Default when omitted is `'visible-background'`.
      */
     backgroundSilent?: boolean;
     /** Initial customizable virtual cursor & trail style */

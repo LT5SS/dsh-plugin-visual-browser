@@ -1,8 +1,9 @@
 import { type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools';
-import type { BrowserRuntimeMode, VirtualCursorStyleConfig } from './driver/types.js';
+import type { BrowserRuntimeMode, BrowserWindowBounds, BrowserWindowMode, VirtualCursorStyleConfig } from './driver/types.js';
 import { BrowserSubagentRunner, type SubagentPlanner } from './subagent/runner.js';
 export * from './driver/types.js';
 export * from './driver/browser-session.js';
+export * from './driver/window-manager.js';
 export * from './driver/human-motion.js';
 export * from './injected/virtual-cursor.js';
 export * from './sampler/telemetry-collector.js';
@@ -32,6 +33,10 @@ export interface VisualBrowserPluginConfig {
     mode?: BrowserRuntimeMode;
     cdpEndpoint?: string;
     executablePath?: string;
+    windowMode?: BrowserWindowMode;
+    keepWindowOpen?: boolean;
+    showTakeoverControl?: boolean;
+    windowBounds?: BrowserWindowBounds;
     backgroundSilent?: boolean;
     artifactDir?: string;
     maxSteps?: number;

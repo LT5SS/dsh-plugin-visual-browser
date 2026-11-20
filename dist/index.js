@@ -4,10 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { defineTool, } from '@deepseek-ai/dsh-tools';
 import { BrowserSession } from './driver/browser-session.js';
+import { resolveBrowserWindowMode } from './driver/window-manager.js';
 import { AtomicBrowserToolset } from './tools/atomic-tools.js';
 import { BrowserSubagentRunner, createBuiltinInspectorPlanner, createDshHostLlmPlanner, createOpenAIVisionPlanner, } from './subagent/runner.js';
 export * from './driver/types.js';
 export * from './driver/browser-session.js';
+export * from './driver/window-manager.js';
 export * from './driver/human-motion.js';
 export * from './injected/virtual-cursor.js';
 export * from './sampler/telemetry-collector.js';
@@ -278,6 +280,11 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 description: 'Optional virtual cursor trail preset',
                 enum: ['cyber-neon', 'comet-gold', 'laser-dots', 'stealth-minimal', 'clean-none'],
             },
+            window_mode: {
+                type: 'string',
+                description: 'Optional window presentation override ("visible-background", "minimized", or "headless")',
+                enum: ['visible-background', 'minimized', 'headless'],
+            },
         },
         output: {
             schema: {
@@ -330,6 +337,12 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     return undefined;
                 }
             };
+            const effectiveWindowMode = resolveBrowserWindowMode({
+                windowMode: args.window_mode ?? config.windowMode,
+                backgroundSilent: config.backgroundSilent,
+            });
+            const keepWindowOpen = config.keepWindowOpen ?? effectiveWindowMode !== 'headless';
+            const showTakeoverControl = config.showTakeoverControl ?? effectiveWindowMode !== 'headless';
             try {
                 const res = await runner.runTask({
                     subagentId,
@@ -341,12 +354,17 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     maxRecentImages: config.maxRecentImages ?? 3,
                     allowedOrigins: config.allowedOrigins,
                     blockedOrigins: config.blockedOrigins,
+                    keepWindowOpen,
                     signal: exec?.signal,
                     sessionOptions: {
                         mode: config.mode ?? 'auto',
                         cdpEndpoint: config.cdpEndpoint,
                         executablePath: config.executablePath,
-                        backgroundSilent: config.backgroundSilent ?? true,
+                        windowMode: effectiveWindowMode,
+                        keepWindowOpen,
+                        showTakeoverControl,
+                        windowBounds: config.windowBounds,
+                        backgroundSilent: effectiveWindowMode === 'headless',
                         cursorStyle: style,
                     },
                     planner,
@@ -357,6 +375,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     timestamp: new Date().toISOString(),
                     status: res.status,
                     subagent_id: res.subagentId,
+                    window_mode: effectiveWindowMode,
                     planner_mode: tracker.effectiveMode,
                     planner_detail: plannerDetail,
                     host_services: hostServicesStatus,
@@ -382,6 +401,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     timestamp: new Date().toISOString(),
                     status: 'FAILED',
                     subagent_id: subagentId,
+                    window_mode: effectiveWindowMode,
                     error: {
                         name: error?.name || error?.constructor?.name || 'Error',
                         message: String(error?.message ?? error).slice(0, 400),
@@ -534,14 +554,45 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
         },
         async execute(args, exec) {
             exec?.signal?.throwIfAborted();
-            const session = await new BrowserSession({
-                mode: config.mode ?? 'auto',
-                cdpEndpoint: config.cdpEndpoint,
-                executablePath: config.executablePath,
-                backgroundSilent: config.backgroundSilent ?? true,
-                cursorStyle: activeCursorStyle,
-            }).start();
+            const effectiveWindowMode = resolveBrowserWindowMode({
+                windowMode: config.windowMode,
+                backgroundSilent: config.backgroundSilent,
+            });
+            const keepWindowOpen = config.keepWindowOpen ?? effectiveWindowMode !== 'headless';
+            const showTakeoverControl = config.showTakeoverControl ?? effectiveWindowMode !== 'headless';
+            const useShared = keepWindowOpen && !runner.isSharedSessionBusy();
+            const acquired = useShared
+                ? await runner.acquireReusableSession({
+                    mode: config.mode ?? 'auto',
+                    cdpEndpoint: config.cdpEndpoint,
+                    executablePath: config.executablePath,
+                    windowMode: effectiveWindowMode,
+                    keepWindowOpen: true,
+                    showTakeoverControl,
+                    windowBounds: config.windowBounds,
+                    backgroundSilent: effectiveWindowMode === 'headless',
+                    cursorStyle: activeCursorStyle,
+                }, true)
+                : {
+                    session: await new BrowserSession({
+                        mode: config.mode ?? 'auto',
+                        cdpEndpoint: config.cdpEndpoint,
+                        executablePath: config.executablePath,
+                        windowMode: runner.isSharedSessionBusy() ? 'headless' : effectiveWindowMode,
+                        showTakeoverControl: runner.isSharedSessionBusy() ? false : showTakeoverControl,
+                        windowBounds: config.windowBounds,
+                        backgroundSilent: runner.isSharedSessionBusy()
+                            ? true
+                            : effectiveWindowMode === 'headless',
+                        cursorStyle: activeCursorStyle,
+                    }).start(),
+                    isShared: false,
+                    reused: false,
+                };
+            const session = acquired.session;
             const onAbort = () => {
+                if (acquired.isShared)
+                    runner.detachSharedSessionForTakeover(session);
                 void session.close().catch(() => { });
             };
             exec?.signal?.addEventListener('abort', onAbort, { once: true });
@@ -560,7 +611,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             }
             finally {
                 exec?.signal?.removeEventListener('abort', onAbort);
-                await session.close();
+                await runner.releaseReusableSession(session, Boolean(useShared && acquired.isShared && !exec?.signal?.aborted));
             }
         },
     });
@@ -579,7 +630,7 @@ export function apply(ctx, config = {}) {
     }
     // Standard Cordis 4.x disposal hook via ctx.effect(() => disposer)
     const disposeAll = () => {
-        void runner.closeAllPausedSessions();
+        void runner.closeAllSessions();
     };
     if (typeof ctx.effect === 'function') {
         ctx.effect(() => disposeAll, 'dsh-plugin-visual-browser.disposePausedSessions');

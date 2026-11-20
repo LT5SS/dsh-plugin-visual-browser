@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-visual-browser",
-  "version": "1.1.8",
+  "version": "1.2.0",
   "description": "Dual-mode adaptive, background-silent visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with customizable Bezier virtual cursor, 3-in-1 sampler, isolated Subagent loop, and human takeover approval cards.",
   "type": "module",
   "main": "dist/index.js",

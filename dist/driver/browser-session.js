@@ -3,8 +3,9 @@ import path from 'node:path';
 import { chromium } from 'playwright-core';
 import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
 import { HumanMotionController } from './human-motion.js';
-import { isNavigationRaceError } from '../sampler/page-snapshot.js';
+import { isNavigationRaceError, safeEvaluate } from '../sampler/page-snapshot.js';
 import { TelemetryCollector } from '../sampler/telemetry-collector.js';
+import { launchChromeNoActivateWin32, resolveBrowserWindowMode, terminateLaunchedChrome, } from './window-manager.js';
 const LOCAL_BROWSER_CANDIDATES = [
     process.env.DSH_BROWSER_EXECUTABLE,
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -27,21 +28,54 @@ export function findLocalBrowserExecutable() {
 export class BrowserSession {
     options;
     activeMode = 'local-background';
+    resolvedWindowMode = 'visible-background';
+    launchedPid;
+    launchedHwnd;
     browser;
     context;
     page;
     motion;
     telemetry;
     isAttachedCDP = false;
+    ephemeralProfileDir;
+    humanTakeoverRequested = false;
+    takeoverBindingInstalled = false;
     constructor(opts = {}) {
+        const resolvedWindowMode = resolveBrowserWindowMode(opts);
+        this.resolvedWindowMode = resolvedWindowMode;
         this.options = {
             mode: opts.mode ?? 'auto',
             viewport: opts.viewport ?? { width: 1440, height: 900 },
-            backgroundSilent: opts.backgroundSilent ?? true,
+            backgroundSilent: opts.backgroundSilent ?? (resolvedWindowMode === 'headless'),
             ...opts,
         };
     }
+    isAlive() {
+        try {
+            return Boolean(this.browser && this.browser.isConnected() && this.page && !this.page.isClosed());
+        }
+        catch {
+            return false;
+        }
+    }
+    async checkHumanTakeoverRequested() {
+        if (this.humanTakeoverRequested)
+            return true;
+        if (!this.page)
+            return false;
+        const flag = await safeEvaluate(this.page, () => Boolean(window.__dshTakeoverRequested), false, 0).catch(() => false);
+        if (flag) {
+            this.humanTakeoverRequested = true;
+        }
+        return this.humanTakeoverRequested;
+    }
+    async resetHumanTakeoverRequest() {
+        this.humanTakeoverRequested = false;
+        await this.motion?.resetTakeoverRequest().catch(() => { });
+    }
     async start() {
+        this.resolvedWindowMode = resolveBrowserWindowMode(this.options);
+        const showTakeover = this.options.showTakeoverControl ?? (this.resolvedWindowMode !== 'headless');
         const cdpUrl = this.options.cdpEndpoint ||
             process.env.DSH_WEBVIEW_CDP_URL ||
             process.env.DSH_CDP_ENDPOINT;
@@ -54,7 +88,29 @@ export class BrowserSession {
             this.isAttachedCDP = true;
             this.browser = await chromium.connectOverCDP(cdpUrl);
             const existingContexts = this.browser.contexts();
-            this.context = existingContexts[0] ?? (await this.browser.newContext({ viewport: this.options.viewport }));
+            this.context =
+                existingContexts[0] ?? (await this.browser.newContext({ viewport: this.options.viewport }));
+            const existingPages = this.context.pages();
+            this.page = existingPages[0] ?? (await this.context.newPage());
+        }
+        else if (this.resolvedWindowMode !== 'headless' && process.platform === 'win32') {
+            this.activeMode = 'local-background';
+            this.isAttachedCDP = false;
+            const executablePath = this.options.executablePath ?? findLocalBrowserExecutable();
+            const launched = await launchChromeNoActivateWin32({
+                executablePath,
+                windowMode: this.resolvedWindowMode,
+                windowBounds: this.options.windowBounds,
+                userDataDir: this.options.userDataDir,
+            });
+            this.launchedPid = launched.pid;
+            this.launchedHwnd = launched.hwnd;
+            if (launched.ephemeralProfile) {
+                this.ephemeralProfileDir = launched.userDataDir;
+            }
+            this.browser = await chromium.connectOverCDP(launched.wsUrl);
+            const existingContexts = this.browser.contexts();
+            this.context = existingContexts[0] ?? (await this.browser.newContext({ viewport: null }));
             const existingPages = this.context.pages();
             this.page = existingPages[0] ?? (await this.context.newPage());
         }
@@ -69,11 +125,15 @@ export class BrowserSession {
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
+                '--disable-features=CalculateNativeWinOcclusion',
                 '--disable-infobars',
-                '--window-size=' + `${this.options.viewport.width},${this.options.viewport.height}`,
             ];
-            if (this.options.backgroundSilent) {
+            if (this.resolvedWindowMode === 'headless') {
                 args.unshift('--headless=new');
+                args.push('--window-size=' + `${this.options.viewport.width},${this.options.viewport.height}`);
+            }
+            else if (this.resolvedWindowMode === 'minimized') {
+                args.push('--start-minimized');
             }
             this.browser = await chromium.launch({
                 executablePath,
@@ -81,14 +141,30 @@ export class BrowserSession {
                 args,
             });
             this.context = await this.browser.newContext({
-                viewport: this.options.viewport,
+                viewport: this.resolvedWindowMode === 'headless' ? this.options.viewport : null,
                 deviceScaleFactor: 1,
             });
             this.page = await this.context.newPage();
         }
-        const initScript = buildVirtualCursorInitScript(this.options.cursorStyle);
+        const initScript = buildVirtualCursorInitScript(this.options.cursorStyle, {
+            showTakeoverControl: showTakeover,
+        });
         await this.context.addInitScript(initScript);
-        this.motion = new HumanMotionController(this.page, this.options.cursorStyle);
+        if (!this.takeoverBindingInstalled) {
+            try {
+                await this.context.exposeBinding('__dshRequestTakeover', () => {
+                    this.humanTakeoverRequested = true;
+                });
+            }
+            catch {
+                /* ignore if binding already registered on reused external CDP context */
+            }
+            this.takeoverBindingInstalled = true;
+        }
+        this.motion = new HumanMotionController(this.page, this.options.cursorStyle, {
+            showTakeoverControl: showTakeover,
+            shouldAbort: () => this.humanTakeoverRequested,
+        });
         this.telemetry = new TelemetryCollector(this.page);
         return this;
     }
@@ -116,8 +192,26 @@ export class BrowserSession {
         return outputPath;
     }
     async close() {
-        if (!this.browser)
+        if (this.launchedPid) {
+            try {
+                if (this.browser?.isConnected()) {
+                    const cdp = await this.browser.newBrowserCDPSession().catch(() => null);
+                    await cdp?.send('Browser.close').catch(() => { });
+                    await this.browser.close().catch(() => { });
+                }
+            }
+            finally {
+                const pid = this.launchedPid;
+                const profileDir = this.ephemeralProfileDir;
+                this.launchedPid = undefined;
+                this.launchedHwnd = undefined;
+                this.ephemeralProfileDir = undefined;
+                await terminateLaunchedChrome(pid, profileDir, Boolean(profileDir));
+            }
             return;
-        await this.browser.close();
+        }
+        if (!this.isAttachedCDP && this.browser) {
+            await this.browser.close().catch(() => { });
+        }
     }
 }

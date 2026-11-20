@@ -3,5 +3,8 @@ export declare const CURSOR_STYLE_PRESETS: Record<VirtualCursorPreset, Required<
 export declare function resolveCursorStyle(config?: VirtualCursorStyleConfig): Required<Omit<VirtualCursorStyleConfig, 'preset'>> & {
     preset: VirtualCursorPreset;
 };
-export declare function buildVirtualCursorInitScript(initialStyle?: VirtualCursorStyleConfig): string;
+export declare function buildVirtualCursorInitScript(initialStyle?: VirtualCursorStyleConfig, opts?: {
+    showTakeoverControl?: boolean;
+    roleLabel?: string;
+}): string;
 export declare const VIRTUAL_CURSOR_INIT_SCRIPT: string;

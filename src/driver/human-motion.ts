@@ -3,6 +3,8 @@ import type { MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.j
 import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
 import { safeEvaluate } from '../sampler/page-snapshot.js';
 
+export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
+
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
@@ -24,10 +26,19 @@ export class HumanMotionController {
   private page: Page;
   private pos: Point2D = { x: 120, y: 120 };
   private cursorStyle: VirtualCursorStyleConfig;
+  private showTakeoverControl: boolean;
+  private shouldAbort?: () => boolean;
+  private takeoverRole = '';
 
-  constructor(page: Page, initialStyle: VirtualCursorStyleConfig = {}) {
+  constructor(
+    page: Page,
+    initialStyle: VirtualCursorStyleConfig = {},
+    opts: { showTakeoverControl?: boolean; shouldAbort?: () => boolean } = {}
+  ) {
     this.page = page;
     this.cursorStyle = initialStyle;
+    this.showTakeoverControl = Boolean(opts.showTakeoverControl);
+    this.shouldAbort = opts.shouldAbort;
   }
 
   public getPosition(): Point2D {
@@ -39,7 +50,10 @@ export class HumanMotionController {
   }
 
   public async ensureCursorHUD(): Promise<void> {
-    const initScript = buildVirtualCursorInitScript(this.cursorStyle);
+    const initScript = buildVirtualCursorInitScript(this.cursorStyle, {
+      showTakeoverControl: this.showTakeoverControl,
+      roleLabel: this.takeoverRole,
+    });
     await safeEvaluate(
       this.page,
       (script: string) => {
@@ -49,6 +63,33 @@ export class HumanMotionController {
       },
       undefined,
       { arg: initScript, retries: 1 }
+    );
+  }
+
+  public async setTakeoverState(mode: TakeoverControlMode, roleLabel?: string): Promise<void> {
+    if (typeof roleLabel === 'string') {
+      this.takeoverRole = roleLabel;
+    }
+    this.showTakeoverControl = mode !== 'hidden';
+    await this.ensureCursorHUD();
+    await safeEvaluate(
+      this.page,
+      ({ m, role }: { m: TakeoverControlMode; role: string }) => {
+        (window as any).__dshCursorAPI?.setTakeoverState(m, role);
+      },
+      undefined,
+      { arg: { m: mode, role: this.takeoverRole }, retries: 0 }
+    );
+  }
+
+  public async resetTakeoverRequest(): Promise<void> {
+    await safeEvaluate(
+      this.page,
+      () => {
+        (window as any).__dshCursorAPI?.resetTakeoverRequest();
+      },
+      undefined,
+      0
     );
   }
 
@@ -118,6 +159,7 @@ export class HumanMotionController {
     const stepDelay = Math.max(4, Math.round(durationMs / steps));
 
     for (let i = 1; i <= steps; i++) {
+      if (this.shouldAbort?.()) break;
       const progress = easeInOutCubic(i / steps);
       const pt = cubicBezier(p0, p1, p2, p3, progress);
       this.pos = pt;
@@ -132,6 +174,7 @@ export class HumanMotionController {
 
   public async sweepPath(waypoints: Point2D[], opts: MotionOptions = {}): Promise<Point2D> {
     for (let i = 0; i < waypoints.length; i++) {
+      if (this.shouldAbort?.()) break;
       const wp = waypoints[i];
       await this.moveTo(wp.x, wp.y, {
         steps: opts.steps ?? 16,
@@ -194,6 +237,7 @@ export class HumanMotionController {
     let accumulated = 0;
 
     for (let i = 1; i <= frames; i++) {
+      if (this.shouldAbort?.()) break;
       const targetNow = deltaY * easeInOutCubic(i / frames);
       const stepDelta = targetNow - accumulated;
       accumulated = targetNow;

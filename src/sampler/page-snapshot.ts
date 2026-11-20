@@ -229,6 +229,7 @@ export class PageSnapshotSampler {
       let refIdx = 0;
       for (const el of candidates) {
         if (nodes.length >= 35) break;
+        if (el.closest('#__dsh_vc_root__')) continue;
         const style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.05) {
           continue;
@@ -336,8 +337,8 @@ export class PageSnapshotSampler {
             img: document.querySelectorAll('img').length,
             section: document.querySelectorAll('section').length,
             article: document.querySelectorAll('article').length,
-            button: document.querySelectorAll('button').length,
-            a: document.querySelectorAll('a').length,
+            button: document.querySelectorAll('button:not(#__dsh_vc_root__ button)').length,
+            a: document.querySelectorAll('a:not(#__dsh_vc_root__ a)').length,
             openDialogs: document.querySelectorAll('dialog[open]').length,
           },
           detectedTechHints: techHints,

@@ -504,6 +504,8 @@ export function createBuiltinInspectorPlanner() {
 }
 export class BrowserSubagentRunner {
     pausedSessions = new Map();
+    sharedSession = null;
+    sharedSessionBusy = false;
     isOriginPermitted(targetUrl, allowedOrigins, blockedOrigins) {
         try {
             const origin = new URL(targetUrl).origin;
@@ -521,7 +523,56 @@ export class BrowserSubagentRunner {
     getPausedSession(subagentId) {
         return this.pausedSessions.get(subagentId);
     }
-    async closeAllPausedSessions() {
+    getSharedSession() {
+        if (this.sharedSession && !this.sharedSession.isAlive()) {
+            this.sharedSession = null;
+            this.sharedSessionBusy = false;
+        }
+        return this.sharedSession;
+    }
+    isSharedSessionBusy() {
+        return Boolean(this.getSharedSession() && this.sharedSessionBusy);
+    }
+    async acquireReusableSession(opts, allowReuse) {
+        const existing = allowReuse ? this.getSharedSession() : null;
+        if (allowReuse && existing && !this.sharedSessionBusy) {
+            this.sharedSessionBusy = true;
+            if (opts.cursorStyle) {
+                await existing.motion.setCursorStyle(opts.cursorStyle).catch(() => { });
+            }
+            return { session: existing, isShared: true, reused: true };
+        }
+        const session = await new BrowserSession(opts).start();
+        if (allowReuse && !this.getSharedSession()) {
+            this.sharedSession = session;
+            this.sharedSessionBusy = true;
+            return { session, isShared: true, reused: false };
+        }
+        return { session, isShared: false, reused: false };
+    }
+    async releaseReusableSession(session, keepAlive) {
+        if (session === this.sharedSession) {
+            if (keepAlive && session.isAlive()) {
+                this.sharedSessionBusy = false;
+                await session.motion.setTakeoverState('idle').catch(() => { });
+                return;
+            }
+            this.sharedSession = null;
+            this.sharedSessionBusy = false;
+            await session.close().catch(() => { });
+            return;
+        }
+        if (!keepAlive) {
+            await session.close().catch(() => { });
+        }
+    }
+    detachSharedSessionForTakeover(session) {
+        if (session === this.sharedSession) {
+            this.sharedSession = null;
+            this.sharedSessionBusy = false;
+        }
+    }
+    async closeAllSessions() {
         const sessions = [...this.pausedSessions.values()];
         this.pausedSessions.clear();
         for (const state of sessions) {
@@ -532,6 +583,20 @@ export class BrowserSubagentRunner {
                 // ignore cleanup error on already-closed browser
             }
         }
+        if (this.sharedSession) {
+            const shared = this.sharedSession;
+            this.sharedSession = null;
+            this.sharedSessionBusy = false;
+            try {
+                await shared.close();
+            }
+            catch {
+                // ignore cleanup error on already-closed shared browser
+            }
+        }
+    }
+    async closeAllPausedSessions() {
+        await this.closeAllSessions();
     }
     async runTask(req) {
         req.signal?.throwIfAborted();
@@ -539,12 +604,18 @@ export class BrowserSubagentRunner {
         const maxSteps = req.maxSteps ?? 10;
         const maxRecentImages = req.maxRecentImages ?? 3;
         const snapshotDir = path.join(req.artifactDir, subagentId);
-        const session = await new BrowserSession(req.sessionOptions).start();
+        const keepWindowOpen = Boolean(req.keepWindowOpen);
+        const { session, isShared } = await this.acquireReusableSession(req.sessionOptions ?? {}, keepWindowOpen);
         const onAbort = () => {
+            this.detachSharedSessionForTakeover(session);
             void session.close().catch(() => { });
         };
         req.signal?.addEventListener('abort', onAbort, { once: true });
         try {
+            await session.resetHumanTakeoverRequest();
+            if (req.sessionOptions?.showTakeoverControl ?? session.resolvedWindowMode !== 'headless') {
+                await session.motion.setTakeoverState('running', req.role).catch(() => { });
+            }
             const hostFacts = new HostFactsTracker(subagentId, req.role, session);
             const history = new SlidingWindowHistory(maxRecentImages);
             const tools = new AtomicBrowserToolset(session, snapshotDir);
@@ -558,7 +629,7 @@ export class BrowserSubagentRunner {
                     : createBuiltinInspectorPlanner());
             if (!this.isOriginPermitted(req.startUrl, req.allowedOrigins, req.blockedOrigins)) {
                 hostFacts.recordBlockedOrigin(req.startUrl);
-                await session.close();
+                await this.releaseReusableSession(session, Boolean(keepWindowOpen && isShared));
                 return {
                     subagentId,
                     role: req.role,
@@ -584,7 +655,12 @@ export class BrowserSubagentRunner {
                 nextStep: 1,
                 maxSteps,
                 latestObs: initRes.observation,
+                isSharedSession: isShared,
             });
+        }
+        catch (err) {
+            await this.releaseReusableSession(session, Boolean(keepWindowOpen && isShared && !req.signal?.aborted));
+            throw err;
         }
         finally {
             req.signal?.removeEventListener('abort', onAbort);
@@ -607,6 +683,10 @@ export class BrowserSubagentRunner {
         };
         signal?.addEventListener('abort', onAbort, { once: true });
         try {
+            await session.resetHumanTakeoverRequest();
+            if (req.sessionOptions?.showTakeoverControl ?? session.resolvedWindowMode !== 'headless') {
+                await session.motion.setTakeoverState('running', req.role).catch(() => { });
+            }
             const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
             signal?.throwIfAborted();
             hostFacts.recordStep(postTakeoverObs.screenshotPath);
@@ -622,6 +702,7 @@ export class BrowserSubagentRunner {
                 nextStep,
                 maxSteps,
                 latestObs: postTakeoverObs,
+                isSharedSession: false,
             });
         }
         finally {
@@ -629,45 +710,53 @@ export class BrowserSubagentRunner {
         }
     }
     async executeLoop(state) {
-        const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps } = state;
+        const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps, isSharedSession } = state;
         let latestObs = state.latestObs;
         let keepSessionAlive = false;
+        const pauseNow = async (nextStep, reason, url, details) => {
+            keepSessionAlive = true;
+            this.detachSharedSessionForTakeover(session);
+            await session.motion.setTakeoverState('paused', req.role).catch(() => { });
+            this.pausedSessions.set(subagentId, {
+                subagentId,
+                req,
+                session,
+                tools,
+                hostFacts,
+                history,
+                planner,
+                nextStep,
+                maxSteps,
+            });
+            const card = buildApprovalCard({
+                subagentId,
+                role: req.role,
+                reason,
+                url,
+                screenshotPath: latestObs.screenshotPath,
+                details,
+            });
+            return {
+                subagentId,
+                role: req.role,
+                status: 'PAUSED_FOR_TAKEOVER',
+                subagentReport: `${card.title}\n${card.instructions}`,
+                hostFactsBlock: hostFacts.formatHostFactsBlock(),
+                hostFacts: hostFacts.getFacts(),
+                contextStats: history.getStats(),
+                approvalCard: card,
+            };
+        };
         try {
             for (let step = state.nextStep; step <= maxSteps; step++) {
                 req.signal?.throwIfAborted();
+                if (await session.checkHumanTakeoverRequested()) {
+                    return await pauseNow(step, 'USER_TAKEOVER', session.page.url(), '用户在浏览器窗口点击了「暂停并接管」。子代理已立即暂停，请完成人工操作后调用 browser_subagent_resume。');
+                }
                 if (req.pauseOnGate ?? true) {
                     const gate = await detectPageGate(session.page);
                     if (gate.detected && gate.reason) {
-                        keepSessionAlive = true;
-                        this.pausedSessions.set(subagentId, {
-                            subagentId,
-                            req,
-                            session,
-                            tools,
-                            hostFacts,
-                            history,
-                            planner,
-                            nextStep: step,
-                            maxSteps,
-                        });
-                        const card = buildApprovalCard({
-                            subagentId,
-                            role: req.role,
-                            reason: gate.reason,
-                            url: gate.url,
-                            screenshotPath: latestObs.screenshotPath,
-                            details: gate.details,
-                        });
-                        return {
-                            subagentId,
-                            role: req.role,
-                            status: 'PAUSED_FOR_TAKEOVER',
-                            subagentReport: `${card.title}\n${card.instructions}`,
-                            hostFactsBlock: hostFacts.formatHostFactsBlock(),
-                            hostFacts: hostFacts.getFacts(),
-                            contextStats: history.getStats(),
-                            approvalCard: card,
-                        };
+                        return await pauseNow(step, gate.reason, gate.url, gate.details ?? 'Page gate detected. Waiting for human action.');
                     }
                 }
                 const decision = await planner({
@@ -680,6 +769,9 @@ export class BrowserSubagentRunner {
                     signal: req.signal,
                 });
                 req.signal?.throwIfAborted();
+                if (await session.checkHumanTakeoverRequested()) {
+                    return await pauseNow(step, 'USER_TAKEOVER', session.page.url(), '用户在子代理决策期间点击了「暂停并接管」。子代理已立即暂停。');
+                }
                 if (decision.type === 'complete') {
                     return {
                         subagentId,
@@ -692,36 +784,7 @@ export class BrowserSubagentRunner {
                     };
                 }
                 if (decision.type === 'pause_for_takeover') {
-                    keepSessionAlive = true;
-                    this.pausedSessions.set(subagentId, {
-                        subagentId,
-                        req,
-                        session,
-                        tools,
-                        hostFacts,
-                        history,
-                        planner,
-                        nextStep: step + 1,
-                        maxSteps,
-                    });
-                    const card = buildApprovalCard({
-                        subagentId,
-                        role: req.role,
-                        reason: decision.blockReason,
-                        url: session.page.url(),
-                        screenshotPath: latestObs.screenshotPath,
-                        details: decision.message,
-                    });
-                    return {
-                        subagentId,
-                        role: req.role,
-                        status: 'PAUSED_FOR_TAKEOVER',
-                        subagentReport: `${card.title}\n${card.instructions}`,
-                        hostFactsBlock: hostFacts.formatHostFactsBlock(),
-                        hostFacts: hostFacts.getFacts(),
-                        contextStats: history.getStats(),
-                        approvalCard: card,
-                    };
+                    return await pauseNow(step + 1, decision.blockReason, session.page.url(), decision.message);
                 }
                 if (decision.type === 'navigate') {
                     if (!this.isOriginPermitted(decision.url, req.allowedOrigins, req.blockedOrigins)) {
@@ -736,10 +799,16 @@ export class BrowserSubagentRunner {
                     hostFacts.recordStep(res.observation.screenshotPath);
                     history.pushObservation(`${res.action} (${decision.reason})`, res.observation, res.llmSummary);
                     latestObs = res.observation;
+                    if (await session.checkHumanTakeoverRequested()) {
+                        return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在导航期间点击了「暂停并接管」。');
+                    }
                     continue;
                 }
                 if (decision.type === 'set_cursor_style') {
                     await tools.setCursorStyle(decision.style);
+                    if (await session.checkHumanTakeoverRequested()) {
+                        return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在更新光标样式后点击了「暂停并接管」。');
+                    }
                     continue;
                 }
                 let actionResult;
@@ -764,6 +833,9 @@ export class BrowserSubagentRunner {
                 hostFacts.recordStep(actionResult.observation.screenshotPath);
                 history.pushObservation(`${actionResult.action} — ${decision.reason}`, actionResult.observation, actionResult.llmSummary);
                 latestObs = actionResult.observation;
+                if (await session.checkHumanTakeoverRequested()) {
+                    return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在执行动作期间点击了「暂停并接管」。请人工接管完成后调用 browser_subagent_resume。');
+                }
             }
             return {
                 subagentId,
@@ -777,7 +849,7 @@ export class BrowserSubagentRunner {
         }
         finally {
             if (!keepSessionAlive) {
-                await session.close();
+                await this.releaseReusableSession(session, Boolean(req.keepWindowOpen && isSharedSession && !req.signal?.aborted));
             }
         }
     }

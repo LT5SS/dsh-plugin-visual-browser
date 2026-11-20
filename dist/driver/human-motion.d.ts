@@ -1,13 +1,22 @@
 import type { Page } from 'playwright-core';
 import type { MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
+export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
 export declare class HumanMotionController {
     private page;
     private pos;
     private cursorStyle;
-    constructor(page: Page, initialStyle?: VirtualCursorStyleConfig);
+    private showTakeoverControl;
+    private shouldAbort?;
+    private takeoverRole;
+    constructor(page: Page, initialStyle?: VirtualCursorStyleConfig, opts?: {
+        showTakeoverControl?: boolean;
+        shouldAbort?: () => boolean;
+    });
     getPosition(): Point2D;
     getCursorStyle(): VirtualCursorStyleConfig;
     ensureCursorHUD(): Promise<void>;
+    setTakeoverState(mode: TakeoverControlMode, roleLabel?: string): Promise<void>;
+    resetTakeoverRequest(): Promise<void>;
     /**
      * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).
      */
