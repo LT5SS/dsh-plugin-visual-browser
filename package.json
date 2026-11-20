@@ -1,0 +1,43 @@
+{
+  "name": "dsh-plugin-visual-browser",
+  "version": "1.0.0",
+  "description": "Dual-mode adaptive, background-silent visual browser subagent plugin for DeepSeek Harness (DSH) with customizable Bezier virtual cursor, 3-in-1 sampler, isolated Subagent loop, and human takeover approval cards.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "cordis.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": "cordis.yml"
+  },
+  "scripts": {
+    "stage1:verify": "tsx scripts/verify-stage1.ts",
+    "stage2:verify": "tsx scripts/verify-stage2.ts",
+    "stage3:verify": "tsx scripts/verify-stage3.ts",
+    "stage4:verify": "tsx scripts/verify-stage4.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "playwright-core": "^1.51.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}

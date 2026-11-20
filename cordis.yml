@@ -1,0 +1,14 @@
+# DeepSeek Harness (Cordis) Patch / Bundle Configuration
+# Usage: pnpm dsh web --patch ./cordis.yml
+
+- insert:
+  - id: dsh-plugin-visual-browser
+    name: './dist/index.js'
+    config:
+      mode: 'auto'
+      backgroundSilent: true
+      maxSteps: 12
+      maxRecentImages: 3
+      artifactDir: './artifacts/dsh-browser'
+      cursorStyle:
+        preset: 'cyber-neon'
