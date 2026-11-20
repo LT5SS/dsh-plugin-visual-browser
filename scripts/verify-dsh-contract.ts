@@ -604,12 +604,48 @@ async function main() {
   assert.ok(fs.existsSync(clientDistPath), 'Expected built dist/client.js to exist');
   const clientSource = fs.readFileSync(clientDistPath, 'utf8');
   let registeredClientMod: any = null;
+  const hookStates = new Map<string, any[]>();
+  const pendingEffects: Array<() => void> = [];
+  const recordedTimers: Array<{ id: number; ms: number; cb: () => void }> = [];
+  let nextTimerId = 1;
+  let currentCompKey = 'root';
+  let currentHookIdx = 0;
+
   const mockReact = {
     Fragment: Symbol.for('react.fragment'),
     createElement: (type: any, props: any, ...children: any[]) => ({ type, props, children }),
-    useState: (init: any) => [typeof init === 'function' ? init() : init, () => {}],
-    useEffect: () => {},
-    useRef: (init: any) => ({ current: init }),
+    useState: (init: any) => {
+      const idx = currentHookIdx++;
+      let arr = hookStates.get(currentCompKey);
+      if (!arr) {
+        arr = [];
+        hookStates.set(currentCompKey, arr);
+      }
+      if (!(idx in arr)) {
+        arr[idx] = typeof init === 'function' ? init() : init;
+      }
+      const keySnap = currentCompKey;
+      const setState = (next: any) => {
+        const list = hookStates.get(keySnap)!;
+        list[idx] = typeof next === 'function' ? next(list[idx]) : next;
+      };
+      return [arr[idx], setState];
+    },
+    useEffect: (fn: () => any) => {
+      pendingEffects.push(fn);
+    },
+    useRef: (init: any) => {
+      const idx = currentHookIdx++;
+      let arr = hookStates.get(currentCompKey);
+      if (!arr) {
+        arr = [];
+        hookStates.set(currentCompKey, arr);
+      }
+      if (!(idx in arr)) {
+        arr[idx] = { current: init };
+      }
+      return arr[idx];
+    },
   };
   const clientSandbox: any = {
     Object,
@@ -625,12 +661,24 @@ async function main() {
     JSON,
     Reflect,
     Symbol,
+    Promise,
+    setTimeout: (cb: () => void, ms: number) => {
+      const id = nextTimerId++;
+      recordedTimers.push({ id, ms, cb });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      const idx = recordedTimers.findIndex((t) => t.id === id);
+      if (idx >= 0) recordedTimers.splice(idx, 1);
+    },
     window: {
       __ModuleLoader__: {
         load(reg: any) {
           registeredClientMod = reg;
         },
       },
+      addEventListener() {},
+      removeEventListener() {},
     },
   };
   vm.runInNewContext(clientSource, clientSandbox);
@@ -640,6 +688,85 @@ async function main() {
     throw new Error(`Unexpected require inside dist/client.js: ${id}`);
   });
   assert.deepEqual([...clientExports.inject], ['slots', 'locale', 'configForms']);
+
+  const renderPanelTree = (panelProps: Record<string, any>, reset = true): any => {
+    if (reset) {
+      hookStates.clear();
+      recordedTimers.length = 0;
+    }
+    pendingEffects.length = 0;
+    const expand = (node: any, scopePath: string): any => {
+      if (node == null || typeof node !== 'object') return node;
+      if (Array.isArray(node)) return node.map((item, i) => expand(item, `${scopePath}[${i}]`));
+      if (typeof node.type === 'function') {
+        const compKey = `${scopePath}:${node.type.name || 'anon'}`;
+        currentCompKey = compKey;
+        currentHookIdx = 0;
+        const out = node.type(node.props || {});
+        return expand(out, compKey);
+      }
+      return {
+        ...node,
+        children: expand(node.children, scopePath),
+      };
+    };
+    const tree = expand(mockReact.createElement(clientExports.VisualBrowserSettingsPanel, panelProps), 'panel');
+    for (const eff of [...pendingEffects]) {
+      eff();
+    }
+    return tree;
+  };
+  const collectTreeText = (node: any): string => {
+    if (node == null || typeof node === 'boolean') return '';
+    if (typeof node === 'string' || typeof node === 'number') return String(node);
+    if (Array.isArray(node)) return node.map(collectTreeText).join(' ');
+    if (typeof node === 'object') {
+      return [node.props?.children, node.children].map(collectTreeText).join(' ');
+    }
+    return '';
+  };
+
+  // Verify 4 UI modes per TASK-v1.2.3:
+  const noProviderText = collectTreeText(renderPanelTree({}));
+  assert.ok(noProviderText.includes('未向本插件提供可视化配置表单'), 'Expected immediate degraded message when host supplies neither form nor hooks');
+  assert.ok(!noProviderText.includes('正在读取视觉浏览器配置…'), 'Degraded panel without provider must NEVER render loading text');
+  assert.ok(noProviderText.includes('宿主能力探测：'), 'Expected P1 diagnostic line in degraded view');
+
+  const readyFormText = collectTreeText(
+    renderPanelTree({
+      form: {
+        state: { status: 'ready', writable: true, revision: 1, value: { cursorStyle: { preset: 'comet-gold' } } },
+        mutate: async () => true,
+      },
+    })
+  );
+  assert.ok(!readyFormText.includes('未向本插件提供可视化配置表单'));
+  assert.ok(readyFormText.includes('保存设置'));
+
+  const useHookText = collectTreeText(
+    renderPanelTree({
+      useConfigForm: (sel: (s: any) => any) =>
+        sel({ status: 'ready', writable: true, revision: 2, value: { cursorStyle: { preset: 'laser-dots' } } }),
+    })
+  );
+  assert.ok(!useHookText.includes('未向本插件提供可视化配置表单'));
+  assert.ok(useHookText.includes('保存设置'));
+
+  const loadingStoreProps = {
+    configFormStore: {
+      getSnapshot: () => ({ status: 'loading', writable: false }),
+      subscribe: () => () => {},
+      mutate: async () => false,
+    },
+  };
+  const initialLoadingText = collectTreeText(renderPanelTree(loadingStoreProps, true));
+  assert.ok(initialLoadingText.includes('正在读取视觉浏览器配置…'));
+  const timeoutTimer = recordedTimers.find((t) => t.ms === 2500);
+  assert.ok(timeoutTimer, 'Expected 2500ms loading timeout fallback timer');
+  timeoutTimer!.cb();
+  const timedOutText = collectTreeText(renderPanelTree(loadingStoreProps, false));
+  assert.ok(timedOutText.includes('未向本插件提供可视化配置表单'), 'Expected degraded view after 2.5s timeout');
+  assert.ok(!timedOutText.includes('正在读取视觉浏览器配置…'), 'Loading text must vanish after 2.5s timeout');
 
   const slotRegistrations: Array<{ name: string; opts: any; comp: any }> = [];
   const mutateCalls: Array<{ ns: string; ops: any[]; rev?: number }> = [];
@@ -1503,6 +1630,56 @@ async function main() {
       console.log('[Strict DSH 0.2 Contract] 5k Verified custom shapes, URL sanitization & settings/document-updated live sync!');
     } finally {
       await liveRes.runner.closeAllSessions();
+    }
+
+    // 5l. TASK-v1.2.4: HUD badge viewport boundary flip & 8px clamping + resize re-clamp
+    const badgeSession = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+    }).start();
+    try {
+      await badgeSession.page.setViewportSize({ width: 754, height: 751 });
+      await badgeSession.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded');
+
+      const evalBadge = async (x: number, y: number, label: string) =>
+        safeEvaluate(
+          badgeSession.page,
+          ({ px, py, lbl }) => {
+            (window as any).__dshCursorAPI.update(px, py, lbl);
+            const badge = document.getElementById('__dsh_vc_badge__')!;
+            const r = badge.getBoundingClientRect();
+            return {
+              vw: window.innerWidth,
+              vh: window.innerHeight,
+              left: Math.round(r.left),
+              top: Math.round(r.top),
+              right: Math.round(r.right),
+              bottom: Math.round(r.bottom),
+            };
+          },
+          { vw: 0, vh: 0, left: 0, top: 0, right: 0, bottom: 0 },
+          { arg: { px: x, py: y, lbl: label }, retries: 0 }
+        );
+
+      const br = await evalBadge(748, 742, 'NEAR-CORNER');
+      assert.ok(br.right <= 754 - 8, `Expected right <= 746, got ${br.right}`);
+      assert.ok(br.bottom <= 751 - 8, `Expected bottom <= 743, got ${br.bottom}`);
+
+      const tr = await evalBadge(690, 40, 'CLICK #2');
+      assert.ok(tr.right <= 754 - 8 && tr.left < 690 && tr.top >= 8);
+
+      const tl = await evalBadge(2, 2, 'TOP-LEFT');
+      assert.ok(tl.left >= 8 && tl.top >= 8);
+
+      const mid = await evalBadge(300, 300, 'CENTER');
+      assert.ok(mid.left > 300 && mid.top > 300);
+
+      await badgeSession.page.setViewportSize({ width: 500, height: 400 });
+      const rsz = await evalBadge(494, 392, 'RESIZED');
+      assert.ok(rsz.right <= 500 - 8 && rsz.bottom <= 400 - 8);
+      console.log('[Strict DSH 0.2 Contract] 5l Verified HUD badge viewport flip, 8px clamping & resize re-clamp!');
+    } finally {
+      await badgeSession.close();
     }
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');

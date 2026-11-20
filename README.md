@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.2.2 — Top-Layer Hit-Test Isolation, Live Takeover & DSH Settings UI)
+# `dsh-plugin-visual-browser` (v1.2.4 — HUD Badge Viewport Clamping, Layer Isolation & DSH Settings UI)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -18,7 +18,8 @@
 3. **物理轨迹虚拟鼠标 + DSH 原生可视化设置页（预设 / 自定义指针 & 拖尾）**
    - 三次贝塞尔弧线（Cubic Bezier）+ Ease-In-Out 速度曲线步进器，派发连续真实的 `pointermove` / `wheel` 事件；
    - 支持 **5 套内置预设**（`cyber-neon`、`comet-gold`、`laser-dots`、`stealth-minimal`、`clean-none`）+ `custom`，以及 **7 种指针造型**（`arrow`、`crosshair`、`dot`、`star`、`ring`、`custom-svg` 自定义路径、`custom-image` 上传本地图标或图片 URL + 热点偏移）；
-   - 通过 `dsh.client` 与 live `.volatile()` Schema 在 DSH **设置 → 视觉浏览器**（以及 **插件 → dsh-plugin-visual-browser** 详情页）提供实时交互预览画布与全部参数调色板，保存后即时热更新到打开的共享浏览器窗口；
+   - 通过 `dsh.client` 与 live `.volatile()` Schema 在 DSH **设置 → 视觉浏览器**（以及 **插件 → dsh-plugin-visual-browser** 详情页）提供实时交互预览画布与全部参数调色板（兼容宿主 `useConfigForm` 注入及无表单时的即时降级提示与配置/调用导出），保存后即时热更新到打开的共享浏览器窗口；
+   - **HUD 徽标视口防裁切**：光标坐标徽标会根据窗口边界与 `resize` 自动向左侧/上方翻转并保持 8px 安全内边距，贴边停靠时完整可见；
    - 采用 Chromium `popover="manual"` Top-Layer 与 **点击前 `elementsFromPoint` 穿透层级命中测试**（穿透 Shadow DOM 与同源 iframe）：运行期右上角接管提示条默认 `pointer-events: none` 不挡下方 `Menu` 等站点元素；一旦任意点击落点命中处于顶层且可交互的插件 UI，立即拒绝派发真实 `mouse.click` 并返回 `{ ok: false, blocked: 'PLUGIN_UI_LAYER', hit }` 记录入 `diagnostics.json`；默认支持按 `F8`（可在设置自定义热键）随时触发人工接管。
    - 支持 `?__dsh_test_center_pill=1` 测试开关，可将插件状态条临时居中用于验证 Top-Layer 遮挡拒点行为。
 4. **独立 Browser Subagent 循环 + 截图滑动窗口（省 80%+ 视觉 Token）**
@@ -50,7 +51,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.2.2+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.2.4+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）

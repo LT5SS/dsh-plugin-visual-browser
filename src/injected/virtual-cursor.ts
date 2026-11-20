@@ -256,6 +256,51 @@ export function buildVirtualCursorInitScript(
     takeoverPending: Boolean(window.__dshTakeoverRequested),
   };
 
+  let badgeMeasurePending = false;
+  function placeBadge(x, y) {
+    const badge = document.getElementById('__dsh_vc_badge__');
+    if (!badge || badge.style.display === 'none') return;
+    const MARGIN = 8;
+    const GAP_X = 14;
+    const GAP_Y = 12;
+    const bw = badge.offsetWidth || Math.ceil(badge.getBoundingClientRect().width) || 0;
+    const bh = badge.offsetHeight || Math.ceil(badge.getBoundingClientRect().height) || 0;
+    if ((bw === 0 || bh === 0) && !badgeMeasurePending && typeof requestAnimationFrame === 'function') {
+      badgeMeasurePending = true;
+      requestAnimationFrame(() => {
+        badgeMeasurePending = false;
+        placeBadge(state.x, state.y);
+      });
+    }
+    const vw = window.innerWidth || document.documentElement?.clientWidth || 1440;
+    const vh = window.innerHeight || document.documentElement?.clientHeight || 900;
+
+    let left = 22;
+    let top = 18;
+
+    if (x + left + bw > vw - MARGIN) left = -(bw + GAP_X);
+    if (x + left < MARGIN) left = MARGIN - x;
+    if (x + left + bw > vw - MARGIN) {
+      left = Math.max(MARGIN - x, vw - MARGIN - bw - x);
+    }
+
+    if (y + top + bh > vh - MARGIN) top = -(bh + GAP_Y);
+    if (y + top < MARGIN) top = MARGIN - y;
+    if (y + top + bh > vh - MARGIN) {
+      top = Math.max(MARGIN - y, vh - MARGIN - bh - y);
+    }
+
+    badge.style.left = Math.round(left) + 'px';
+    badge.style.top = Math.round(top) + 'px';
+  }
+
+  if (!window.__dshVcResizeInstalled) {
+    window.__dshVcResizeInstalled = true;
+    window.addEventListener('resize', () => {
+      placeBadge(state.x, state.y);
+    });
+  }
+
   function isCenterTestMode() {
     try {
       return new URLSearchParams(window.location.search).get('__dsh_test_center_pill') === '1';
@@ -329,10 +374,10 @@ export function buildVirtualCursorInitScript(
         <g id="__dsh_vc_dots__" style="pointer-events:none"></g>
         <g id="__dsh_vc_ripples__" style="pointer-events:none"></g>
       </svg>
-      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #00f0ff;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);pointer-events:none;backdrop-filter:blur(8px);user-select:none">
+      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;max-width:calc(100vw - 16px);box-sizing:border-box;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #00f0ff;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);pointer-events:none;backdrop-filter:blur(8px);user-select:none">
         <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;border-radius:50%;background:#00f0ff;box-shadow:0 0 8px #00f0ff;flex-shrink:0;pointer-events:none"></span>
-        <span id="__dsh_vc_status_text__" style="white-space:nowrap;pointer-events:none">DSH Agent 运行中</span>
-        <button id="__dsh_vc_takeover_btn__" type="button" style="border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;pointer-events:none;white-space:nowrap">按 F8 接管</button>
+        <span id="__dsh_vc_status_text__" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none">DSH Agent 运行中</span>
+        <button id="__dsh_vc_takeover_btn__" type="button" style="border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;pointer-events:none;white-space:nowrap;flex-shrink:0">按 F8 接管</button>
       </div>
       <div id="__dsh_vc_pointer__" style="position:absolute;left:0;top:0;transform:translate3d(120px,120px,0);will-change:transform;pointer-events:none">
         <div id="__dsh_vc_ring__" style="position:absolute;left:-7px;top:-7px;width:14px;height:14px;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8);pointer-events:none"></div>
@@ -563,6 +608,7 @@ export function buildVirtualCursorInitScript(
       badge.style.borderColor = s.rippleColor;
       const prefix = (typeof s.badgeTextPrefix === 'string' && s.badgeTextPrefix.trim()) ? s.badgeTextPrefix.trim() : 'DSH';
       badge.textContent = prefix + ' · (' + Math.round(state.x) + ', ' + Math.round(state.y) + ') · ' + state.action;
+      placeBadge(state.x, state.y);
     }
     if (stop0) stop0.setAttribute('stop-color', s.trailColorStart);
     if (stop1) stop1.setAttribute('stop-color', s.trailColorEnd);

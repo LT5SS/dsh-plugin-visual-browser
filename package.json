@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-visual-browser",
-  "version": "1.2.2",
+  "version": "1.2.4",
   "description": "Dual-mode adaptive visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with Top-Layer hit-test isolation, customizable Bezier virtual cursor & DSH settings UI, 3-in-1 sampler, and human takeover approval cards.",
   "type": "module",
   "main": "dist/index.js",
@@ -36,6 +36,7 @@
     "stage3:verify": "tsx scripts/verify-stage3.ts",
     "stage4:verify": "tsx scripts/verify-stage4.ts",
     "test:contract": "tsx scripts/verify-dsh-contract.ts",
+    "test:badge": "node scripts/verify-badge-clamp.mjs",
     "build": "tsc && node scripts/build-client.mjs"
   },
   "dependencies": {

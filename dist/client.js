@@ -229,6 +229,17 @@ window.__ModuleLoader__.load({
       readOnly: "Settings are read-only in this deployment.",
       loading: "Loading visual browser settings…",
       unavailable: "dsh-plugin-visual-browser is not active in this profile.",
+      degradedTitle: "Host did not provide a live configuration form",
+      degradedDesc:
+        "The host did not inject a configuration form for this plugin slot (for example, DSH 0.2.1-rc.2 settings.section does not expose configForm or timed out). You can still click \"Open configuration file\" below to edit cordis.yml (restart required), or customize below and copy a browser_set_cursor_trail call for instant live updates.",
+      openConfigFile: "Open configuration file",
+      openConfigDone: "Opened configuration document request sent to host.",
+      openConfigMissing:
+        "Host remote.settings.openSettingsDocument is unavailable here; use the Settings modal top-right \"Open configuration file\" button or edit your profile cordis.yml.",
+      copyToolCall: "Copy browser_set_cursor_trail call",
+      copyYamlSnippet: "Copy cordis.yml snippet",
+      copiedSnippet: "Copied to clipboard!",
+      copyFallback: "Clipboard unavailable; copy the snippet manually below:",
       summary: "Configure virtual cursor styles, custom SVG/image pointers, and background window takeover options.",
     };
 
@@ -303,6 +314,17 @@ window.__ModuleLoader__.load({
       readOnly: "当前部署配置为只读，无法在线写入。",
       loading: "正在读取视觉浏览器配置…",
       unavailable: "当前 Profile 未激活 dsh-plugin-visual-browser 插件。",
+      degradedTitle: "当前宿主未向本插件提供可视化配置表单",
+      degradedDesc:
+        "当前宿主未向本插件提供可视化配置表单（例如 DSH 0.2.1-rc.2 的 settings.section 未注入或等待超时）。你仍然可以：点击下方「打开配置文件」直接修改 cordis.yml 里的 config 段（改完重启生效），或在下方预览并调整样式后复制参数，让 Agent 调用 browser_set_cursor_trail 实时改光标（立即生效，无需重启）。",
+      openConfigFile: "打开配置文件",
+      openConfigDone: "已向宿主发送打开配置文件请求。",
+      openConfigMissing:
+        "当前插槽未暴露打开配置文件接口，请点弹窗右上角「打开配置文件」或手动编辑 profile 下的 cordis.yml。",
+      copyToolCall: "复制 browser_set_cursor_trail 调用",
+      copyYamlSnippet: "复制 cordis.yml 配置",
+      copiedSnippet: "已复制到剪贴板！可直接粘贴给 Agent 执行或写入 cordis.yml。",
+      copyFallback: "剪贴板不可用，请手动复制下方内容：",
       summary: "调整虚拟鼠标预设、自定义 SVG/图片指针、拖尾光效及可见后台窗口接管热键。",
     };
 
@@ -311,6 +333,10 @@ window.__ModuleLoader__.load({
 .dshvb_head h2{margin:0 0 4px 0;font-size:18px;font-weight:600;color:var(--dsw-alias-label-primary,#f8fafc)}
 .dshvb_head p{margin:0;color:var(--dsw-alias-label-tertiary,#94a3b8);font-size:13px}
 .dshvb_card{border:1px solid var(--dsw-alias-border-l2,rgba(148,163,184,0.22));background:var(--dsw-alias-bg-base,rgba(15,23,42,0.35));border-radius:var(--dsw-radius-md,10px);padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.dshvb_banner{border:1px solid rgba(245,158,11,0.45);background:rgba(245,158,11,0.1);border-radius:var(--dsw-radius-md,10px);padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.dshvb_bannerTitle{margin:0;font-size:13px;font-weight:600;color:#fbbf24}
+.dshvb_bannerText{margin:0;font-size:12px;color:var(--dsw-alias-label-secondary,#cbd5e1);line-height:1.55}
+.dshvb_diag{margin:0;padding:8px 10px;border-radius:6px;background:rgba(15,23,42,0.45);border:1px dashed var(--dsw-alias-border-l2,rgba(148,163,184,0.22));font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--dsw-alias-label-tertiary,#94a3b8);word-break:break-all}
 .dshvb_cardTitle{margin:0;font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary,#f1f5f9);display:flex;align-items:center;justify-content:space-between;gap:8px}
 .dshvb_stage{position:relative;height:210px;border-radius:8px;overflow:hidden;border:1px solid var(--dsw-alias-border-l4,rgba(148,163,184,0.28));cursor:none;user-select:none}
 .dshvb_stage.dark{background:radial-gradient(circle at 20% 20%,rgba(0,240,255,0.08),transparent 45%),#0b0f19;background-image:linear-gradient(to right,rgba(148,163,184,0.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(148,163,184,0.08) 1px,transparent 1px);background-size:24px 24px}
@@ -703,33 +729,141 @@ window.__ModuleLoader__.load({
         return t("summary");
       }
 
-      return e(VisualBrowserSettingsBody, { ...props, t });
+      if (typeof props.useConfigForm === "function") {
+        return e(VisualBrowserSettingsHookWrapper, { ...props, t });
+      }
+
+      return e(VisualBrowserSettingsStoreWrapper, { ...props, t });
     }
 
-    function VisualBrowserSettingsBody(props) {
-      const t = props.t;
+    function VisualBrowserSettingsHookWrapper(props) {
+      const liveSnap = props.useConfigForm((s) => s);
+      return e(VisualBrowserSettingsBody, {
+        ...props,
+        liveSnap,
+        hasProvider: true,
+      });
+    }
 
-      const [formSnap, setFormSnap] = React.useState(() =>
-        props.form ? props.form.state : props.hooks?.configForm?.getSnapshot?.() || { status: "loading", writable: false }
+    function VisualBrowserSettingsStoreWrapper(props) {
+      const store = props.configFormStore || props.hooks?.configForm || null;
+      const [storeSnap, setStoreSnap] = React.useState(() =>
+        props.form ? props.form.state : store?.getSnapshot?.() || null
       );
 
       React.useEffect(() => {
         if (props.form) {
-          setFormSnap(props.form.state);
+          setStoreSnap(props.form.state);
           return;
         }
-        const store = props.hooks?.configForm;
-        if (!store || typeof store.subscribe !== "function") return;
-        setFormSnap(store.getSnapshot());
+        if (!store || typeof store.subscribe !== "function") {
+          setStoreSnap(null);
+          return;
+        }
+        setStoreSnap(store.getSnapshot());
         return store.subscribe(() => {
-          setFormSnap(store.getSnapshot());
+          setStoreSnap(store.getSnapshot());
         });
-      }, [props.form, props.hooks]);
+      }, [props.form, store]);
+
+      const liveSnap = props.form ? props.form.state : storeSnap;
+      const hasProvider = Boolean(props.form || store);
+      return e(VisualBrowserSettingsBody, {
+        ...props,
+        liveSnap,
+        hasProvider,
+      });
+    }
+
+    function buildToolCallSnippet(draft) {
+      const cs = draft.cursorStyle;
+      return (
+        "browser_set_cursor_trail(" +
+        JSON.stringify(
+          {
+            preset: cs.preset,
+            pointer_shape: cs.pointerShape,
+            pointer_color: cs.pointerColor,
+            pointer_border_color: cs.pointerBorderColor,
+            pointer_scale: cs.pointerScale,
+            ...(cs.customPointerSvgPath ? { custom_svg_path: cs.customPointerSvgPath } : {}),
+            ...(cs.customPointerImageUrl ? { custom_image_url: cs.customPointerImageUrl } : {}),
+            trail_variant: cs.trailVariant,
+            trail_color_start: cs.trailColorStart,
+            trail_color_end: cs.trailColorEnd,
+            trail_width: cs.trailWidth,
+            trail_length: cs.trailLength,
+            trail_glow: cs.trailGlow,
+            ripple_color: cs.rippleColor,
+            show_badge: cs.showBadge,
+            badge_text_prefix: cs.badgeTextPrefix,
+          },
+          null,
+          2
+        ) +
+        ")"
+      );
+    }
+
+    function buildCordisYamlSnippet(draft) {
+      const cs = draft.cursorStyle;
+      const lines = [
+        "config:",
+        "  windowMode: '" + draft.windowMode + "'",
+        "  keepWindowOpen: " + Boolean(draft.keepWindowOpen),
+        "  showTakeoverControl: " + Boolean(draft.showTakeoverControl),
+        "  takeoverHotkey: '" + draft.takeoverHotkey + "'",
+        "  cursorStyle:",
+        "    preset: '" + cs.preset + "'",
+        "    pointerShape: '" + cs.pointerShape + "'",
+        "    pointerColor: '" + cs.pointerColor + "'",
+        "    pointerBorderColor: '" + cs.pointerBorderColor + "'",
+        "    pointerScale: " + cs.pointerScale,
+        "    trailVariant: '" + cs.trailVariant + "'",
+        "    trailColorStart: '" + cs.trailColorStart + "'",
+        "    trailColorEnd: '" + cs.trailColorEnd + "'",
+        "    trailWidth: " + cs.trailWidth,
+        "    trailLength: " + cs.trailLength,
+        "    trailGlow: " + Boolean(cs.trailGlow),
+        "    rippleColor: '" + cs.rippleColor + "'",
+        "    showBadge: " + Boolean(cs.showBadge),
+        "    badgeTextPrefix: '" + cs.badgeTextPrefix + "'",
+      ];
+      if (cs.customPointerSvgPath) {
+        lines.push("    customPointerSvgPath: " + JSON.stringify(cs.customPointerSvgPath));
+      }
+      if (cs.customPointerImageUrl) {
+        lines.push("    customPointerImageUrl: " + JSON.stringify(cs.customPointerImageUrl));
+        lines.push("    customPointerHotspotX: " + cs.customPointerHotspotX);
+        lines.push("    customPointerHotspotY: " + cs.customPointerHotspotY);
+      }
+      return lines.join("\n");
+    }
+
+    function VisualBrowserSettingsBody(props) {
+      const t = props.t;
+      const formSnap = props.liveSnap;
+      const hasProvider = Boolean(props.hasProvider);
+      const rawStatus = formSnap?.status;
+
+      const [loadingTimedOut, setLoadingTimedOut] = React.useState(false);
+
+      React.useEffect(() => {
+        if (!hasProvider || (rawStatus && rawStatus !== "loading")) {
+          setLoadingTimedOut(false);
+          return;
+        }
+        const timer = setTimeout(() => {
+          setLoadingTimedOut(true);
+        }, 2500);
+        return () => clearTimeout(timer);
+      }, [hasProvider, rawStatus]);
 
       const [draft, setDraft] = React.useState(() => buildDraftFromServer(formSnap?.value));
       const [dirty, setDirty] = React.useState(false);
       const [saving, setSaving] = React.useState(false);
       const [statusMsg, setStatusMsg] = React.useState(null);
+      const [snippetText, setSnippetText] = React.useState("");
       const [recordingKey, setRecordingKey] = React.useState(false);
 
       React.useEffect(() => {
@@ -754,14 +888,19 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener("keydown", onKey, true);
       }, [recordingKey]);
 
-      if (!formSnap || formSnap.status === "loading") {
-        return e("div", { className: "dshvb_wrap" }, e("p", { className: "dshvb_status" }, t("loading")));
-      }
-      if (formSnap.status === "unavailable") {
+      if (rawStatus === "unavailable") {
         return e("div", { className: "dshvb_wrap" }, e("p", { className: "dshvb_status err" }, t("unavailable")));
       }
 
-      const writable = Boolean(formSnap.writable);
+      if (hasProvider && (!formSnap || rawStatus === "loading") && !loadingTimedOut) {
+        return e("div", { className: "dshvb_wrap" }, e("p", { className: "dshvb_status" }, t("loading")));
+      }
+
+      const isDegraded =
+        !hasProvider || !formSnap || rawStatus === "loading" || rawStatus === "degraded";
+      const liveWritable = Boolean(formSnap?.writable) && !isDegraded;
+      const controlsEditable = liveWritable || isDegraded;
+      const writable = controlsEditable;
       const cs = draft.cursorStyle;
       const imgUrl = (cs.customPointerImageUrl || "").trim();
       const imageUrlError =
@@ -816,7 +955,7 @@ window.__ModuleLoader__.load({
       };
 
       const onSave = async () => {
-        if (!writable || saving || imageUrlError) return;
+        if (!liveWritable || saving || imageUrlError) return;
         const mutateFn = props.form?.mutate || props.saveMutation;
         if (typeof mutateFn !== "function") return;
         setSaving(true);
@@ -829,7 +968,7 @@ window.__ModuleLoader__.load({
             { op: "set", path: ["showTakeoverControl"], value: draft.showTakeoverControl },
             { op: "set", path: ["takeoverHotkey"], value: draft.takeoverHotkey },
           ];
-          const ok = await mutateFn(ops, formSnap.revision);
+          const ok = await mutateFn(ops, formSnap?.revision);
           if (ok) {
             setDirty(false);
             setStatusMsg({ kind: "ok", text: t("saved") });
@@ -843,8 +982,37 @@ window.__ModuleLoader__.load({
         }
       };
 
+      const onOpenConfigFile = async () => {
+        if (typeof props.openConfigDocument !== "function") {
+          setStatusMsg({ kind: "err", text: t("openConfigMissing") });
+          return;
+        }
+        try {
+          const res = await props.openConfigDocument();
+          if (res && res.ok === false) {
+            setStatusMsg({ kind: "err", text: res.error?.message || t("openConfigMissing") });
+          } else {
+            setStatusMsg({ kind: "ok", text: t("openConfigDone") });
+          }
+        } catch {
+          setStatusMsg({ kind: "err", text: t("openConfigMissing") });
+        }
+      };
+
+      const onCopySnippet = async (text) => {
+        setSnippetText(text);
+        try {
+          if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+            setStatusMsg({ kind: "ok", text: t("copiedSnippet") });
+            return;
+          }
+        } catch {}
+        setStatusMsg({ kind: "ok", text: t("copyFallback") });
+      };
+
       const onDiscard = () => {
-        setDraft(buildDraftFromServer(formSnap.value));
+        setDraft(buildDraftFromServer(formSnap?.value));
         setDirty(false);
         setStatusMsg(null);
       };
@@ -870,6 +1038,18 @@ window.__ModuleLoader__.load({
         { key: "custom", label: t("presetCustom"), c0: cs.pointerColor, c1: cs.trailColorEnd },
       ];
 
+      const diagText =
+        "宿主能力探测：props.form=" +
+        String(Boolean(props.form)) +
+        " · useConfigForm=" +
+        typeof props.useConfigForm +
+        " · hooks.configForm=" +
+        typeof props.hooks?.configForm +
+        " · configFormStore=" +
+        typeof props.configFormStore +
+        " · 插件已挂载=" +
+        String(rawStatus !== "unavailable");
+
       return e(
         "div",
         { className: "dshvb_wrap" },
@@ -879,6 +1059,44 @@ window.__ModuleLoader__.load({
           e("h2", null, t("title")),
           e("p", null, t("subtitle"))
         ),
+        isDegraded &&
+          e(
+            "div",
+            { className: "dshvb_banner", role: "status" },
+            e("div", { className: "dshvb_bannerTitle" }, t("degradedTitle")),
+            e("p", { className: "dshvb_bannerText" }, t("degradedDesc")),
+            e(
+              "div",
+              { className: "dshvb_btnGroup" },
+              e(
+                "button",
+                {
+                  type: "button",
+                  className: "dshvb_btn",
+                  onClick: onOpenConfigFile,
+                },
+                t("openConfigFile")
+              ),
+              e(
+                "button",
+                {
+                  type: "button",
+                  className: "dshvb_btn primary",
+                  onClick: () => onCopySnippet(buildToolCallSnippet(draft)),
+                },
+                t("copyToolCall")
+              ),
+              e(
+                "button",
+                {
+                  type: "button",
+                  className: "dshvb_btn",
+                  onClick: () => onCopySnippet(buildCordisYamlSnippet(draft)),
+                },
+                t("copyYamlSnippet")
+              )
+            )
+          ),
         e(LiveCursorPreview, { style: cs, t }),
         e(
           "div",
@@ -1358,11 +1576,22 @@ window.__ModuleLoader__.load({
               className:
                 "dshvb_status" + (statusMsg?.kind === "ok" ? " ok" : statusMsg?.kind === "err" ? " err" : ""),
             },
-            !writable ? t("readOnly") : statusMsg?.text || ""
+            statusMsg?.text || (!isDegraded && !liveWritable ? t("readOnly") : "")
           ),
           e(
             "div",
             { className: "dshvb_btnGroup" },
+            !isDegraded &&
+              typeof props.openConfigDocument === "function" &&
+              e(
+                "button",
+                {
+                  type: "button",
+                  className: "dshvb_btn",
+                  onClick: onOpenConfigFile,
+                },
+                t("openConfigFile")
+              ),
             e(
               "button",
               {
@@ -1373,28 +1602,62 @@ window.__ModuleLoader__.load({
               },
               t("resetDefaults")
             ),
-            e(
-              "button",
-              {
-                type: "button",
-                className: "dshvb_btn",
-                disabled: !dirty || saving,
-                onClick: onDiscard,
-              },
-              t("discard")
-            ),
-            e(
-              "button",
-              {
-                type: "button",
-                className: "dshvb_btn primary",
-                disabled: !writable || !dirty || saving || Boolean(imageUrlError),
-                onClick: onSave,
-              },
-              saving ? t("saving") : t("save")
-            )
+            isDegraded
+              ? e(
+                  React.Fragment,
+                  null,
+                  e(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshvb_btn primary",
+                      onClick: () => onCopySnippet(buildToolCallSnippet(draft)),
+                    },
+                    t("copyToolCall")
+                  ),
+                  e(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshvb_btn",
+                      onClick: () => onCopySnippet(buildCordisYamlSnippet(draft)),
+                    },
+                    t("copyYamlSnippet")
+                  )
+                )
+              : e(
+                  React.Fragment,
+                  null,
+                  e(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshvb_btn",
+                      disabled: !dirty || saving,
+                      onClick: onDiscard,
+                    },
+                    t("discard")
+                  ),
+                  e(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dshvb_btn primary",
+                      disabled: !liveWritable || !dirty || saving || Boolean(imageUrlError),
+                      onClick: onSave,
+                    },
+                    saving ? t("saving") : t("save")
+                  )
+                )
           )
-        )
+        ),
+        snippetText &&
+          e("textarea", {
+            readOnly: true,
+            className: "dshvb_textarea",
+            value: snippetText,
+          }),
+        isDegraded && e("p", { className: "dshvb_diag" }, diagText)
       );
     }
 
@@ -1435,7 +1698,8 @@ window.__ModuleLoader__.load({
         const matched = namespaces.find(
           (n) =>
             (typeof n.ns === "string" && n.ns.includes("visual-browser")) ||
-            (n.value && typeof n.value === "object" && "cursorStyle" in n.value)
+            (n.value && typeof n.value === "object" && "cursorStyle" in n.value) ||
+            (n.schema && typeof n.schema === "object" && n.schema.dict && "cursorStyle" in n.schema.dict)
         );
         if (matched && matched.ns !== currentNs) {
           bindForm(matched.ns);
@@ -1474,9 +1738,32 @@ window.__ModuleLoader__.load({
       const targetFormStore = createTargetFormStore(ctx);
       ctx.effect(() => () => targetFormStore.dispose(), "dsh-plugin-visual-browser: settings store");
 
+      let openConfigDocFn = null;
+      if (typeof ctx.inject === "function") {
+        try {
+          ctx.inject(["remote.settings"], (sub) => {
+            openConfigDocFn = async () => {
+              const rs = sub?.["remote.settings"];
+              if (rs && typeof rs.openSettingsDocument === "function") {
+                return rs.openSettingsDocument();
+              }
+              return { ok: false, error: { message: "remote.settings unavailable" } };
+            };
+            return () => {
+              openConfigDocFn = null;
+            };
+          });
+        } catch {}
+      }
+
       const makeInjected = () => ({
         hooks: { configForm: targetFormStore },
+        configFormStore: targetFormStore,
         saveMutation: (ops, expectedRevision) => targetFormStore.mutate(ops, expectedRevision),
+        openConfigDocument: () =>
+          typeof openConfigDocFn === "function"
+            ? openConfigDocFn()
+            : Promise.resolve({ ok: false, error: { message: "remote.settings unavailable" } }),
         fallbackT,
       });
 
