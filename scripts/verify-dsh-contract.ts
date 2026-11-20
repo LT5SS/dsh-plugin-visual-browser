@@ -12,6 +12,7 @@ import {
 } from '@deepseek-ai/dsh-tools';
 import {
   apply,
+  extractHostStreamChunk,
   parseJsonDecision,
   resolvePlannerMode,
   type DshCordisContext,
@@ -228,6 +229,22 @@ async function main() {
   assert.equal(parseJsonDecision('{"type":"click"}'), null);
   const parsedAction = parseJsonDecision('```json\n{"type":"click","target":"#1","reason":"test"}\n```');
   assert.deepEqual(parsedAction, { type: 'click', target: '#1', reason: 'test' });
+
+  const finishErrChunk = extractHostStreamChunk({
+    type: 'finish',
+    reason: { kind: 'error', failure: { code: 'NO_ADAPTER', message: 'no adapter registered' } },
+  });
+  assert.equal(finishErrChunk.kind, 'finish');
+  assert.equal(finishErrChunk.text, '');
+  assert.ok(finishErrChunk.error?.includes('NO_ADAPTER'));
+
+  const finishStopChunk = extractHostStreamChunk({
+    type: 'finish',
+    reason: { kind: 'stop' },
+  });
+  assert.equal(finishStopChunk.kind, 'finish');
+  assert.equal(finishStopChunk.text, '');
+  assert.equal(finishStopChunk.error, undefined);
 
   const prevVisionKey = process.env.DSH_VISION_API_KEY;
   try {
@@ -597,7 +614,51 @@ async function main() {
     assert.ok(proseRunVal.planner_detail?.llm_steps?.[0]?.sample_unrecognized_keys?.includes('foo'));
     console.log('[Strict DSH 0.2 Contract] 5c Verified unrecognized chunk diagnostics & prose fallback!');
 
-    console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS (P0 + P1 + P2 + ISSUE #3/#4) PASSED!');
+    // 5d. Issue #5 / TASK-v1.1.5: finish chunk with error reason surfaces NO_ADAPTER & skips useless retry
+    let finishErrCalls = 0;
+    const finishErrHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream() {
+            finishErrCalls++;
+            yield {
+              type: 'finish',
+              reason: {
+                kind: 'error',
+                failure: {
+                  code: 'NO_ADAPTER',
+                  message: 'no adapter registered for provider "opencode-go"',
+                },
+              },
+            };
+          },
+        },
+      },
+    });
+    apply(finishErrHost.ctx, {
+      mode: 'auto',
+      backgroundSilent: true,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...finishErrHost.effectDisposers);
+    const finishErrRunDef = finishErrHost.registeredTools.get('browser_subagent_run')!;
+    const finishErrVal: any = await finishErrRunDef.execute(
+      { url: srv.url, role: 'Finish Error Verifier', task_prompt: 'Verify finish error chunk handling', max_steps: 1 },
+      fakeExec
+    );
+    assert.equal(finishErrVal.status, 'COMPLETED');
+    assert.equal(finishErrVal.planner_mode, 'host-ctx-llm-fallback');
+    assert.equal(finishErrVal.planner_detail?.last_fallback_reason, 'HOST_LLM_ERROR_CHUNK');
+    assert.ok(String(finishErrVal.planner_detail?.llm_steps?.[0]?.stream_error ?? '').includes('NO_ADAPTER'));
+    assert.equal(finishErrCalls, 1, 'Expected config error NO_ADAPTER to skip redundant text-only retry');
+    assert.equal(finishErrVal.planner_detail?.llm_steps?.[0]?.retried_text_only, undefined);
+    console.log('[Strict DSH 0.2 Contract] 5d Verified finish error chunk (NO_ADAPTER) surfaced & retry skipped!');
+
+    console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {
     for (const d of allDisposers) d();
     await srv.close();

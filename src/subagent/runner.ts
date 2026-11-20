@@ -191,7 +191,6 @@ const RECOGNIZED_NON_TEXT_CHUNK_TYPES = new Set([
   'thinking-delta',
   'thinking',
   'start',
-  'finish',
   'step-start',
   'step-finish',
   'message-start',
@@ -241,6 +240,17 @@ export function extractHostStreamChunk(chunk: unknown): {
     const text = firstStringField(obj, ['text', 'delta', 'content']);
     if (text !== undefined) return { kind, text };
     return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
+  }
+
+  if (kind === 'finish') {
+    const reason = obj.reason;
+    if (reason?.kind === 'error') {
+      const failure = reason.failure ?? {};
+      const message = String(failure.message ?? reason.message ?? 'unknown finish error').slice(0, 260);
+      const code = String(failure.code ?? 'UNKNOWN');
+      return { kind, text: '', error: `${code}: ${message}` };
+    }
+    return { kind, text: '' };
   }
 
   if (kind === 'error') {
@@ -356,8 +366,11 @@ export function createDshHostLlmPlanner(opts: {
     let attempt = await runStreamAttempt(imageBlock ? [textBlock, imageBlock] : [textBlock]);
     let decision = parseJsonDecision(attempt.fullText);
     let retriedTextOnly = false;
+    const isConfigError = /NO_ADAPTER|NO_API_KEY|UNAUTHORIZED|MODEL_NOT_FOUND/i.test(
+      attempt.streamError ?? ''
+    );
 
-    if (!decision && imageBlock && !ctx.signal?.aborted) {
+    if (!decision && imageBlock && !ctx.signal?.aborted && !isConfigError) {
       retriedTextOnly = true;
       attempt = await runStreamAttempt([textBlock]);
       decision = parseJsonDecision(attempt.fullText);
