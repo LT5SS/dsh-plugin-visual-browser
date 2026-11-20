@@ -52,6 +52,26 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
 }
 
 async function main() {
+  // 0. Verify package.json dsh.bundle.patch manifest contract (guards against P0-1 regression)
+  const pkgRoot = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser');
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8'));
+  if (
+    typeof pkgJson?.dsh?.bundle !== 'object' ||
+    pkgJson.dsh.bundle === null ||
+    typeof pkgJson.dsh.bundle.patch !== 'string' ||
+    !fs.existsSync(path.resolve(pkgRoot, pkgJson.dsh.bundle.patch))
+  ) {
+    throw new Error(
+      `Invalid dsh.bundle manifest in package.json: expected { bundle: { patch: "./cordis.yml" } }, got ${JSON.stringify(pkgJson?.dsh)}`
+    );
+  }
+  if (pkgJson?.dependencies?.['@deepseek-ai/dsh-tools'] || pkgJson?.dependencies?.['@deepseek-ai/cordis']) {
+    throw new Error(
+      '@deepseek-ai/dsh-tools and @deepseek-ai/cordis must be in peerDependencies/devDependencies, not runtime dependencies'
+    );
+  }
+  console.log('[Strict DSH 0.2 Contract] Verified package.json dsh.bundle.patch & peerDependencies!');
+
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
   const artifactDir = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test');
   fs.mkdirSync(artifactDir, { recursive: true });

@@ -50,10 +50,13 @@ export declare const inject: string[];
  */
 export declare function toLosslessJson(value: unknown): any;
 /**
- * Resolves the default absolute artifact directory anchored to `$DSH_HOME` or `~/.dsh`
- * so screenshots never drift with `process.cwd()`.
+ * Resolves the default absolute artifact directory anchored to:
+ * 1. Explicit `config.artifactDir` (from cordis.yml)
+ * 2. `DSH_BROWSER_ARTIFACT_DIR` env var
+ * 3. Host Cordis `ctx.baseDir` (active profile / pack directory in DSH Desktop & CLI)
+ * 4. `DSH_HOME` env var or `~/.dsh` fallback
  */
-export declare function resolveDefaultArtifactDir(configuredDir?: string): string;
+export declare function resolveDefaultArtifactDir(configuredDir?: string, ctx?: DshCordisContext): string;
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */

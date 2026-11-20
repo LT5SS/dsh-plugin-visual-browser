@@ -78,13 +78,25 @@ export function toLosslessJson(value: unknown): any {
 }
 
 /**
- * Resolves the default absolute artifact directory anchored to `$DSH_HOME` or `~/.dsh`
- * so screenshots never drift with `process.cwd()`.
+ * Resolves the default absolute artifact directory anchored to:
+ * 1. Explicit `config.artifactDir` (from cordis.yml)
+ * 2. `DSH_BROWSER_ARTIFACT_DIR` env var
+ * 3. Host Cordis `ctx.baseDir` (active profile / pack directory in DSH Desktop & CLI)
+ * 4. `DSH_HOME` env var or `~/.dsh` fallback
  */
-export function resolveDefaultArtifactDir(configuredDir?: string): string {
+export function resolveDefaultArtifactDir(configuredDir?: string, ctx?: DshCordisContext): string {
+  const ctxAny = ctx as any;
+  const hostBaseDir: string | undefined =
+    typeof ctxAny?.baseDir === 'string'
+      ? ctxAny.baseDir
+      : typeof ctxAny?.root?.config?.baseDir === 'string'
+        ? ctxAny.root.config.baseDir
+        : undefined;
+
   const raw =
     configuredDir ||
     process.env.DSH_BROWSER_ARTIFACT_DIR ||
+    (hostBaseDir ? path.join(hostBaseDir, 'artifacts', 'dsh-browser') : undefined) ||
     path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'artifacts', 'dsh-browser');
   return path.resolve(raw);
 }
@@ -179,7 +191,7 @@ export function createVisualBrowserTools(
   config: VisualBrowserPluginConfig = {},
   runner = new BrowserSubagentRunner()
 ): ToolDefinition[] {
-  const artifactRoot = resolveDefaultArtifactDir(config.artifactDir);
+  const artifactRoot = resolveDefaultArtifactDir(config.artifactDir, ctx);
 
   let activeCursorStyle: VirtualCursorStyleConfig = {
     preset: 'cyber-neon',
