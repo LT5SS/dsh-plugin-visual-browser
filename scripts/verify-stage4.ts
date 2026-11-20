@@ -1,10 +1,10 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import {
   apply,
   type DshCordisContext,
-  type DshToolDefinition,
   type SubagentActionDecision,
   type SubagentPlannerContext,
 } from '../src/index.js';
@@ -57,7 +57,7 @@ async function main() {
   const srv = await startSilentStaticServer(distDir);
 
   // 1. Mock a DSH Cordis Context & mount our plugin via apply(ctx, config)
-  const registeredTools = new Map<string, DshToolDefinition>();
+  const registeredTools = new Map<string, ToolDefinition>();
   const disposeCallbacks: Array<() => Promise<void>> = [];
 
   const mockDshCtx: DshCordisContext = {
@@ -122,23 +122,24 @@ async function main() {
   });
 
   try {
+    const fakeExec: any = { signal: new AbortController().signal };
     // 2. Call `browser_set_cursor_trail` tool
     const trailTool = registeredTools.get('browser_set_cursor_trail')!;
     const trailRes = await trailTool.execute({
       preset: 'comet-gold',
       trail_width: 4.5,
       trail_length: 28,
-    });
+    }, fakeExec);
     console.log('\n[Stage 4 Verify] Tool 1 (`browser_set_cursor_trail`) result:', JSON.stringify(trailRes));
 
     // 3. Call `browser_subagent_run` -> Will pause at Step 2 with a DSH_BROWSER_TAKEOVER_CARD!
     const runTool = registeredTools.get('browser_subagent_run')!;
     console.log('\n[Stage 4 Verify] Tool 2 (`browser_subagent_run`) launching...');
-    const runRes = await runTool.execute({
+    const runRes: any = await runTool.execute({
       url: srv.url,
       role: 'Stage 4 DSH Lifecycle Tester',
       task_prompt: 'Sweep hero waves, pause at login gate for human takeover, then scroll to #about.',
-    });
+    }, fakeExec);
 
     console.log(`[Stage 4 Verify] Subagent paused status: ${runRes.status}`);
     console.log('[Stage 4 Verify] Generated DSH Approval / Takeover Card:');
@@ -147,10 +148,10 @@ async function main() {
     // 4. Call `browser_subagent_resume` with the paused `subagent_id` to continue in the SAME open tab!
     const resumeTool = registeredTools.get('browser_subagent_resume')!;
     console.log(`\n[Stage 4 Verify] Tool 3 (\`browser_subagent_resume\`) resuming ${runRes.subagent_id} in-place...`);
-    const resumeRes = await resumeTool.execute({
+    const resumeRes: any = await resumeTool.execute({
       subagent_id: runRes.subagent_id,
       user_note: 'User completed login in the paused browser tab. Please continue scrolling to #about.',
-    });
+    }, fakeExec);
 
     console.log(`[Stage 4 Verify] Resumed subagent final status: ${resumeRes.status}`);
     console.log('\n' + resumeRes.host_facts_block);

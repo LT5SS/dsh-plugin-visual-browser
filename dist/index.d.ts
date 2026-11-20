@@ -1,3 +1,4 @@
+import { type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { BrowserRuntimeMode, VirtualCursorStyleConfig } from './driver/types.js';
 import { BrowserSubagentRunner, type SubagentPlanner } from './subagent/runner.js';
 export * from './driver/types.js';
@@ -11,21 +12,14 @@ export * from './subagent/host-facts.js';
 export * from './subagent/sliding-context.js';
 export * from './subagent/runner.js';
 export * from './guardrails/takeover.js';
-export interface DshToolDefinition {
-    name: string;
-    description: string;
-    parameters: Record<string, {
-        type: string;
-        required?: boolean;
-        description: string;
-        enum?: string[];
-    }>;
-    execute: (args: Record<string, any>) => Promise<any>;
-}
 export interface DshCordisContext {
     tools: {
-        register: (tool: DshToolDefinition) => void;
+        register: (tool: ToolDefinition) => (() => void) | void;
     };
+    llm?: any;
+    attachments?: any;
+    get?: (name: string) => any;
+    effect?: (fn: () => (() => void) | void, label?: string) => any;
     on?: (event: string, listener: (...args: any[]) => void) => void;
 }
 export interface VisualBrowserPluginConfig {
@@ -39,6 +33,10 @@ export interface VisualBrowserPluginConfig {
     allowedOrigins?: string[];
     blockedOrigins?: string[];
     cursorStyle?: VirtualCursorStyleConfig;
+    /** Optional explicit DSH host LLM provider/model route override */
+    hostProvider?: string;
+    hostModel?: string;
+    /** Optional external OpenAI-compatible Vision API configuration */
     visionApiKey?: string;
     visionBaseUrl?: string;
     visionModel?: string;
@@ -47,8 +45,23 @@ export interface VisualBrowserPluginConfig {
 export declare const name = "dsh-plugin-visual-browser";
 export declare const inject: string[];
 /**
+ * Guarantees a canonical lossless JSON object with zero `undefined` members or non-plain prototypes,
+ * satisfying `@deepseek-ai/dsh-tools` 0.2.x output validation.
+ */
+export declare function toLosslessJson(value: unknown): any;
+/**
+ * Resolves the default absolute artifact directory anchored to `$DSH_HOME` or `~/.dsh`
+ * so screenshots never drift with `process.cwd()`.
+ */
+export declare function resolveDefaultArtifactDir(configuredDir?: string): string;
+/**
+ * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
+ */
+export declare function createVisualBrowserTools(ctx: DshCordisContext, config?: VisualBrowserPluginConfig, runner?: BrowserSubagentRunner): ToolDefinition[];
+/**
  * DeepSeek Harness (Cordis) Plugin Entry Point
  */
 export declare function apply(ctx: DshCordisContext, config?: VisualBrowserPluginConfig): {
     runner: BrowserSubagentRunner;
+    tools: ToolDefinition[];
 };

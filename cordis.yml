@@ -1,14 +1,21 @@
-# DeepSeek Harness (Cordis) Patch / Bundle Configuration
-# Usage: pnpm dsh web --patch ./cordis.yml
+# DeepSeek Harness (DSH 0.2.x / Cordis) Patch Configuration
+#
+# Launch command (note: --patch must come BEFORE --profile):
+#   dsh --patch ./cordis.yml --profile web
+#
+# Note on `name`:
+# - After installing the package into your DSH profile (`dsh plugin --profile web add dsh-plugin-visual-browser`),
+#   set `name: 'dsh-plugin-visual-browser'`.
+# - If loading from a local clone without installing into the profile, use an absolute path
+#   (because Cordis resolves relative paths against the profile directory, not the patch file directory).
 
 - insert:
   - id: dsh-plugin-visual-browser
-    name: './dist/index.js'
+    name: 'dsh-plugin-visual-browser'
     config:
       mode: 'auto'
       backgroundSilent: true
       maxSteps: 12
       maxRecentImages: 3
-      artifactDir: './artifacts/dsh-browser'
       cursorStyle:
         preset: 'cyber-neon'

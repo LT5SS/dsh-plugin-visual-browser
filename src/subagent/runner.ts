@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserSession } from '../driver/browser-session.js';
 import type { BrowserSessionOptions, Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
@@ -35,6 +36,7 @@ export interface SubagentPlannerContext {
   latestObservation: PageObservation;
   history: SlidingWindowHistory;
   hostFacts: HostFactsTracker;
+  signal?: AbortSignal;
 }
 
 export type SubagentPlanner = (ctx: SubagentPlannerContext) => Promise<SubagentActionDecision>;
@@ -53,6 +55,8 @@ export interface SubagentTaskRequest {
   blockedOrigins?: string[];
   /** Automatically pause for human takeover if CAPTCHA, payment, or login gate appears (default: true) */
   pauseOnGate?: boolean;
+  /** Cooperative cancellation signal from DSH ToolRunContext (exec.signal) */
+  signal?: AbortSignal;
   planner?: SubagentPlanner;
 }
 
@@ -79,14 +83,14 @@ interface PausedSubagentState {
   maxSteps: number;
 }
 
-const SUBAGENT_SYSTEM_PROMPT = `You are an isolated Visual Browser Subagent inside DeepSeek Harness (DSH).
+export const SUBAGENT_SYSTEM_PROMPT = `You are an isolated Visual Browser Subagent inside DeepSeek Harness (DSH).
 You operate a background browser equipped with a physical Bezier virtual cursor.
 At each step you receive:
 1. A compact archive of earlier steps (images evicted to save context);
 2. The latest 1-3 viewport screenshots with the virtual cursor & trail visible;
 3. The 3-in-1 Observation HUD (scroll metrics, DOM/tech stats, console/network errors, and numbered #ref interactive controls).
 
-Respond ONLY with a valid JSON object matching one of these actions:
+Respond ONLY with a single valid JSON object matching one of these actions:
 - {"type":"move_mouse","points":[{"x":300,"y":400},{"x":800,"y":420}],"label":"SWEEP","reason":"..."}
 - {"type":"hover","target":"#3","reason":"..."}
 - {"type":"click","target":"#8","reason":"..."}
@@ -96,36 +100,198 @@ Respond ONLY with a valid JSON object matching one of these actions:
 - {"type":"pause_for_takeover","blockReason":"LOGIN_REQUIRED","message":"..."}
 - {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}`;
 
+/** Extracts the first JSON object from a model text response (handles markdown code fences gracefully). */
+export function parseJsonDecision(rawText: string): SubagentActionDecision {
+  const trimmed = rawText.trim();
+  const fenceMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
+  const candidate = fenceMatch ? fenceMatch[1].trim() : trimmed;
+  const firstBrace = candidate.indexOf('{');
+  const lastBrace = candidate.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return JSON.parse(candidate.slice(firstBrace, lastBrace + 1)) as SubagentActionDecision;
+  }
+  return JSON.parse(candidate) as SubagentActionDecision;
+}
+
+/**
+ * Creates a planner backed by DSH 0.2's native `ctx.llm` runtime service when available.
+ */
+export function createDshHostLlmPlanner(opts: {
+  llm: any;
+  attachments?: any;
+  provider: string;
+  model: string;
+}): SubagentPlanner {
+  return async (ctx: SubagentPlannerContext): Promise<SubagentActionDecision> => {
+    const contentBlocks: any[] = [];
+    const entries = ctx.history.getEntries();
+    const archived = entries.filter((e) => e.imageBase64 === null).map((e) => `- ${e.compactText}`);
+
+    let promptText = `## Task Goal\n${ctx.taskPrompt}\n`;
+    if (archived.length > 0) {
+      promptText += `\n## Archived Earlier Steps\n${archived.join('\n')}\n`;
+    }
+    for (const entry of entries.filter((e) => e.imageBase64 !== null)) {
+      promptText += `\n---\n**Action Executed**: ${entry.actionTaken}\n${entry.fullHudText}\n`;
+    }
+    contentBlocks.push({ type: 'text', text: promptText });
+
+    // Attach latest screenshot via ctx.attachments if supported by host
+    const latestPath = ctx.latestObservation.screenshotPath;
+    if (opts.attachments && typeof opts.attachments.saveImage === 'function' && fs.existsSync(latestPath)) {
+      try {
+        const ref = await opts.attachments.saveImage({
+          data: new Uint8Array(fs.readFileSync(latestPath)),
+          mediaType: 'image/png',
+          name: path.basename(latestPath),
+        });
+        contentBlocks.push({ type: 'image', attachment: ref });
+      } catch {
+        // Fallback to text-only HUD if attachment admission fails
+      }
+    }
+
+    const stream = opts.llm.stream({
+      provider: opts.provider,
+      model: opts.model,
+      systemPrompt: SUBAGENT_SYSTEM_PROMPT,
+      messages: [
+        {
+          id: `msg-${crypto.randomUUID()}`,
+          role: 'user',
+          content: contentBlocks,
+          source: { kind: 'user' },
+        },
+      ],
+      signal: ctx.signal,
+    });
+
+    let fullText = '';
+    for await (const chunk of stream) {
+      if (chunk.type === 'text-delta' && typeof chunk.delta === 'string') {
+        fullText += chunk.delta;
+      } else if (chunk.type === 'text' && typeof chunk.text === 'string') {
+        fullText += chunk.text;
+      }
+    }
+
+    return parseJsonDecision(fullText);
+  };
+}
+
+/**
+ * Creates a Vision LLM planner talking to any OpenAI-compatible multimodal endpoint.
+ * Includes timeout, AbortSignal propagation, and automatic fallback for gateways that reject response_format.
+ */
 export function createOpenAIVisionPlanner(opts: {
   apiKey: string;
   baseUrl?: string;
   model?: string;
+  timeoutMs?: number;
 }): SubagentPlanner {
   const baseUrl = (opts.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
   const model = opts.model || 'gpt-4o-mini';
+  const timeoutMs = opts.timeoutMs ?? 45000;
 
   return async (ctx: SubagentPlannerContext): Promise<SubagentActionDecision> => {
     const messages = ctx.history.buildMultimodalMessages(SUBAGENT_SYSTEM_PROMPT, ctx.taskPrompt);
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${opts.apiKey}`,
-      },
-      body: JSON.stringify({
+
+    const callApi = async (useJsonObjectFormat: boolean) => {
+      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      const signal = ctx.signal
+        ? AbortSignal.any([ctx.signal, timeoutSignal])
+        : timeoutSignal;
+
+      const body: Record<string, unknown> = {
         model,
         messages,
         temperature: 0.2,
-        response_format: { type: 'json_object' },
-      }),
-    });
+      };
+      if (useJsonObjectFormat) {
+        body.response_format = { type: 'json_object' };
+      }
+
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${opts.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+      return res;
+    };
+
+    let res = await callApi(true);
+    if (!res.ok && res.status === 400) {
+      // Retry without response_format for OpenAI-compatible gateways that don't support json_object mode with vision
+      res = await callApi(false);
+    }
 
     if (!res.ok) {
       throw new Error(`Vision LLM request failed: HTTP ${res.status} ${await res.text()}`);
     }
     const data = (await res.json()) as any;
     const rawContent = data.choices?.[0]?.message?.content || '{}';
-    return JSON.parse(rawContent) as SubagentActionDecision;
+    return parseJsonDecision(rawContent);
+  };
+}
+
+/**
+ * Built-in Zero-Config Autonomous Visual Walkthrough Planner.
+ * Used when neither a custom planner, DSH host LLM selection, nor DSH_VISION_API_KEY is configured,
+ * ensuring `browser_subagent_run` works out-of-the-box without hard-crashing.
+ */
+export function createBuiltinInspectorPlanner(): SubagentPlanner {
+  return async (ctx: SubagentPlannerContext): Promise<SubagentActionDecision> => {
+    const { stepIndex, maxSteps, latestObservation, history } = ctx;
+    const { scroll, domStats, interactiveElements, health } = latestObservation;
+
+    if (stepIndex === 1) {
+      return {
+        type: 'move_mouse',
+        points: [
+          { x: Math.round(scroll.viewportWidth * 0.25), y: Math.round(scroll.viewportHeight * 0.48) },
+          { x: Math.round(scroll.viewportWidth * 0.52), y: Math.round(scroll.viewportHeight * 0.42) },
+          { x: Math.round(scroll.viewportWidth * 0.76), y: Math.round(scroll.viewportHeight * 0.5) },
+        ],
+        label: 'HERO PROBE',
+        reason: 'Probe hero section for mouse-reactive animations and hover states',
+      };
+    }
+
+    if (scroll.scrollProgressPercent < 88 && stepIndex < maxSteps - 1) {
+      const stepDelta = Math.max(700, Math.round(scroll.viewportHeight * 0.85));
+      return {
+        type: 'scroll',
+        deltaY: stepDelta,
+        reason: `Scroll down (+${stepDelta}px) to inspect next viewport section (current: ${scroll.scrollProgressPercent}%)`,
+      };
+    }
+
+    const entries = history.getEntries();
+    const controlSamples = interactiveElements
+      .slice(0, 10)
+      .map((el) => `${el.ref} [${el.tag}] "${el.label}"`)
+      .join(', ');
+
+    return {
+      type: 'complete',
+      report: [
+        `COMPLETED / TASK_COMPLETED`,
+        ``,
+        `### Visual Browser Subagent Inspection Report`,
+        `- **URL**: ${domStats.url}`,
+        `- **Title**: ${domStats.title}`,
+        `- **Page Dimensions**: ${scroll.viewportWidth}x${scroll.viewportHeight} viewport, ${scroll.scrollHeight}px total height (scrolled to ${scroll.scrollProgressPercent}%)`,
+        `- **Detected Tech Stack**: ${domStats.detectedTechHints.join(', ') || 'Standard HTML/CSS/JS'}`,
+        `- **DOM Counts**: canvas=${domStats.counts.canvas}, svg=${domStats.counts.svg}, video=${domStats.counts.video}, img=${domStats.counts.img}, section=${domStats.counts.section}, button=${domStats.counts.button}, a=${domStats.counts.a}`,
+        `- **Sampled Interactive Controls**: ${controlSamples || 'none'}`,
+        `- **Runtime Health**: ConsoleErrors=${health.consoleErrorsCount}, FailedRequests=${health.failedRequestsCount}/${health.totalRequests}`,
+        `- **Steps Captured**: ${entries.length} snapshots (latest: \`${latestObservation.screenshotPath}\`)`,
+      ].join('\n'),
+    };
   };
 }
 
@@ -154,77 +320,87 @@ export class BrowserSubagentRunner {
   }
 
   public async closeAllPausedSessions(): Promise<void> {
-    for (const state of this.pausedSessions.values()) {
-      await state.session.close();
-    }
+    const sessions = [...this.pausedSessions.values()];
     this.pausedSessions.clear();
+    for (const state of sessions) {
+      try {
+        await state.session.close();
+      } catch {
+        // ignore cleanup error on already-closed browser
+      }
+    }
   }
 
   public async runTask(req: SubagentTaskRequest): Promise<SubagentRunResult> {
+    req.signal?.throwIfAborted();
     const subagentId = `subagent-${crypto.randomUUID().slice(0, 8)}`;
     const maxSteps = req.maxSteps ?? 10;
     const maxRecentImages = req.maxRecentImages ?? 3;
     const snapshotDir = path.join(req.artifactDir, subagentId);
 
     const session = await new BrowserSession(req.sessionOptions).start();
-    const hostFacts = new HostFactsTracker(subagentId, req.role, session);
-    const history = new SlidingWindowHistory(maxRecentImages);
-    const tools = new AtomicBrowserToolset(session, snapshotDir);
+    const onAbort = () => {
+      void session.close().catch(() => {});
+    };
+    req.signal?.addEventListener('abort', onAbort, { once: true });
 
-    const planner =
-      req.planner ||
-      (process.env.DSH_VISION_API_KEY
-        ? createOpenAIVisionPlanner({
-            apiKey: process.env.DSH_VISION_API_KEY,
-            baseUrl: process.env.DSH_VISION_BASE_URL,
-            model: process.env.DSH_VISION_MODEL,
-          })
-        : undefined);
+    try {
+      const hostFacts = new HostFactsTracker(subagentId, req.role, session);
+      const history = new SlidingWindowHistory(maxRecentImages);
+      const tools = new AtomicBrowserToolset(session, snapshotDir);
 
-    if (!planner) {
-      await session.close();
-      throw new Error('No SubagentPlanner provided and DSH_VISION_API_KEY is not set.');
-    }
+      const planner: SubagentPlanner =
+        req.planner ||
+        (process.env.DSH_VISION_API_KEY
+          ? createOpenAIVisionPlanner({
+              apiKey: process.env.DSH_VISION_API_KEY,
+              baseUrl: process.env.DSH_VISION_BASE_URL,
+              model: process.env.DSH_VISION_MODEL,
+            })
+          : createBuiltinInspectorPlanner());
 
-    if (!this.isOriginPermitted(req.startUrl, req.allowedOrigins, req.blockedOrigins)) {
-      hostFacts.recordBlockedOrigin(req.startUrl);
-      await session.close();
-      return {
+      if (!this.isOriginPermitted(req.startUrl, req.allowedOrigins, req.blockedOrigins)) {
+        hostFacts.recordBlockedOrigin(req.startUrl);
+        await session.close();
+        return {
+          subagentId,
+          role: req.role,
+          status: 'BLOCKED',
+          subagentReport: `BLOCKED: Origin of ${req.startUrl} is not permitted by host policy.`,
+          hostFactsBlock: hostFacts.formatHostFactsBlock(),
+          hostFacts: hostFacts.getFacts(),
+          contextStats: history.getStats(),
+        };
+      }
+
+      const initRes = await tools.navigate(req.startUrl, 1200);
+      req.signal?.throwIfAborted();
+      hostFacts.recordStep(initRes.observation.screenshotPath);
+      history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
+
+      return await this.executeLoop({
         subagentId,
-        role: req.role,
-        status: 'BLOCKED',
-        subagentReport: `BLOCKED: Origin of ${req.startUrl} is not permitted by host policy.`,
-        hostFactsBlock: hostFacts.formatHostFactsBlock(),
-        hostFacts: hostFacts.getFacts(),
-        contextStats: history.getStats(),
-      };
+        req,
+        session,
+        tools,
+        hostFacts,
+        history,
+        planner,
+        nextStep: 1,
+        maxSteps,
+        latestObs: initRes.observation,
+      });
+    } finally {
+      req.signal?.removeEventListener('abort', onAbort);
     }
-
-    const initRes = await tools.navigate(req.startUrl, 1200);
-    hostFacts.recordStep(initRes.observation.screenshotPath);
-    history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
-
-    return this.executeLoop({
-      subagentId,
-      req,
-      session,
-      tools,
-      hostFacts,
-      history,
-      planner,
-      nextStep: 1,
-      maxSteps,
-      latestObs: initRes.observation,
-    });
   }
 
-  /**
-   * Resumes a paused subagent session in the exact same open browser tab after human takeover.
-   */
   public async resumeTask(
     subagentId: string,
-    userFollowupNote = 'Human takeover completed. Continue the task.'
+    userFollowupNote = 'Human takeover completed. Continue the task.',
+    signal?: AbortSignal
   ): Promise<SubagentRunResult> {
+    signal?.throwIfAborted();
     const paused = this.pausedSessions.get(subagentId);
     if (!paused) {
       throw new Error(`No paused subagent session found for subagentId: ${subagentId}`);
@@ -232,40 +408,54 @@ export class BrowserSubagentRunner {
     this.pausedSessions.delete(subagentId);
 
     const { req, session, tools, hostFacts, history, planner, nextStep, maxSteps } = paused;
+    req.signal = signal;
     if (userFollowupNote) {
       req.taskPrompt = `${req.taskPrompt}\n\n[User Follow-up Note]: ${userFollowupNote}`;
     }
 
-    const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
-    hostFacts.recordStep(postTakeoverObs.screenshotPath);
-    history.pushObservation(
-      `Resumed after human takeover (${userFollowupNote})`,
-      postTakeoverObs,
-      tools.sampler.formatObservationForLLM(postTakeoverObs)
-    );
+    const onAbort = () => {
+      void session.close().catch(() => {});
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
-    return this.executeLoop({
-      subagentId,
-      req,
-      session,
-      tools,
-      hostFacts,
-      history,
-      planner,
-      nextStep,
-      maxSteps,
-      latestObs: postTakeoverObs,
-    });
+    try {
+      const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
+      signal?.throwIfAborted();
+      hostFacts.recordStep(postTakeoverObs.screenshotPath);
+      history.pushObservation(
+        `Resumed after human takeover (${userFollowupNote})`,
+        postTakeoverObs,
+        tools.sampler.formatObservationForLLM(postTakeoverObs)
+      );
+
+      return await this.executeLoop({
+        subagentId,
+        req,
+        session,
+        tools,
+        hostFacts,
+        history,
+        planner,
+        nextStep,
+        maxSteps,
+        latestObs: postTakeoverObs,
+      });
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
   }
 
-  private async executeLoop(state: PausedSubagentState & { latestObs: PageObservation }): Promise<SubagentRunResult> {
+  private async executeLoop(
+    state: PausedSubagentState & { latestObs: PageObservation }
+  ): Promise<SubagentRunResult> {
     const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps } = state;
     let latestObs = state.latestObs;
     let keepSessionAlive = false;
 
     try {
       for (let step = state.nextStep; step <= maxSteps; step++) {
-        // 1. Automatic Host Gate Check (CAPTCHA / Payment / Login Wall)
+        req.signal?.throwIfAborted();
+
         if (req.pauseOnGate ?? true) {
           const gate = await detectPageGate(session.page);
           if (gate.detected && gate.reason) {
@@ -302,7 +492,6 @@ export class BrowserSubagentRunner {
           }
         }
 
-        // 2. Ask Subagent Planner for next action
         const decision = await planner({
           stepIndex: step,
           maxSteps,
@@ -310,7 +499,9 @@ export class BrowserSubagentRunner {
           latestObservation: latestObs,
           history,
           hostFacts,
+          signal: req.signal,
         });
+        req.signal?.throwIfAborted();
 
         if (decision.type === 'complete') {
           return {
