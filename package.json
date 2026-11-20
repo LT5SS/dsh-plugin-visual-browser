@@ -1,10 +1,18 @@
 {
   "name": "dsh-plugin-visual-browser",
-  "version": "1.2.0",
-  "description": "Dual-mode adaptive, background-silent visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with customizable Bezier virtual cursor, 3-in-1 sampler, isolated Subagent loop, and human takeover approval cards.",
+  "version": "1.2.2",
+  "description": "Dual-mode adaptive visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with Top-Layer hit-test isolation, customizable Bezier virtual cursor & DSH settings UI, 3-in-1 sampler, and human takeover approval cards.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "cordis.yml",
@@ -13,6 +21,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "scripts": {
@@ -21,14 +36,15 @@
     "stage3:verify": "tsx scripts/verify-stage3.ts",
     "stage4:verify": "tsx scripts/verify-stage4.ts",
     "test:contract": "tsx scripts/verify-dsh-contract.ts",
-    "build": "tsc"
+    "build": "tsc && node scripts/build-client.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.51.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0 <5",
-    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3"
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3",
+    "@deepseek-ai/schemastery": ">=3.18.0 <4"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
@@ -36,11 +52,15 @@
     },
     "@deepseek-ai/dsh-tools": {
       "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/schemastery": "3.19.0",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.0"

@@ -22,20 +22,25 @@ export interface DshCordisContext {
     get?: (name: string) => any;
     inject?: (deps: string[] | Record<string, any>, callback: (ctx: any) => void) => any;
     effect?: (fn: () => (() => void) | void, label?: string) => any;
-    on?: (event: string, listener: (...args: any[]) => void) => void;
+    on?: (event: string, listener: (...args: any[]) => void) => (() => void) | void;
 }
 export interface OptionalHostServices {
     llm?: any;
     attachments?: any;
 }
 export type PlannerMode = 'custom' | 'host-ctx-llm' | 'host-ctx-llm-fallback' | 'external-vision-api' | 'external-vision-api-fallback' | 'builtin-inspector';
+export interface VolatileRef<T> {
+    get(): T;
+}
+export type MaybeVolatile<T> = T | VolatileRef<T>;
 export interface VisualBrowserPluginConfig {
     mode?: BrowserRuntimeMode;
     cdpEndpoint?: string;
     executablePath?: string;
-    windowMode?: BrowserWindowMode;
-    keepWindowOpen?: boolean;
-    showTakeoverControl?: boolean;
+    windowMode?: MaybeVolatile<BrowserWindowMode>;
+    keepWindowOpen?: MaybeVolatile<boolean>;
+    showTakeoverControl?: MaybeVolatile<boolean>;
+    takeoverHotkey?: MaybeVolatile<string>;
     windowBounds?: BrowserWindowBounds;
     backgroundSilent?: boolean;
     artifactDir?: string;
@@ -43,7 +48,7 @@ export interface VisualBrowserPluginConfig {
     maxRecentImages?: number;
     allowedOrigins?: string[];
     blockedOrigins?: string[];
-    cursorStyle?: VirtualCursorStyleConfig;
+    cursorStyle?: MaybeVolatile<VirtualCursorStyleConfig>;
     /** Optional explicit DSH host LLM provider/model route override */
     hostProvider?: string;
     hostModel?: string;
@@ -55,6 +60,12 @@ export interface VisualBrowserPluginConfig {
 }
 export declare const name = "dsh-plugin-visual-browser";
 export declare const inject: string[];
+/**
+ * Unwraps a Cordis/Cosmokit Volatile<T> ref or returns plain values directly.
+ */
+export declare function readVolatileValue<T>(value: MaybeVolatile<T> | undefined): T | undefined;
+export declare function buildPluginConfigSchema(z: any): any;
+export declare const Config: any;
 /**
  * Guarantees a canonical lossless JSON object with zero `undefined` members or non-plain prototypes,
  * satisfying `@deepseek-ai/dsh-tools` 0.2.x output validation.
@@ -83,10 +94,15 @@ export declare function resolveHostLlmRoute(config: VisualBrowserPluginConfig, e
  * Resolves which planner backend will handle `browser_subagent_run` given config and bound host services.
  */
 export declare function resolvePlannerMode(config: VisualBrowserPluginConfig, hostServices?: OptionalHostServices, exec?: Partial<ToolRunContext>): PlannerMode;
+export interface LiveVisualBrowserSettingsBridge {
+    syncFromSettingsDocument: () => void;
+}
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */
-export declare function createVisualBrowserTools(ctx: DshCordisContext, config?: VisualBrowserPluginConfig, runner?: BrowserSubagentRunner, hostServices?: OptionalHostServices): ToolDefinition[];
+export declare function createVisualBrowserTools(ctx: DshCordisContext, config?: VisualBrowserPluginConfig, runner?: BrowserSubagentRunner, hostServices?: OptionalHostServices, bridgeOut?: {
+    bridge?: LiveVisualBrowserSettingsBridge;
+}): ToolDefinition[];
 /**
  * DeepSeek Harness (Cordis) Plugin Entry Point
  */
@@ -94,4 +110,5 @@ export declare function apply(ctx: DshCordisContext, config?: VisualBrowserPlugi
     runner: BrowserSubagentRunner;
     tools: ToolDefinition[];
     hostServices: OptionalHostServices;
+    bridge: LiveVisualBrowserSettingsBridge | undefined;
 };

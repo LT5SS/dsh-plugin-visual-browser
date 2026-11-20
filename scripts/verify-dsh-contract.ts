@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import vm from 'node:vm';
 import {
   assertObjectJsonSchema,
   assertSupportedJsonSchema,
@@ -14,13 +15,17 @@ import {
   AtomicBrowserToolset,
   BrowserSession,
   BrowserSubagentRunner,
+  Config,
+  POINTER_SHAPE_SVG_PATHS,
   PageSnapshotSampler,
   SUBAGENT_SYSTEM_PROMPT,
   apply,
   computeDefaultBackgroundWindowBounds,
   extractHostStreamChunk,
   parseJsonDecision,
+  readVolatileValue,
   resolveBrowserWindowMode,
+  resolveCursorStyle,
   resolvePlannerMode,
   safeEvaluate,
   type DshCordisContext,
@@ -42,6 +47,36 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const cleanUrl = (req.url || '/').split('?')[0];
+      if (cleanUrl === '/__layer-iframe.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Iframe Fixture</title></head>
+<body style="margin:0;padding:12px;">
+  <button id="frame-btn" style="padding:8px 14px;">Frame Button</button>
+</body>
+</html>`);
+        return;
+      }
+      if (cleanUrl === '/__layer-fixture.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Layer Isolation Fixture</title></head>
+<body style="margin:0;padding:24px;height:2400px;font-family:sans-serif;">
+  <a id="menu-link" href="#studio" style="position:fixed;top:18px;right:20px;z-index:2147483647;padding:8px 16px;background:#111827;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;" onclick="window.__menuClicked=(window.__menuClicked||0)+1; return false;">Menu</a>
+  <h1>Layer Isolation Fixture</h1>
+  <div id="shadow-host" style="position:fixed;top:90px;left:40px;width:160px;height:44px;"></div>
+  <iframe id="same-origin-frame" src="/__layer-iframe.html" style="position:fixed;top:160px;left:40px;width:240px;height:90px;border:1px solid #999;"></iframe>
+  <script>
+    const host = document.getElementById('shadow-host');
+    const sr = host.attachShadow({ mode: 'open' });
+    sr.innerHTML = '<button id="shadow-btn" style="width:160px;height:44px;">Shadow Button</button>';
+  </script>
+</body>
+</html>`);
+        return;
+      }
       if (cleanUrl === '/__hud-fixture.html') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(`<!doctype html>
@@ -544,6 +579,109 @@ async function main() {
   assert.deepEqual(customBounds, { x: 100, y: 20, width: 900, height: 700 });
   console.log('[Strict DSH 0.2 Contract] 0i Verified resolveBrowserWindowMode() & computeDefaultBackgroundWindowBounds()!');
 
+  // 0j. v1.2.2: Verify volatile Schemastery Config schema, dsh.client manifest & dist/client.js settings registration
+  assert.ok(Config && typeof Config === 'function' && 'toJSON' in Config, 'Expected Config Schemastery schema export');
+  const parsedCfg = Config({
+    mode: 'auto',
+    windowMode: 'headless',
+    cursorStyle: { preset: 'comet-gold' },
+  });
+  assert.equal(readVolatileValue(parsedCfg.windowMode), 'headless');
+  assert.equal(readVolatileValue(parsedCfg.takeoverHotkey), 'F8');
+  assert.equal(readVolatileValue(parsedCfg.keepWindowOpen), true);
+  assert.equal(readVolatileValue(parsedCfg.cursorStyle)?.preset, 'comet-gold');
+  assert.equal(
+    readVolatileValue(parsedCfg.cursorStyle)?.pointerColor,
+    undefined,
+    'Preset-only cursorStyle must not inject cyber-neon pointerColor over comet-gold'
+  );
+  assert.equal(readVolatileValue('plain'), 'plain');
+  assert.equal(readVolatileValue({ get: () => 42 }), 42);
+
+  assert.equal(pkgJson?.dsh?.client?.platform, 'web', 'Expected package.json dsh.client.platform === "web"');
+  assert.equal(pkgJson?.exports?.['./client'], './dist/client.js');
+  const clientDistPath = path.join(pkgRoot, 'dist', 'client.js');
+  assert.ok(fs.existsSync(clientDistPath), 'Expected built dist/client.js to exist');
+  const clientSource = fs.readFileSync(clientDistPath, 'utf8');
+  let registeredClientMod: any = null;
+  const mockReact = {
+    Fragment: Symbol.for('react.fragment'),
+    createElement: (type: any, props: any, ...children: any[]) => ({ type, props, children }),
+    useState: (init: any) => [typeof init === 'function' ? init() : init, () => {}],
+    useEffect: () => {},
+    useRef: (init: any) => ({ current: init }),
+  };
+  const clientSandbox: any = {
+    Object,
+    Array,
+    Math,
+    Number,
+    String,
+    Boolean,
+    Set,
+    Map,
+    Date,
+    RegExp,
+    JSON,
+    Reflect,
+    Symbol,
+    window: {
+      __ModuleLoader__: {
+        load(reg: any) {
+          registeredClientMod = reg;
+        },
+      },
+    },
+  };
+  vm.runInNewContext(clientSource, clientSandbox);
+  assert.ok(registeredClientMod && typeof registeredClientMod.factory === 'function');
+  const clientExports = registeredClientMod.factory((id: string) => {
+    if (id === 'react') return mockReact;
+    throw new Error(`Unexpected require inside dist/client.js: ${id}`);
+  });
+  assert.deepEqual([...clientExports.inject], ['slots', 'locale', 'configForms']);
+
+  const slotRegistrations: Array<{ name: string; opts: any; comp: any }> = [];
+  const mutateCalls: Array<{ ns: string; ops: any[]; rev?: number }> = [];
+  const mockClientCtx = {
+    locale: {
+      bind: (ns: string) => (k: string) => `${ns}:${k}`,
+      register: () => () => {},
+    },
+    effect: (fn: () => any) => fn(),
+    slots: {
+      inject: (_name: string, fn: () => any) => fn(),
+      register: (opts: any, comp: any) => {
+        slotRegistrations.push({ name: opts.name, opts, comp });
+        return () => {};
+      },
+    },
+    configForms: {
+      get: (ns: string) => ({
+        getSnapshot: () => ({ status: 'ready', writable: true, revision: 3, value: { cursorStyle: { preset: 'cyber-neon' } } }),
+        subscribe: () => () => {},
+        mutate: async (ops: any[], rev?: number) => {
+          mutateCalls.push({ ns, ops, rev });
+          return true;
+        },
+      }),
+      describe: () => ({
+        getSnapshot: () => ({ status: 'ready', view: { namespaces: [{ ns: 'dsh-plugin-visual-browser', value: { cursorStyle: { preset: 'cyber-neon' } } }] } }),
+        subscribe: () => () => {},
+      }),
+    },
+  };
+  clientExports.apply(mockClientCtx);
+  const settingsSlot = slotRegistrations.find((s) => s.name === 'settings.section' && s.opts.id === 'visual-browser');
+  const bundleSlot = slotRegistrations.find((s) => s.name === 'plugins.bundle.config' && s.opts.key === 'dsh-plugin-visual-browser');
+  assert.ok(settingsSlot, 'Expected settings.section registration with id="visual-browser"');
+  assert.ok(bundleSlot, 'Expected plugins.bundle.config registration with key="dsh-plugin-visual-browser"');
+  const injectedFace = settingsSlot!.opts.inject();
+  assert.equal(await injectedFace.saveMutation([{ op: 'set', path: ['cursorStyle'], value: { preset: 'custom' } }], 3), true);
+  assert.equal(mutateCalls.length, 1);
+  assert.equal(mutateCalls[0]?.ns, 'dsh-plugin-visual-browser');
+  console.log('[Strict DSH 0.2 Contract] 0j Verified Config schema, dsh.client manifest & dist/client.js settings slots!');
+
   // Checks 1-5: End-to-end tool execution with headless Chromium & local static server
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
   const artifactDir = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test');
@@ -1012,29 +1150,51 @@ async function main() {
       await hudSession.close();
     }
 
-    // 5h. v1.2.0: In-page takeover button is excluded from HUD/counts, triggers USER_TAKEOVER pause, and resumes cleanly
+    // 5h. v1.2.2: Overlay root is pointer-events:none (popover="manual"), button is pointer-events:none during RUNNING and auto during PAUSED, F8 triggers USER_TAKEOVER & resumes
     const takeoverHost = createCordisStrictCtx({ validateSchemas: false });
     let takeoverPlannerCalls = 0;
+    let capturedTakeoverSession: BrowserSession | null = null;
     let takeoverRes!: ReturnType<typeof apply>;
     takeoverRes = apply(takeoverHost.ctx, {
       mode: 'auto',
       windowMode: 'headless',
       keepWindowOpen: true,
       showTakeoverControl: true,
+      takeoverHotkey: 'F8',
       artifactDir,
       customPlanner: async (ctx) => {
         takeoverPlannerCalls++;
         assert.ok(
           !ctx.latestObservation.interactiveElements.some(
-            (e) => e.label.includes('暂停并接管') || e.selectorHint.includes('__dsh_vc_takeover_btn__')
+            (e) =>
+              e.label.includes('接管') ||
+              e.selectorHint.includes('__dsh_vc_takeover_btn__')
           ),
           'Takeover overlay button must be excluded from interactiveElements HUD'
         );
         if (takeoverPlannerCalls === 1) {
           const activeSession = takeoverRes.runner.getSharedSession();
           assert.ok(activeSession, 'Expected shared session while runTask with keepWindowOpen is active');
-          await activeSession.page.locator('#__dsh_vc_takeover_btn__').click();
-          return { type: 'scroll', deltaY: 120, reason: 'Check in-page takeover signal' };
+          capturedTakeoverSession = activeSession;
+          const runningStyles = await safeEvaluate(
+            activeSession.page,
+            () => {
+              const root = document.getElementById('__dsh_vc_root__');
+              const btn = document.getElementById('__dsh_vc_takeover_btn__');
+              return {
+                popover: root?.getAttribute('popover') ?? '',
+                rootPointerEvents: root ? getComputedStyle(root).pointerEvents : '',
+                btnPointerEvents: btn ? getComputedStyle(btn).pointerEvents : '',
+              };
+            },
+            { popover: '', rootPointerEvents: '', btnPointerEvents: '' },
+            0
+          );
+          assert.equal(runningStyles.popover, 'manual');
+          assert.equal(runningStyles.rootPointerEvents, 'none');
+          assert.equal(runningStyles.btnPointerEvents, 'none', 'Takeover button must be click-through during RUNNING');
+          await activeSession.page.keyboard.press('F8');
+          return { type: 'scroll', deltaY: 120, reason: 'Check F8 hotkey takeover signal' };
         }
         return { type: 'complete', report: 'RESUMED_AFTER_USER_TAKEOVER' };
       },
@@ -1047,7 +1207,7 @@ async function main() {
         {
           url: srv.url,
           role: 'Takeover Verifier',
-          task_prompt: 'Verify live takeover button pauses and resumes',
+          task_prompt: 'Verify live takeover button pointer-events, F8 hotkey pause & resume',
           max_steps: 4,
           window_mode: 'headless',
         },
@@ -1057,6 +1217,17 @@ async function main() {
       assert.equal(pauseVal.status, 'PAUSED_FOR_TAKEOVER');
       assert.equal(pauseVal.approval_card?.reason, 'USER_TAKEOVER');
       assert.equal(takeoverRes.runner.getSharedSession(), null, 'Paused takeover session must detach from shared pool');
+      assert.ok(capturedTakeoverSession);
+      const pausedBtnPe = await safeEvaluate(
+        capturedTakeoverSession.page,
+        () => {
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return btn ? getComputedStyle(btn).pointerEvents : '';
+        },
+        '',
+        0
+      );
+      assert.equal(pausedBtnPe, 'auto', 'Takeover button must become pointer-events:auto in PAUSED state');
 
       const resumedVal: any = await takeoverResumeDef.execute(
         {
@@ -1068,7 +1239,7 @@ async function main() {
       assert.equal(takeoverPlannerCalls, 2, 'Expected customPlanner to resume at step 2 after USER_TAKEOVER');
       assert.equal(resumedVal.status, 'COMPLETED');
       assert.ok(String(resumedVal.subagent_report).includes('RESUMED_AFTER_USER_TAKEOVER'));
-      console.log('[Strict DSH 0.2 Contract] 5h Verified in-page takeover button HUD exclusion, USER_TAKEOVER pause & resume!');
+      console.log('[Strict DSH 0.2 Contract] 5h Verified pointer-events state machine, F8 takeover pause & resume!');
     } finally {
       await takeoverRes.runner.closeAllSessions();
     }
@@ -1111,6 +1282,227 @@ async function main() {
       console.log('[Strict DSH 0.2 Contract] 5i Verified persistent BrowserSession reuse & clean closeAllSessions() teardown!');
     } finally {
       await reuseRunner.closeAllSessions();
+    }
+
+    // 5j. TASK-v1.2.2 P0/P0.5/P1/P3: Layer isolation hit-test blocks PLUGIN_UI_LAYER without mouse.click & allows click-through to Menu
+    const layerSession = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+    }).start();
+    try {
+      const layerTools = new AtomicBrowserToolset(layerSession, path.join(artifactDir, 'layer-fixture'));
+      let mouseClickSpyCount = 0;
+      const origMouseClick = layerSession.page.mouse.click.bind(layerSession.page.mouse);
+      (layerSession.page.mouse as any).click = async (x: number, y: number, options?: any) => {
+        mouseClickSpyCount++;
+        return origMouseClick(x, y, options);
+      };
+
+      await layerTools.navigate(`${srv.url}__layer-fixture.html`, 400);
+      const menuClickRes = await layerTools.click('a#menu-link', 120);
+      assert.equal(menuClickRes.ok, true);
+      assert.equal(menuClickRes.blocked, undefined);
+      assert.equal(mouseClickSpyCount, 1, 'Expected real page.mouse.click once when clicking Menu beneath pill');
+      const menuCount = await safeEvaluate(layerSession.page, () => Number((window as any).__menuClicked || 0), 0, 0);
+      assert.equal(menuCount, 1, 'Expected Menu link beneath RUNNING pill to receive real click');
+      assert.equal(await layerSession.checkHumanTakeoverRequested(), false);
+
+      const shadowCenter = await safeEvaluate(
+        layerSession.page,
+        () => {
+          const btn = document.getElementById('shadow-host')?.shadowRoot?.getElementById('shadow-btn');
+          if (!btn) return null;
+          const r = btn.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        },
+        null,
+        0
+      );
+      assert.ok(shadowCenter, 'Expected Shadow DOM button bounding box');
+      const shadowHit = await layerSession.motion.hitTestAt(shadowCenter!.x, shadowCenter!.y);
+      assert.equal(shadowHit.hitsPluginUi, false);
+      assert.equal(shadowHit.inShadowRoot, true);
+
+      const frameCenter = await safeEvaluate(
+        layerSession.page,
+        () => {
+          const iframe = document.getElementById('same-origin-frame') as HTMLIFrameElement | null;
+          const fBtn = iframe?.contentDocument?.getElementById('frame-btn');
+          if (!iframe || !fBtn) return null;
+          const ir = iframe.getBoundingClientRect();
+          const br = fBtn.getBoundingClientRect();
+          return { x: ir.left + br.left + br.width / 2, y: ir.top + br.top + br.height / 2 };
+        },
+        null,
+        0
+      );
+      assert.ok(frameCenter, 'Expected same-origin iframe button coordinates');
+      const frameHit = await layerSession.motion.hitTestAt(frameCenter!.x, frameCenter!.y);
+      assert.equal(frameHit.hitsPluginUi, false);
+      assert.equal(frameHit.inIframe, true);
+
+      await layerTools.navigate(`${srv.url}__layer-fixture.html?__dsh_test_center_pill=1`, 400);
+      mouseClickSpyCount = 0;
+      const vpCenter = await safeEvaluate(
+        layerSession.page,
+        () => ({ x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) }),
+        { x: 720, y: 450 },
+        0
+      );
+      const blockedTop = await layerTools.click(vpCenter, 100);
+      assert.equal(blockedTop.ok, false);
+      assert.equal(blockedTop.blocked, 'PLUGIN_UI_LAYER');
+      assert.ok(String(blockedTop.hit ?? '').includes('#__dsh_vc_root__'), `Expected #__dsh_vc_root__ hit chain, got ${blockedTop.hit}`);
+      assert.equal(mouseClickSpyCount, 0, 'page.mouse.click MUST NOT be called when blocked by PLUGIN_UI_LAYER');
+      assert.equal(await layerSession.checkHumanTakeoverRequested(), false);
+
+      await layerTools.scroll(600, 150);
+      const blockedScrolled = await layerTools.click(vpCenter, 100);
+      assert.equal(blockedScrolled.ok, false);
+      assert.equal(blockedScrolled.blocked, 'PLUGIN_UI_LAYER');
+      assert.equal(mouseClickSpyCount, 0, 'page.mouse.click MUST NOT be called after scroll when center pill overlaps');
+    } finally {
+      await layerSession.close();
+    }
+
+    const layerDiagHost = createCordisStrictCtx({ validateSchemas: false });
+    let layerRunCalls = 0;
+    const layerDiagRes = apply(layerDiagHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      showTakeoverControl: true,
+      artifactDir,
+      customPlanner: async (ctx) => {
+        layerRunCalls++;
+        if (layerRunCalls === 1) {
+          const vw = ctx.latestObservation.scroll.viewportWidth || 1440;
+          const vh = ctx.latestObservation.scroll.viewportHeight || 900;
+          return {
+            type: 'click',
+            target: { x: Math.round(vw / 2), y: Math.round(vh / 2) },
+            reason: 'Verify PLUGIN_UI_LAYER diagnostics persistence',
+          };
+        }
+        return { type: 'complete', report: 'LAYER_DIAG_COMPLETED' };
+      },
+    });
+    allDisposers.push(...layerDiagHost.effectDisposers);
+    try {
+      const layerRunDef = layerDiagHost.registeredTools.get('browser_subagent_run')!;
+      const layerRunVal: any = await layerRunDef.execute(
+        {
+          url: `${srv.url}__layer-fixture.html?__dsh_test_center_pill=1`,
+          role: 'Layer Verifier',
+          task_prompt: 'Verify blocked PLUGIN_UI_LAYER action is recorded in diagnostics.json',
+          max_steps: 3,
+          window_mode: 'headless',
+        },
+        fakeExec
+      );
+      assert.equal(layerRunVal.status, 'COMPLETED');
+      assert.ok(fs.existsSync(layerRunVal.diagnostics_path));
+      const layerDiag = JSON.parse(fs.readFileSync(layerRunVal.diagnostics_path, 'utf8'));
+      const step1Action = layerDiag?.planner_detail?.llm_steps?.[0]?.action;
+      assert.equal(step1Action?.blocked, 'PLUGIN_UI_LAYER');
+      assert.ok(String(step1Action?.hit ?? '').includes('#__dsh_vc_root__'));
+      console.log('[Strict DSH 0.2 Contract] 5j Verified Top-Layer hit-test (Menu pass-through, Shadow/iframe, center-pill refusal & diagnostics)!');
+    } finally {
+      await layerDiagRes.runner.closeAllSessions();
+    }
+
+    // 5k. v1.2.2: Verify custom pointer shapes, image URL sanitization, & live settings/document-updated hot sync
+    const badStyle = resolveCursorStyle({
+      preset: 'custom',
+      pointerShape: 'custom-image',
+      customPointerImageUrl: 'javascript:alert(1)',
+    });
+    assert.equal(badStyle.customPointerImageUrl, '', 'Malicious javascript: cursor URL must be stripped');
+
+    let settingsUpdatedHandler: ((ns?: string) => void) | undefined;
+    let volatileStyleState: any = { preset: 'cyber-neon', pointerShape: 'arrow', badgeTextPrefix: 'DSH' };
+    const liveHostCtx: DshCordisContext = {
+      tools: { register: (t) => liveTools.set(t.name, t) },
+      on(event, listener) {
+        if (event === 'settings/document-updated') {
+          settingsUpdatedHandler = listener;
+        }
+      },
+      effect: (fn) => {
+        const d = fn();
+        if (typeof d === 'function') allDisposers.push(d);
+      },
+      get: () => undefined,
+      inject: () => {},
+    };
+    const liveTools = new Map<string, ToolDefinition>();
+    const liveRes = apply(liveHostCtx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      artifactDir,
+      cursorStyle: { get: () => volatileStyleState },
+      takeoverHotkey: { get: () => 'F9' },
+      customPlanner: async () => ({ type: 'complete', report: 'LIVE_STYLE_OK' }),
+    });
+    try {
+      const liveRun = liveTools.get('browser_subagent_run')!;
+      await liveRun.execute(
+        { url: srv.url, role: 'Cursor Sync', task_prompt: 'Keep session open for style sync', max_steps: 1, window_mode: 'headless' },
+        fakeExec
+      );
+      const shared = liveRes.runner.getSharedSession();
+      assert.ok(shared && shared.isAlive(), 'Expected persistent shared session for live cursor sync check');
+
+      await shared.motion.setCursorStyle({ preset: 'custom', pointerShape: 'crosshair', pointerColor: '#22c55e' });
+      const crosshairState = await safeEvaluate(
+        shared.page,
+        () => ({
+          d: document.getElementById('__dsh_vc_arrow_path__')?.getAttribute('d') ?? '',
+          fill: document.getElementById('__dsh_vc_arrow_path__')?.getAttribute('fill') ?? '',
+        }),
+        { d: '', fill: '' },
+        0
+      );
+      assert.equal(crosshairState.d, POINTER_SHAPE_SVG_PATHS.crosshair);
+      assert.equal(crosshairState.fill, 'none');
+
+      const safeSvgUri = 'data:image/svg+xml;utf8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="10" fill="red"/></svg>');
+      await shared.motion.setCursorStyle({ preset: 'custom', pointerShape: 'custom-image', customPointerImageUrl: safeSvgUri });
+      const imgState = await safeEvaluate(
+        shared.page,
+        () => {
+          const img = document.getElementById('__dsh_vc_custom_img__') as HTMLImageElement | null;
+          return { display: img?.style.display ?? '', src: img?.getAttribute('src') ?? '' };
+        },
+        { display: '', src: '' },
+        0
+      );
+      assert.equal(imgState.display, 'block');
+      assert.ok(imgState.src.startsWith('data:image/svg+xml'));
+
+      volatileStyleState = {
+        preset: 'comet-gold',
+        pointerShape: 'star',
+        badgeTextPrefix: 'VIP',
+      };
+      assert.ok(settingsUpdatedHandler, 'Expected settings/document-updated listener to register');
+      settingsUpdatedHandler!('dsh-plugin-visual-browser');
+      await new Promise((r) => setTimeout(r, 150));
+
+      const syncedState = await safeEvaluate(
+        shared.page,
+        () => (window as any).__dshCursorAPI?.getState?.()?.style ?? null,
+        null as any,
+        0
+      );
+      assert.equal(syncedState?.pointerShape, 'star');
+      assert.equal(syncedState?.badgeTextPrefix, 'VIP');
+      console.log('[Strict DSH 0.2 Contract] 5k Verified custom shapes, URL sanitization & settings/document-updated live sync!');
+    } finally {
+      await liveRes.runner.closeAllSessions();
     }
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');

@@ -148,6 +148,7 @@ export class BrowserSession {
         }
         const initScript = buildVirtualCursorInitScript(this.options.cursorStyle, {
             showTakeoverControl: showTakeover,
+            takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
         });
         await this.context.addInitScript(initScript);
         if (!this.takeoverBindingInstalled) {
@@ -163,6 +164,7 @@ export class BrowserSession {
         }
         this.motion = new HumanMotionController(this.page, this.options.cursorStyle, {
             showTakeoverControl: showTakeover,
+            takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
             shouldAbort: () => this.humanTakeoverRequested,
         });
         this.telemetry = new TelemetryCollector(this.page);

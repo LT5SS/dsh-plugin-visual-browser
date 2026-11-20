@@ -31,7 +31,8 @@ Respond ONLY with a single valid JSON object matching one of these actions:
 动作效率与步数预算规则：
 1. \`move_mouse\` 的装饰性轨迹动作（如 jiggle、slow approach、probe）**仅在用户明确要求演示鼠标轨迹时使用**；否则直接使用 \`hover\` / \`click\` / \`scroll\` / \`type_text\` / \`navigate\` 等语义动作，或直接汇总结果。
 2. 当现有 HUD 已包含任务所需的全部事实时，立即返回 \`complete\`，不要"再摸一下确认"。
-3. 时刻关注剩余步数预算（\`stepIndex / maxSteps\`）：若剩余步数 <= 1，必须在本步直接返回 \`complete\` 收尾。`;
+3. 若动作返回 \`[ACTION_REFUSED] {"ok":false,"blocked":"PLUGIN_UI_LAYER",...}\`，说明目标坐标被工具自身顶层 UI 遮挡（真实点击未发送），请先 \`scroll\` 调整位置或改用未被遮挡的 \`#ref\`，禁止反复点击同一被遮挡坐标。
+4. 时刻关注剩余步数预算（\`stepIndex / maxSteps\`）：若剩余步数 <= 1，必须在本步直接返回 \`complete\` 收尾。`;
 /** Summarizes a SubagentActionDecision into a compact JSON-safe replay object for diagnostics. */
 export function summarizeDecisionAction(decision) {
     switch (decision.type) {
@@ -830,6 +831,15 @@ export class BrowserSubagentRunner {
                 else {
                     throw new Error(`Unsupported decision: ${JSON.stringify(decision)}`);
                 }
+                req.onActionResult?.({
+                    stepIndex: step,
+                    decision,
+                    ok: actionResult.ok !== false,
+                    blocked: actionResult.blocked,
+                    hit: actionResult.hit,
+                    at: actionResult.at,
+                    hint: actionResult.hint,
+                });
                 hostFacts.recordStep(actionResult.observation.screenshotPath);
                 history.pushObservation(`${actionResult.action} — ${decision.reason}`, actionResult.observation, actionResult.llmSummary);
                 latestObs = actionResult.observation;

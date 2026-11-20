@@ -18,24 +18,44 @@ export interface ViewportSize {
   height: number;
 }
 
+export type VirtualCursorShape =
+  | 'arrow'
+  | 'crosshair'
+  | 'dot'
+  | 'star'
+  | 'ring'
+  | 'custom-svg'
+  | 'custom-image';
+
 export type VirtualCursorPreset =
   | 'cyber-neon'
   | 'comet-gold'
   | 'laser-dots'
   | 'stealth-minimal'
-  | 'clean-none';
+  | 'clean-none'
+  | 'custom';
 
 export type TrailVariant = 'dashed' | 'solid' | 'dots' | 'comet' | 'none';
 
 export interface VirtualCursorStyleConfig {
   /** Named preset (individual properties below can override any preset field) */
   preset?: VirtualCursorPreset;
+  /** Pointer visual shape ('arrow' | 'crosshair' | 'dot' | 'star' | 'ring' | 'custom-svg' | 'custom-image') */
+  pointerShape?: VirtualCursorShape;
   /** Cursor arrow fill color (e.g. '#ff3b28') */
   pointerColor?: string;
   /** Cursor arrow border stroke color (e.g. '#ffffff') */
   pointerBorderColor?: string;
   /** Cursor size scale multiplier (default: 1.0) */
   pointerScale?: number;
+  /** Custom SVG `<path d="...">` string in a 28x28 coordinate box when pointerShape === 'custom-svg' */
+  customPointerSvgPath?: string;
+  /** Sanitized image URL or data:image/... URI when pointerShape === 'custom-image' */
+  customPointerImageUrl?: string;
+  /** Pointer click hotspot X offset in px within 28x28 box (default: 3) */
+  customPointerHotspotX?: number;
+  /** Pointer click hotspot Y offset in px within 28x28 box (default: 3) */
+  customPointerHotspotY?: number;
   /** Trail rendering mode: 'dashed' | 'solid' | 'dots' | 'comet' | 'none' */
   trailVariant?: TrailVariant;
   /** Gradient start (tail end) color */
@@ -52,6 +72,8 @@ export interface VirtualCursorStyleConfig {
   rippleColor?: string;
   /** Whether to show the floating "(x, y) · ACTION" pill badge next to the cursor */
   showBadge?: boolean;
+  /** Custom prefix text shown inside the HUD badge (default: 'DSH') */
+  badgeTextPrefix?: string;
 }
 
 export interface BrowserSessionOptions {
@@ -69,8 +91,10 @@ export interface BrowserSessionOptions {
   windowMode?: BrowserWindowMode;
   /** Keep a single visible browser window open and reuse it across subsequent runs (default: true for visible modes) */
   keepWindowOpen?: boolean;
-  /** Show the floating in-page "暂停并接管" control pill so users can take over immediately */
+  /** Show the floating in-page takeover status pill so users can monitor/take over immediately */
   showTakeoverControl?: boolean;
+  /** Keyboard hotkey (e.g. 'F8') that triggers immediate human takeover from anywhere in the page */
+  takeoverHotkey?: string;
   /** Optional explicit screen bounds for `'visible-background'` */
   windowBounds?: BrowserWindowBounds;
   /**
@@ -85,6 +109,23 @@ export interface BrowserSessionOptions {
 export interface Point2D {
   x: number;
   y: number;
+}
+
+export interface ClickHitTestResult {
+  hitsPluginUi: boolean;
+  topElement: string;
+  stackTop: string[];
+  inShadowRoot?: boolean;
+  inIframe?: boolean;
+}
+
+export interface ClickActionResult extends Point2D {
+  ok: boolean;
+  at: Point2D;
+  blocked?: 'PLUGIN_UI_LAYER';
+  hit?: string;
+  element?: string;
+  hint?: string;
 }
 
 export interface MotionOptions {

@@ -21,10 +21,12 @@ export class HumanMotionController {
     showTakeoverControl;
     shouldAbort;
     takeoverRole = '';
+    takeoverHotkey;
     constructor(page, initialStyle = {}, opts = {}) {
         this.page = page;
         this.cursorStyle = initialStyle;
         this.showTakeoverControl = Boolean(opts.showTakeoverControl);
+        this.takeoverHotkey = typeof opts.takeoverHotkey === 'string' ? opts.takeoverHotkey : 'F8';
         this.shouldAbort = opts.shouldAbort;
     }
     getPosition() {
@@ -37,12 +39,20 @@ export class HumanMotionController {
         const initScript = buildVirtualCursorInitScript(this.cursorStyle, {
             showTakeoverControl: this.showTakeoverControl,
             roleLabel: this.takeoverRole,
+            takeoverHotkey: this.takeoverHotkey,
         });
         await safeEvaluate(this.page, (script) => {
             if (!window.__dshVirtualCursorInstalled) {
                 (0, eval)(script);
             }
         }, undefined, { arg: initScript, retries: 1 });
+    }
+    async setTakeoverHotkey(hotkey) {
+        this.takeoverHotkey = hotkey;
+        await this.ensureCursorHUD();
+        await safeEvaluate(this.page, (hk) => {
+            window.__dshCursorAPI?.setTakeoverHotkey?.(hk);
+        }, undefined, { arg: hotkey, retries: 0 });
     }
     async setTakeoverState(mode, roleLabel) {
         if (typeof roleLabel === 'string') {
@@ -145,16 +155,154 @@ export class HumanMotionController {
             label: opts.label ?? `HOVER ${selector}`,
         });
     }
+    /**
+     * Performs a Top-Layer-aware hit test at `(x, y)` before dispatching any real mouse click,
+     * penetrating open Shadow DOM roots and same-origin iframes.
+     */
+    async hitTestAt(x, y) {
+        const fallback = {
+            hitsPluginUi: false,
+            topElement: 'unknown',
+            stackTop: [],
+        };
+        return safeEvaluate(this.page, ({ px, py }) => {
+            const stack = document.elementsFromPoint(px, py);
+            let inShadowRoot = false;
+            let inIframe = false;
+            let resolvedTop = stack[0] ?? null;
+            let depth = 0;
+            while (resolvedTop && depth < 12) {
+                depth++;
+                if (resolvedTop.closest?.('#__dsh_vc_root__'))
+                    break;
+                if (resolvedTop.shadowRoot) {
+                    const sr = resolvedTop.shadowRoot;
+                    const innerEl = sr.elementFromPoint(px, py);
+                    const innerStack = typeof sr.elementsFromPoint === 'function'
+                        ? sr.elementsFromPoint(px, py)
+                        : innerEl
+                            ? [innerEl]
+                            : [];
+                    let inner = null;
+                    for (let i = 0; i < innerStack.length; i++) {
+                        if (innerStack[i] !== resolvedTop) {
+                            inner = innerStack[i];
+                            break;
+                        }
+                    }
+                    if (inner && inner !== resolvedTop) {
+                        inShadowRoot = true;
+                        resolvedTop = inner;
+                        continue;
+                    }
+                }
+                if (resolvedTop.tagName === 'IFRAME') {
+                    try {
+                        const iframe = resolvedTop;
+                        const doc = iframe.contentDocument;
+                        if (doc) {
+                            const rect = iframe.getBoundingClientRect();
+                            const lx = px - rect.left;
+                            const ly = py - rect.top;
+                            const frameStack = doc.elementsFromPoint(lx, ly);
+                            if (frameStack[0]) {
+                                inIframe = true;
+                                resolvedTop = frameStack[0];
+                                continue;
+                            }
+                        }
+                    }
+                    catch {
+                        // Cross-origin iframe cannot be inspected locally; stop descending safely.
+                    }
+                }
+                break;
+            }
+            const hitsPluginUi = Boolean(stack[0]?.closest?.('#__dsh_vc_root__')) ||
+                Boolean(resolvedTop?.closest?.('#__dsh_vc_root__'));
+            const stackTop = [];
+            for (let i = 0; i < Math.min(stack.length, 5); i++) {
+                const el = stack[i];
+                const tag = el.tagName.toLowerCase();
+                const idPart = el.id ? `#${el.id}` : '';
+                let clsPart = '';
+                if (!el.id && typeof el.className === 'string' && el.className.trim()) {
+                    const firstCls = el.className.trim().split(/\s+/)[0];
+                    if (firstCls)
+                        clsPart = `.${firstCls}`;
+                }
+                stackTop.push(`${tag}${idPart}${clsPart}`);
+            }
+            let topElement = 'none';
+            if (resolvedTop) {
+                if (resolvedTop.closest?.('#__dsh_vc_root__')) {
+                    const chain = [];
+                    let cur = resolvedTop;
+                    while (cur) {
+                        const tag = cur.tagName.toLowerCase();
+                        const idPart = cur.id ? `#${cur.id}` : '';
+                        let clsPart = '';
+                        if (!cur.id && typeof cur.className === 'string' && cur.className.trim()) {
+                            const firstCls = cur.className.trim().split(/\s+/)[0];
+                            if (firstCls)
+                                clsPart = `.${firstCls}`;
+                        }
+                        chain.unshift(`${tag}${idPart}${clsPart}`);
+                        if (cur.id === '__dsh_vc_root__')
+                            break;
+                        cur = cur.parentElement;
+                    }
+                    topElement = chain.join(' > ');
+                }
+                else {
+                    const tag = resolvedTop.tagName.toLowerCase();
+                    const idPart = resolvedTop.id ? `#${resolvedTop.id}` : '';
+                    let clsPart = '';
+                    if (!resolvedTop.id && typeof resolvedTop.className === 'string' && resolvedTop.className.trim()) {
+                        const firstCls = resolvedTop.className.trim().split(/\s+/)[0];
+                        if (firstCls)
+                            clsPart = `.${firstCls}`;
+                    }
+                    topElement = `${tag}${idPart}${clsPart}`;
+                }
+            }
+            return {
+                hitsPluginUi,
+                topElement,
+                stackTop,
+                ...(inShadowRoot ? { inShadowRoot: true } : {}),
+                ...(inIframe ? { inIframe: true } : {}),
+            };
+        }, fallback, { arg: { px: x, py: y }, retries: 1 });
+    }
     async clickAt(x, y, opts = {}) {
         await this.moveTo(x, y, { ...opts, label: opts.label ?? 'AIM' });
-        await this.page.mouse.down();
+        const hit = await this.hitTestAt(x, y);
+        if (hit.hitsPluginUi) {
+            await this.syncHUD(x, y, 'BLOCKED · PLUGIN_UI_LAYER');
+            return {
+                ok: false,
+                x: this.pos.x,
+                y: this.pos.y,
+                at: { x, y },
+                blocked: 'PLUGIN_UI_LAYER',
+                hit: hit.topElement,
+                element: hit.topElement,
+                hint: '该位置被工具 UI 覆盖，请滚动或用 #ref',
+            };
+        }
         await safeEvaluate(this.page, ({ px, py, lbl }) => {
             window.__dshCursorAPI?.clickEffect(px, py, lbl);
         }, undefined, { arg: { px: x, py: y, lbl: opts.label ?? 'CLICK' }, retries: 0 });
-        await this.page.waitForTimeout(55);
-        await this.page.mouse.up();
+        await this.page.mouse.click(x, y, { delay: 55 });
         await this.page.waitForTimeout(80);
-        return { ...this.pos };
+        return {
+            ok: true,
+            x: this.pos.x,
+            y: this.pos.y,
+            at: { x, y },
+            element: hit.topElement,
+        };
     }
     async clickSelector(selector, opts = {}) {
         const pt = await this.hoverSelector(selector, {

@@ -17,7 +17,9 @@
       windowMode: 'visible-background'
       keepWindowOpen: true
       showTakeoverControl: true
+      takeoverHotkey: 'F8'
       maxSteps: 12
       maxRecentImages: 3
       cursorStyle:
         preset: 'cyber-neon'
+        pointerShape: 'arrow'

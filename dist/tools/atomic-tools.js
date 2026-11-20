@@ -63,17 +63,38 @@ export class AtomicBrowserToolset {
         };
     }
     async click(target, waitMs = 240) {
-        if (typeof target === 'string') {
-            const selector = resolveTargetSelector(target);
-            await this.session.motion.clickSelector(selector, { label: `CLICK ${target}` });
-        }
-        else {
-            await this.session.motion.clickAt(target.x, target.y, { label: `CLICK (${target.x},${target.y})` });
+        const clickRes = typeof target === 'string'
+            ? await this.session.motion.clickSelector(resolveTargetSelector(target), {
+                label: `CLICK ${target}`,
+            })
+            : await this.session.motion.clickAt(target.x, target.y, {
+                label: `CLICK (${target.x},${target.y})`,
+            });
+        if (!clickRes.ok && clickRes.blocked === 'PLUGIN_UI_LAYER') {
+            const observation = await this.sampler.captureSnapshot('click_blocked');
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: clickRes.blocked,
+                at: clickRes.at,
+                hit: clickRes.hit,
+                hint: clickRes.hint,
+            });
+            return {
+                ok: false,
+                blocked: clickRes.blocked,
+                hit: clickRes.hit,
+                at: clickRes.at,
+                hint: clickRes.hint,
+                action: `Blocked click at (${Math.round(clickRes.at.x)},${Math.round(clickRes.at.y)}) by ${clickRes.blocked} (${clickRes.hit ?? 'overlay'})`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
         }
         if (waitMs > 0)
             await this.session.page.waitForTimeout(waitMs);
         const observation = await this.sampler.captureSnapshot('click');
         return {
+            ok: true,
             action: `Clicked ${typeof target === 'string' ? target : `(${target.x},${target.y})`}`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),
@@ -81,7 +102,29 @@ export class AtomicBrowserToolset {
     }
     async typeText(target, text, pressEnter = false) {
         const selector = resolveTargetSelector(target);
-        await this.session.motion.clickSelector(selector, { label: `FOCUS ${target}` });
+        const focusRes = await this.session.motion.clickSelector(selector, {
+            label: `FOCUS ${target}`,
+        });
+        if (!focusRes.ok && focusRes.blocked === 'PLUGIN_UI_LAYER') {
+            const observation = await this.sampler.captureSnapshot('type_blocked');
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: focusRes.blocked,
+                at: focusRes.at,
+                hit: focusRes.hit,
+                hint: focusRes.hint,
+            });
+            return {
+                ok: false,
+                blocked: focusRes.blocked,
+                hit: focusRes.hit,
+                at: focusRes.at,
+                hint: focusRes.hint,
+                action: `Blocked typeText focus at (${Math.round(focusRes.at.x)},${Math.round(focusRes.at.y)}) by ${focusRes.blocked} (${focusRes.hit ?? 'overlay'})`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
         await this.session.page.keyboard.type(text, { delay: 35 });
         if (pressEnter) {
             await this.session.page.keyboard.press('Enter');
@@ -89,6 +132,7 @@ export class AtomicBrowserToolset {
         await this.session.page.waitForTimeout(200);
         const observation = await this.sampler.captureSnapshot('type_text');
         return {
+            ok: true,
             action: `Typed "${text}" into ${target}`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),

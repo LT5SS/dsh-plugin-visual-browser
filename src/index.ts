@@ -1,7 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   defineTool,
   type ToolDefinition,
@@ -14,15 +16,18 @@ import type {
   BrowserWindowMode,
   TrailVariant,
   VirtualCursorPreset,
+  VirtualCursorShape,
   VirtualCursorStyleConfig,
 } from './driver/types.js';
 import { resolveBrowserWindowMode } from './driver/window-manager.js';
+import { resolveCursorStyle } from './injected/virtual-cursor.js';
 import { AtomicBrowserToolset } from './tools/atomic-tools.js';
 import {
   BrowserSubagentRunner,
   createBuiltinInspectorPlanner,
   createDshHostLlmPlanner,
   createOpenAIVisionPlanner,
+  summarizeDecisionAction,
   type PlannerStepDiagnostic,
   type SubagentPlanner,
 } from './subagent/runner.js';
@@ -49,7 +54,7 @@ export interface DshCordisContext {
   get?: (name: string) => any;
   inject?: (deps: string[] | Record<string, any>, callback: (ctx: any) => void) => any;
   effect?: (fn: () => (() => void) | void, label?: string) => any;
-  on?: (event: string, listener: (...args: any[]) => void) => void;
+  on?: (event: string, listener: (...args: any[]) => void) => (() => void) | void;
 }
 
 export interface OptionalHostServices {
@@ -65,13 +70,20 @@ export type PlannerMode =
   | 'external-vision-api-fallback'
   | 'builtin-inspector';
 
+export interface VolatileRef<T> {
+  get(): T;
+}
+
+export type MaybeVolatile<T> = T | VolatileRef<T>;
+
 export interface VisualBrowserPluginConfig {
   mode?: BrowserRuntimeMode;
   cdpEndpoint?: string;
   executablePath?: string;
-  windowMode?: BrowserWindowMode;
-  keepWindowOpen?: boolean;
-  showTakeoverControl?: boolean;
+  windowMode?: MaybeVolatile<BrowserWindowMode>;
+  keepWindowOpen?: MaybeVolatile<boolean>;
+  showTakeoverControl?: MaybeVolatile<boolean>;
+  takeoverHotkey?: MaybeVolatile<string>;
   windowBounds?: BrowserWindowBounds;
   backgroundSilent?: boolean;
   artifactDir?: string;
@@ -79,7 +91,7 @@ export interface VisualBrowserPluginConfig {
   maxRecentImages?: number;
   allowedOrigins?: string[];
   blockedOrigins?: string[];
-  cursorStyle?: VirtualCursorStyleConfig;
+  cursorStyle?: MaybeVolatile<VirtualCursorStyleConfig>;
   /** Optional explicit DSH host LLM provider/model route override */
   hostProvider?: string;
   hostModel?: string;
@@ -92,6 +104,153 @@ export interface VisualBrowserPluginConfig {
 
 export const name = 'dsh-plugin-visual-browser';
 export const inject = ['tools'];
+
+/**
+ * Unwraps a Cordis/Cosmokit Volatile<T> ref or returns plain values directly.
+ */
+export function readVolatileValue<T>(value: MaybeVolatile<T> | undefined): T | undefined {
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as any).get === 'function'
+  ) {
+    return (value as VolatileRef<T>).get();
+  }
+  return value as T | undefined;
+}
+
+async function loadSchemastery(): Promise<any | null> {
+  try {
+    const mod: any = await import('@deepseek-ai/schemastery');
+    return mod?.default ?? mod;
+  } catch {
+    try {
+      const req = createRequire(import.meta.url);
+      let toolsEntry: string | undefined;
+      const metaResolve = (import.meta as any).resolve;
+      if (typeof metaResolve === 'function') {
+        try {
+          const resolvedUrl = metaResolve.call(import.meta, '@deepseek-ai/dsh-tools');
+          if (typeof resolvedUrl === 'string' && resolvedUrl.startsWith('file:')) {
+            toolsEntry = fileURLToPath(resolvedUrl);
+          }
+        } catch {
+          // fall back to createRequire
+        }
+      }
+      if (!toolsEntry) {
+        toolsEntry = req.resolve('@deepseek-ai/dsh-tools');
+      }
+      const realToolsEntry = fs.realpathSync(toolsEntry);
+      const nestedReq = createRequire(realToolsEntry);
+      const schemaPath = nestedReq.resolve('@deepseek-ai/schemastery');
+      const mod: any = await import(pathToFileURL(schemaPath).href);
+      return mod?.default ?? mod;
+    } catch {
+      return null;
+    }
+  }
+}
+
+export function buildPluginConfigSchema(z: any) {
+  const cursorStyleSchema = z
+    .object({
+      preset: z
+        .union([
+          'cyber-neon',
+          'comet-gold',
+          'laser-dots',
+          'stealth-minimal',
+          'clean-none',
+          'custom',
+        ])
+        .default('cyber-neon')
+        .description('虚拟鼠标预设样式'),
+      pointerShape: z
+        .union(['arrow', 'crosshair', 'dot', 'star', 'ring', 'custom-svg', 'custom-image'])
+        .description('指针图形样式'),
+      pointerColor: z.string().description('指针填充颜色（Hex/CSS）'),
+      pointerBorderColor: z.string().description('指针描边颜色'),
+      pointerScale: z.number().min(0.4).max(3).description('指针缩放倍数（0.4 - 3.0）'),
+      customPointerSvgPath: z
+        .string()
+        .max(2000)
+        .description('自定义 SVG <path d="...">（28x28 viewBox）'),
+      customPointerImageUrl: z
+        .string()
+        .max(200000)
+        .description('自定义指针图片 URL 或 data:image Data URI'),
+      customPointerHotspotX: z.number().min(0).max(28).description('自定义指针热点 X（0 - 28）'),
+      customPointerHotspotY: z.number().min(0).max(28).description('自定义指针热点 Y（0 - 28）'),
+      trailVariant: z
+        .union(['dashed', 'solid', 'dots', 'comet', 'none'])
+        .description('拖尾渲染样式'),
+      trailColorStart: z.string().description('拖尾起点颜色'),
+      trailColorEnd: z.string().description('拖尾终点颜色'),
+      trailWidth: z.number().min(0).max(12).description('拖尾粗细（px）'),
+      trailLength: z.number().min(2).max(60).description('拖尾保留点数（2 - 60）'),
+      trailGlow: z.boolean().description('是否开启拖尾外发光'),
+      rippleColor: z.string().description('点击波纹颜色'),
+      showBadge: z.boolean().description('是否显示坐标与动作徽标'),
+      badgeTextPrefix: z.string().max(24).description('徽标前缀文本（默认 DSH）'),
+    })
+    .default({})
+    .description('虚拟鼠标与拖尾实时外观设置')
+    .volatile();
+
+  return z.object({
+    mode: z
+      .union(['auto', 'dsh-electron-webview', 'local-background', 'cdp-attach'])
+      .default('auto')
+      .description('浏览器连接运行模式'),
+    cdpEndpoint: z.string().description('可选 CDP 调试端点'),
+    executablePath: z.string().description('可选本地 Chrome/Edge 可执行文件路径'),
+    windowMode: z
+      .union(['visible-background', 'minimized', 'headless'])
+      .default('visible-background')
+      .description('窗口显示方式（visible-background 后台可见不抢焦点）')
+      .volatile(),
+    keepWindowOpen: z
+      .boolean()
+      .default(true)
+      .description('任务完成后保持单窗口打开并复用')
+      .volatile(),
+    showTakeoverControl: z
+      .boolean()
+      .default(true)
+      .description('在浏览器右上角显示状态条与接管提示')
+      .volatile(),
+    takeoverHotkey: z
+      .string()
+      .default('F8')
+      .description('随时触发人工暂停接管的全局快捷键')
+      .volatile(),
+    windowBounds: z
+      .object({
+        x: z.number(),
+        y: z.number(),
+        width: z.number(),
+        height: z.number(),
+      })
+      .description('可见后台窗口自定义坐标与尺寸'),
+    backgroundSilent: z.boolean().description('兼容旧版全静默开关'),
+    artifactDir: z.string().description('截图与诊断输出目录'),
+    maxSteps: z.number().min(1).max(60).default(12).description('默认最大执行步数'),
+    maxRecentImages: z.number().min(1).max(10).default(3).description('滑动上下文保留截图数'),
+    allowedOrigins: z.array(z.string()).description('允许访问的源白名单'),
+    blockedOrigins: z.array(z.string()).description('禁止访问的源黑名单'),
+    cursorStyle: cursorStyleSchema,
+    hostProvider: z.string().description('覆盖宿主 LLM Provider'),
+    hostModel: z.string().description('覆盖宿主 LLM Model'),
+    visionApiKey: z.string().description('外部 Vision API Key'),
+    visionBaseUrl: z.string().description('外部 Vision API Base URL'),
+    visionModel: z.string().description('外部 Vision API Model'),
+    customPlanner: z.any().description('程序化测试自定义规划器'),
+  });
+}
+
+const schemasteryRuntime = await loadSchemastery();
+export const Config = schemasteryRuntime ? buildPluginConfigSchema(schemasteryRuntime) : undefined;
 
 /**
  * Guarantees a canonical lossless JSON object with zero `undefined` members or non-plain prototypes,
@@ -373,6 +532,10 @@ function resolveSubagentPlanner(
   };
 }
 
+export interface LiveVisualBrowserSettingsBridge {
+  syncFromSettingsDocument: () => void;
+}
+
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */
@@ -380,7 +543,8 @@ export function createVisualBrowserTools(
   ctx: DshCordisContext,
   config: VisualBrowserPluginConfig = {},
   runner = new BrowserSubagentRunner(),
-  hostServices?: OptionalHostServices
+  hostServices?: OptionalHostServices,
+  bridgeOut?: { bridge?: LiveVisualBrowserSettingsBridge }
 ): ToolDefinition[] {
   const resolvedServices: OptionalHostServices = hostServices ?? {};
   if (!hostServices) {
@@ -388,10 +552,53 @@ export function createVisualBrowserTools(
   }
   const artifactRoot = resolveDefaultArtifactDir(config.artifactDir);
 
-  let activeCursorStyle: VirtualCursorStyleConfig = {
-    preset: 'cyber-neon',
-    ...(config.cursorStyle || {}),
+  let toolCursorOverride: VirtualCursorStyleConfig | null = null;
+
+  const getLiveCursorStyle = (): VirtualCursorStyleConfig => {
+    const baseCfg = readVolatileValue(config.cursorStyle) ?? {};
+    if (toolCursorOverride) {
+      return resolveCursorStyle({ ...baseCfg, ...toolCursorOverride });
+    }
+    return resolveCursorStyle({
+      preset: 'cyber-neon',
+      ...baseCfg,
+    });
   };
+
+  const getLiveWindowMode = (override?: BrowserWindowMode): BrowserWindowMode => {
+    return resolveBrowserWindowMode({
+      windowMode: override ?? readVolatileValue(config.windowMode),
+      backgroundSilent: config.backgroundSilent,
+    });
+  };
+
+  const getLiveKeepWindowOpen = (effectiveMode: BrowserWindowMode): boolean => {
+    return readVolatileValue(config.keepWindowOpen) ?? effectiveMode !== 'headless';
+  };
+
+  const getLiveShowTakeoverControl = (effectiveMode: BrowserWindowMode): boolean => {
+    return readVolatileValue(config.showTakeoverControl) ?? effectiveMode !== 'headless';
+  };
+
+  const getLiveTakeoverHotkey = (): string => {
+    const raw = readVolatileValue(config.takeoverHotkey);
+    return typeof raw === 'string' ? raw : 'F8';
+  };
+
+  if (bridgeOut) {
+    bridgeOut.bridge = {
+      syncFromSettingsDocument: () => {
+        toolCursorOverride = null;
+        const shared = runner.getSharedSession();
+        if (shared?.isAlive()) {
+          const nextStyle = getLiveCursorStyle();
+          const nextHotkey = getLiveTakeoverHotkey();
+          void shared.motion.setCursorStyle(nextStyle).catch(() => {});
+          void shared.motion.setTakeoverHotkey(nextHotkey).catch(() => {});
+        }
+      },
+    };
+  }
 
   // 1. browser_subagent_run
   const subagentRunTool = defineTool({
@@ -421,7 +628,14 @@ export function createVisualBrowserTools(
       cursor_preset: {
         type: 'string',
         description: 'Optional virtual cursor trail preset',
-        enum: ['cyber-neon', 'comet-gold', 'laser-dots', 'stealth-minimal', 'clean-none'] as const,
+        enum: [
+          'cyber-neon',
+          'comet-gold',
+          'laser-dots',
+          'stealth-minimal',
+          'clean-none',
+          'custom',
+        ] as const,
       },
       window_mode: {
         type: 'string',
@@ -450,9 +664,13 @@ export function createVisualBrowserTools(
       },
     },
     async execute(args, exec) {
+      const liveStyle = getLiveCursorStyle();
       const style: VirtualCursorStyleConfig = args.cursor_preset
-        ? { ...activeCursorStyle, preset: args.cursor_preset as VirtualCursorPreset }
-        : activeCursorStyle;
+        ? resolveCursorStyle({
+            ...liveStyle,
+            preset: args.cursor_preset as VirtualCursorPreset,
+          })
+        : liveStyle;
 
       const subagentId = `subagent-${crypto.randomUUID().slice(0, 8)}`;
       const { planner, tracker, effectiveServices } = resolveSubagentPlanner(
@@ -498,13 +716,10 @@ export function createVisualBrowserTools(
         }
       };
 
-      const effectiveWindowMode = resolveBrowserWindowMode({
-        windowMode: (args.window_mode as BrowserWindowMode | undefined) ?? config.windowMode,
-        backgroundSilent: config.backgroundSilent,
-      });
-      const keepWindowOpen = config.keepWindowOpen ?? effectiveWindowMode !== 'headless';
-      const showTakeoverControl =
-        config.showTakeoverControl ?? effectiveWindowMode !== 'headless';
+      const effectiveWindowMode = getLiveWindowMode(args.window_mode as BrowserWindowMode | undefined);
+      const keepWindowOpen = getLiveKeepWindowOpen(effectiveWindowMode);
+      const showTakeoverControl = getLiveShowTakeoverControl(effectiveWindowMode);
+      const takeoverHotkey = getLiveTakeoverHotkey();
 
       try {
         const res = await runner.runTask({
@@ -526,9 +741,35 @@ export function createVisualBrowserTools(
             windowMode: effectiveWindowMode,
             keepWindowOpen,
             showTakeoverControl,
+            takeoverHotkey,
             windowBounds: config.windowBounds,
             backgroundSilent: effectiveWindowMode === 'headless',
             cursorStyle: style,
+          },
+          onActionResult: (info) => {
+            const actionSummary: Record<string, unknown> = {
+              ...summarizeDecisionAction(info.decision),
+              ...(info.blocked ? { blocked: info.blocked } : {}),
+              ...(info.hit ? { hit: info.hit } : {}),
+              ...(info.at ? { at: info.at } : {}),
+            };
+            const existing = tracker.steps.find((s) => s.step === info.stepIndex);
+            if (existing) {
+              existing.action = actionSummary;
+            } else if (info.blocked) {
+              tracker.steps.push({
+                step: info.stepIndex,
+                backend:
+                  tracker.initialMode === 'external-vision-api'
+                    ? 'external-vision-api'
+                    : 'host-ctx-llm',
+                chunk_count: 0,
+                chunk_types: {},
+                text_length: 0,
+                decision_source: 'llm',
+                action: actionSummary,
+              });
+            }
           },
           planner,
         });
@@ -649,21 +890,49 @@ export function createVisualBrowserTools(
   const setCursorTrailTool = defineTool({
     name: 'browser_set_cursor_trail',
     description:
-      'Customize the virtual mouse cursor and motion trail style (choose from 5 presets or set custom colors, trail width, length, and variant).',
+      'Customize the virtual mouse cursor and motion trail style (choose from presets or custom shape, SVG path, custom image URL, colors, trail width, length, and variant).',
     parameters: {
       preset: {
         type: 'string',
         description: 'Preset name',
-        enum: ['cyber-neon', 'comet-gold', 'laser-dots', 'stealth-minimal', 'clean-none'] as const,
+        enum: [
+          'cyber-neon',
+          'comet-gold',
+          'laser-dots',
+          'stealth-minimal',
+          'clean-none',
+          'custom',
+        ] as const,
+      },
+      pointer_shape: {
+        type: 'string',
+        description: 'Cursor shape',
+        enum: ['arrow', 'crosshair', 'dot', 'star', 'ring', 'custom-svg', 'custom-image'] as const,
+      },
+      pointer_color: {
+        type: 'string',
+        description: 'Cursor fill color (hex/rgb)',
+      },
+      pointer_border_color: {
+        type: 'string',
+        description: 'Cursor stroke border color (hex/rgb)',
+      },
+      pointer_scale: {
+        type: 'number',
+        description: 'Cursor scale multiplier (0.4 - 3.0)',
+      },
+      custom_svg_path: {
+        type: 'string',
+        description: 'Custom SVG <path d="..."> string in a 28x28 coordinate box',
+      },
+      custom_image_url: {
+        type: 'string',
+        description: 'Custom cursor image URL (https/http) or data:image/... URI',
       },
       trail_variant: {
         type: 'string',
         description: 'Trail rendering style',
         enum: ['dashed', 'solid', 'dots', 'comet', 'none'] as const,
-      },
-      pointer_color: {
-        type: 'string',
-        description: 'Cursor arrow fill color (hex/rgb)',
       },
       trail_color_start: {
         type: 'string',
@@ -675,11 +944,27 @@ export function createVisualBrowserTools(
       },
       trail_width: {
         type: 'number',
-        description: 'Trail stroke width in px (1 - 10)',
+        description: 'Trail stroke width in px (0 - 12)',
       },
       trail_length: {
         type: 'integer',
         description: 'Number of trail history points (2 - 60)',
+      },
+      trail_glow: {
+        type: 'boolean',
+        description: 'Enable outer neon glow along the trail',
+      },
+      ripple_color: {
+        type: 'string',
+        description: 'Click ripple color',
+      },
+      show_badge: {
+        type: 'boolean',
+        description: 'Show floating coordinate badge next to the cursor',
+      },
+      badge_text_prefix: {
+        type: 'string',
+        description: 'Prefix text displayed inside the cursor badge (default: DSH)',
       },
     },
     output: {
@@ -695,19 +980,41 @@ export function createVisualBrowserTools(
       },
     },
     async execute(args) {
-      activeCursorStyle = {
-        ...activeCursorStyle,
+      const nextPatch: VirtualCursorStyleConfig = {
+        ...getLiveCursorStyle(),
         ...(args.preset ? { preset: args.preset as VirtualCursorPreset } : {}),
-        ...(args.trail_variant ? { trailVariant: args.trail_variant as TrailVariant } : {}),
+        ...(args.pointer_shape ? { pointerShape: args.pointer_shape as VirtualCursorShape } : {}),
         ...(args.pointer_color ? { pointerColor: String(args.pointer_color) } : {}),
+        ...(args.pointer_border_color
+          ? { pointerBorderColor: String(args.pointer_border_color) }
+          : {}),
+        ...(args.pointer_scale !== undefined ? { pointerScale: Number(args.pointer_scale) } : {}),
+        ...(args.custom_svg_path !== undefined
+          ? { customPointerSvgPath: String(args.custom_svg_path) }
+          : {}),
+        ...(args.custom_image_url !== undefined
+          ? { customPointerImageUrl: String(args.custom_image_url) }
+          : {}),
+        ...(args.trail_variant ? { trailVariant: args.trail_variant as TrailVariant } : {}),
         ...(args.trail_color_start ? { trailColorStart: String(args.trail_color_start) } : {}),
         ...(args.trail_color_end ? { trailColorEnd: String(args.trail_color_end) } : {}),
         ...(args.trail_width !== undefined ? { trailWidth: Number(args.trail_width) } : {}),
         ...(args.trail_length !== undefined ? { trailLength: Number(args.trail_length) } : {}),
+        ...(args.trail_glow !== undefined ? { trailGlow: Boolean(args.trail_glow) } : {}),
+        ...(args.ripple_color ? { rippleColor: String(args.ripple_color) } : {}),
+        ...(args.show_badge !== undefined ? { showBadge: Boolean(args.show_badge) } : {}),
+        ...(args.badge_text_prefix !== undefined
+          ? { badgeTextPrefix: String(args.badge_text_prefix) }
+          : {}),
       };
+      toolCursorOverride = resolveCursorStyle(nextPatch);
+      const shared = runner.getSharedSession();
+      if (shared?.isAlive()) {
+        await shared.motion.setCursorStyle(toolCursorOverride).catch(() => {});
+      }
       return toLosslessJson({
         updated: true,
-        active_cursor_style: activeCursorStyle,
+        active_cursor_style: toolCursorOverride,
       });
     },
   });
@@ -739,13 +1046,11 @@ export function createVisualBrowserTools(
     },
     async execute(args, exec) {
       exec?.signal?.throwIfAborted();
-      const effectiveWindowMode = resolveBrowserWindowMode({
-        windowMode: config.windowMode,
-        backgroundSilent: config.backgroundSilent,
-      });
-      const keepWindowOpen = config.keepWindowOpen ?? effectiveWindowMode !== 'headless';
-      const showTakeoverControl =
-        config.showTakeoverControl ?? effectiveWindowMode !== 'headless';
+      const effectiveWindowMode = getLiveWindowMode();
+      const keepWindowOpen = getLiveKeepWindowOpen(effectiveWindowMode);
+      const showTakeoverControl = getLiveShowTakeoverControl(effectiveWindowMode);
+      const takeoverHotkey = getLiveTakeoverHotkey();
+      const liveCursorStyle = getLiveCursorStyle();
 
       const useShared = keepWindowOpen && !runner.isSharedSessionBusy();
       const acquired = useShared
@@ -757,9 +1062,10 @@ export function createVisualBrowserTools(
               windowMode: effectiveWindowMode,
               keepWindowOpen: true,
               showTakeoverControl,
+              takeoverHotkey,
               windowBounds: config.windowBounds,
               backgroundSilent: effectiveWindowMode === 'headless',
-              cursorStyle: activeCursorStyle,
+              cursorStyle: liveCursorStyle,
             },
             true
           )
@@ -770,11 +1076,12 @@ export function createVisualBrowserTools(
               executablePath: config.executablePath,
               windowMode: runner.isSharedSessionBusy() ? 'headless' : effectiveWindowMode,
               showTakeoverControl: runner.isSharedSessionBusy() ? false : showTakeoverControl,
+              takeoverHotkey,
               windowBounds: config.windowBounds,
               backgroundSilent: runner.isSharedSessionBusy()
                 ? true
                 : effectiveWindowMode === 'headless',
-              cursorStyle: activeCursorStyle,
+              cursorStyle: liveCursorStyle,
             }).start(),
             isShared: false,
             reused: false,
@@ -828,14 +1135,26 @@ export function apply(ctx: DshCordisContext, config: VisualBrowserPluginConfig =
   const runner = new BrowserSubagentRunner();
   const hostServices: OptionalHostServices = {};
   bindOptionalHostServices(ctx, hostServices);
-  const tools = createVisualBrowserTools(ctx, config, runner, hostServices);
+  const bridgeHolder: { bridge?: LiveVisualBrowserSettingsBridge } = {};
+  const tools = createVisualBrowserTools(ctx, config, runner, hostServices, bridgeHolder);
 
   for (const tool of tools) {
     ctx.tools.register(tool);
   }
 
+  const unsubSettings = safeRead(() =>
+    ctx.on?.('settings/document-updated', (ns?: string) => {
+      if (!ns || ns === 'dsh-plugin-visual-browser') {
+        bridgeHolder.bridge?.syncFromSettingsDocument();
+      }
+    })
+  );
+
   // Standard Cordis 4.x disposal hook via ctx.effect(() => disposer)
   const disposeAll = () => {
+    if (typeof unsubSettings === 'function') {
+      unsubSettings();
+    }
     void runner.closeAllSessions();
   };
   if (typeof ctx.effect === 'function') {
@@ -844,5 +1163,5 @@ export function apply(ctx: DshCordisContext, config: VisualBrowserPluginConfig =
     ctx.on?.('dispose', disposeAll);
   }
 
-  return { runner, tools, hostServices };
+  return { runner, tools, hostServices, bridge: bridgeHolder.bridge };
 }

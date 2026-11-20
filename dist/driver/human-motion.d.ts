@@ -1,5 +1,5 @@
 import type { Page } from 'playwright-core';
-import type { MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
+import type { ClickActionResult, ClickHitTestResult, MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
 export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
 export declare class HumanMotionController {
     private page;
@@ -8,13 +8,16 @@ export declare class HumanMotionController {
     private showTakeoverControl;
     private shouldAbort?;
     private takeoverRole;
+    private takeoverHotkey;
     constructor(page: Page, initialStyle?: VirtualCursorStyleConfig, opts?: {
         showTakeoverControl?: boolean;
+        takeoverHotkey?: string;
         shouldAbort?: () => boolean;
     });
     getPosition(): Point2D;
     getCursorStyle(): VirtualCursorStyleConfig;
     ensureCursorHUD(): Promise<void>;
+    setTakeoverHotkey(hotkey: string): Promise<void>;
     setTakeoverState(mode: TakeoverControlMode, roleLabel?: string): Promise<void>;
     resetTakeoverRequest(): Promise<void>;
     /**
@@ -28,8 +31,13 @@ export declare class HumanMotionController {
     moveTo(targetX: number, targetY: number, opts?: MotionOptions): Promise<Point2D>;
     sweepPath(waypoints: Point2D[], opts?: MotionOptions): Promise<Point2D>;
     hoverSelector(selector: string, opts?: MotionOptions): Promise<Point2D>;
-    clickAt(x: number, y: number, opts?: MotionOptions): Promise<Point2D>;
-    clickSelector(selector: string, opts?: MotionOptions): Promise<Point2D>;
+    /**
+     * Performs a Top-Layer-aware hit test at `(x, y)` before dispatching any real mouse click,
+     * penetrating open Shadow DOM roots and same-origin iframes.
+     */
+    hitTestAt(x: number, y: number): Promise<ClickHitTestResult>;
+    clickAt(x: number, y: number, opts?: MotionOptions): Promise<ClickActionResult>;
+    clickSelector(selector: string, opts?: MotionOptions): Promise<ClickActionResult>;
     smoothScroll(deltaY: number, frames?: number, durationMs?: number): Promise<void>;
     private syncHUD;
 }

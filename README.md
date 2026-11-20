@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.2.0 — Visible Background Window & Live Takeover Release)
+# `dsh-plugin-visual-browser` (v1.2.2 — Top-Layer Hit-Test Isolation, Live Takeover & DSH Settings UI)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -15,10 +15,12 @@
 2. **双模自适应 + 可见后台不抢焦点窗口（`visible-background`）**
    - **DSH Electron 桌面端模式**：检测到 `DSH_WEBVIEW_CDP_URL` 时自动挂载右侧边栏内置 `<webview>`；
    - **本地 Chrome/Edge 可见后台模式（默认 `windowMode: 'visible-background'`）**：基于 `playwright-core` 自动探测本机已安装的 **Google Chrome** 或 **Microsoft Edge**，在 Windows 上通过 Win32 `SW_SHOWMINNOACTIVE` → `SW_SHOWNOACTIVATE` + `SetWindowPos` 将窗口平铺在屏幕右半边并置于当前前景窗口之后——**用户全程可见 AI 操作且不会突然弹到最顶层抢占焦点**；同时支持持久化单窗口复用（`keepWindowOpen: true`）、页内右上角 **「⏸ 暂停并接管」** 悬浮按钮随时接管，或切换为 `minimized` / `headless`（`backgroundSilent: true`）静默模式。
-3. **物理轨迹虚拟鼠标 + 自定义拖尾样式**
+3. **物理轨迹虚拟鼠标 + DSH 原生可视化设置页（预设 / 自定义指针 & 拖尾）**
    - 三次贝塞尔弧线（Cubic Bezier）+ Ease-In-Out 速度曲线步进器，派发连续真实的 `pointermove` / `wheel` 事件；
-   - 支持 **5 套内置预设**（`cyber-neon`、`comet-gold`、`laser-dots`、`stealth-minimal`、`clean-none`）以及任意自定义颜色、粗细、长度与形态（`dashed`、`solid`、`comet`、`dots`、`none`）；
-   - 采用 Chromium `popover="manual"` Top-Layer 技术，即使网页弹出原生 `<dialog>` 模态框，虚拟鼠标和拖尾也始终浮在最顶层。
+   - 支持 **5 套内置预设**（`cyber-neon`、`comet-gold`、`laser-dots`、`stealth-minimal`、`clean-none`）+ `custom`，以及 **7 种指针造型**（`arrow`、`crosshair`、`dot`、`star`、`ring`、`custom-svg` 自定义路径、`custom-image` 上传本地图标或图片 URL + 热点偏移）；
+   - 通过 `dsh.client` 与 live `.volatile()` Schema 在 DSH **设置 → 视觉浏览器**（以及 **插件 → dsh-plugin-visual-browser** 详情页）提供实时交互预览画布与全部参数调色板，保存后即时热更新到打开的共享浏览器窗口；
+   - 采用 Chromium `popover="manual"` Top-Layer 与 **点击前 `elementsFromPoint` 穿透层级命中测试**（穿透 Shadow DOM 与同源 iframe）：运行期右上角接管提示条默认 `pointer-events: none` 不挡下方 `Menu` 等站点元素；一旦任意点击落点命中处于顶层且可交互的插件 UI，立即拒绝派发真实 `mouse.click` 并返回 `{ ok: false, blocked: 'PLUGIN_UI_LAYER', hit }` 记录入 `diagnostics.json`；默认支持按 `F8`（可在设置自定义热键）随时触发人工接管。
+   - 支持 `?__dsh_test_center_pill=1` 测试开关，可将插件状态条临时居中用于验证 Top-Layer 遮挡拒点行为。
 4. **独立 Browser Subagent 循环 + 截图滑动窗口（省 80%+ 视觉 Token）**
    - 子循环内部默认只保留最近 3 张高清截图，旧步骤自动压缩为单行文字轨迹，不污染主 Agent 上下文；
    - 宿主代码强制生成不可伪造的 `[BROWSER_HOST_FACTS]` 校验头；
@@ -48,7 +50,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.2.0+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.2.2+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）
@@ -98,5 +100,5 @@ dsh --patch ./cordis.yml --profile web
 | :--- | :--- |
 | `browser_subagent_run` | 启动独立视觉浏览器子代理执行多步网页走查/交互（默认复用右侧可见后台窗口，支持 `window_mode` 覆写及页面右上角「暂停并接管」即时暂停），返回报告、`[BROWSER_HOST_FACTS]` 及最新截图附件 |
 | `browser_subagent_resume` | 在用户手动点击「暂停并接管」或完成登录、支付、验证码接管后，在原窗口原标签页恢复已挂起（`PAUSED_FOR_TAKEOVER`）的子代理会话 |
-| `browser_set_cursor_trail` | 实时切换虚拟鼠标与拖尾预设（`cyber-neon` / `comet-gold` / `laser-dots` / `stealth-minimal` / `clean-none`）或自定义颜色/粗细/长度 |
+| `browser_set_cursor_trail` | 实时切换虚拟鼠标预设（`cyber-neon` / `comet-gold` / `laser-dots` / `stealth-minimal` / `clean-none` / `custom`）、指针造型/自定义 SVG 或图片、拖尾光效及配色，并同步更新共享窗口 |
 | `browser_quick_snapshot` | 对指定 URL 进行单次“视觉截图 + `#ref` 控件树 + 控制台健康度”快照（空闲时复用可见后台窗口，否则静默执行），并通过 `ctx.attachments` 返回 `ImageBlock` 让主模型直接看图 |

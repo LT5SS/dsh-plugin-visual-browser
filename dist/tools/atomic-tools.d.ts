@@ -21,6 +21,11 @@ export interface AtomicToolResult {
     action: string;
     observation: PageObservation;
     llmSummary: string;
+    ok?: boolean;
+    blocked?: 'PLUGIN_UI_LAYER';
+    hit?: string;
+    at?: Point2D;
+    hint?: string;
     extraData?: unknown;
 }
 /**
