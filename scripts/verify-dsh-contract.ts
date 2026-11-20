@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import {
   assertObjectJsonSchema,
@@ -10,7 +10,12 @@ import {
   validateJsonSchemaValue,
   type ToolDefinition,
 } from '@deepseek-ai/dsh-tools';
-import { apply, type DshCordisContext } from '../src/index.js';
+import {
+  apply,
+  parseJsonDecision,
+  resolvePlannerMode,
+  type DshCordisContext,
+} from '../src/index.js';
 
 const MIME_MAP: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -52,6 +57,101 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
   });
 }
 
+function createStrictScopedProxy(
+  target: Record<string, any>,
+  allowedKeys: readonly string[]
+): any {
+  const allowed = new Set(allowedKeys);
+  return new Proxy(target, {
+    get(obj, key) {
+      if (allowed.has(String(key))) {
+        return obj[String(key)];
+      }
+      throw new Error(`cannot get property "${String(key)}" without inject`);
+    },
+  });
+}
+
+function createAttachmentsStub() {
+  return {
+    async saveImage(input: { data: Uint8Array; mediaType: string; name?: string }) {
+      const hash = crypto.createHash('sha256').update(input.data).digest('hex');
+      return {
+        attachmentId: `sha256:${hash}`,
+        mediaType: 'image/png',
+        bytes: input.data.byteLength,
+        width: 1440,
+        height: 900,
+        ...(input.name ? { name: input.name } : {}),
+      };
+    },
+  };
+}
+
+function createCordisStrictCtx(opts: {
+  services?: Record<string, any>;
+  validateSchemas?: boolean;
+  deferInject?: boolean;
+}) {
+  const registeredTools = new Map<string, ToolDefinition>();
+  const effectDisposers: Array<() => void> = [];
+  const pendingInjects: Array<{ deps: string[]; cb: (sub: any) => void }> = [];
+
+  const register = (definition: ToolDefinition) => {
+    if (opts.validateSchemas) {
+      const name = definition.name;
+      const output = definition.output;
+      if (
+        output === undefined ||
+        typeof output !== 'object' ||
+        typeof output.render !== 'function' ||
+        (output.presentationMeta !== undefined && typeof output.presentationMeta !== 'function')
+      ) {
+        throw new TypeError(`tool "${name}" must declare output { schema, render, presentationMeta? }`);
+      }
+      assertObjectJsonSchema(definition.parameters);
+      assertSupportedJsonSchema(output.schema);
+      const projected = projectToolSchema(definition, true);
+      assertObjectJsonSchema(projected.parameters);
+      console.log(`[Strict DSH 0.2 Contract] Verified & registered tool: ${name}`);
+    }
+    registeredTools.set(definition.name, definition);
+    return () => registeredTools.delete(definition.name);
+  };
+
+  const effect = (fn: () => (() => void) | void) => {
+    const disposer = fn();
+    if (typeof disposer === 'function') effectDisposers.push(disposer);
+    return disposer;
+  };
+
+  const inject = (deps: string[] | Record<string, any>, cb: (sub: any) => void) => {
+    const depList = Array.isArray(deps) ? deps : Object.keys(deps);
+    if (opts.deferInject) {
+      pendingInjects.push({ deps: depList, cb });
+      return;
+    }
+    if (opts.services && depList.every((d) => opts.services![d] !== undefined)) {
+      const subTarget: Record<string, any> = { effect };
+      for (const dep of depList) subTarget[dep] = opts.services[dep];
+      cb(createStrictScopedProxy(subTarget, [...depList, 'effect']));
+    }
+  };
+
+  const ctx = createStrictScopedProxy(
+    {
+      tools: { register },
+      effect,
+      on() {},
+      get: () => undefined,
+      inject,
+    },
+    ['tools', 'effect', 'on', 'get', 'inject']
+  ) as DshCordisContext;
+
+  return { ctx, registeredTools, effectDisposers, pendingInjects };
+}
+
 async function main() {
   // 0. Verify package.json dsh.bundle.patch manifest contract (guards against P0-1 regression)
   const pkgRoot = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser');
@@ -73,127 +173,186 @@ async function main() {
   }
   console.log('[Strict DSH 0.2 Contract] Verified package.json dsh.bundle.patch & peerDependencies!');
 
-  // 0b. Cordis 4.x restricted-ctx regression checks (must survive bare & hostile uninjected getters)
+  // 0b. Cordis 4.x restricted-ctx negative regression checks (bare + hostile + no-inject fallback)
   const bareTools: ToolDefinition[] = [];
   const bareCtx = {
     tools: { register: (t: ToolDefinition) => bareTools.push(t) },
     effect: (fn: () => void) => fn(),
     on() {},
     get: () => undefined,
+    inject: () => {},
   };
+  let bareRes!: ReturnType<typeof apply>;
   assert.doesNotThrow(
-    () => apply(bareCtx as any, {}),
+    () => {
+      bareRes = apply(bareCtx as any, {});
+    },
     'apply() must survive a ctx without optional services'
   );
   assert.equal(bareTools.length, 4, 'bareCtx must register all 4 tools');
+  assert.equal(bareRes.hostServices.llm, undefined);
+  assert.equal(bareRes.hostServices.attachments, undefined);
 
-  const hostileTools: ToolDefinition[] = [];
-  const hostileBase = {
-    tools: { register: (t: ToolDefinition) => hostileTools.push(t) },
-    effect: (fn: () => void) => fn(),
-    on() {},
-    get: (name: string) => {
-      throw new Error(`cannot get service "${name}" without inject`);
-    },
-  };
-  const hostileCtx = new Proxy(hostileBase, {
-    get(target, key) {
-      if (['tools', 'effect', 'on', 'get'].includes(String(key))) {
-        return (target as any)[key];
-      }
-      throw new Error(`cannot get property "${String(key)}" without inject`);
-    },
-  });
+  const hostile = createCordisStrictCtx({ validateSchemas: false });
+  let hostileRes!: ReturnType<typeof apply>;
   assert.doesNotThrow(
-    () => apply(hostileCtx as any, {}),
-    'apply() must not read services it did not inject'
+    () => {
+      hostileRes = apply(hostile.ctx, {});
+    },
+    'apply() must not read uninjected services directly on Cordis 4.x ctx'
   );
-  assert.equal(hostileTools.length, 4, 'hostileCtx must register all 4 tools');
-  console.log('[Strict DSH 0.2 Contract] Verified bareCtx & hostileCtx apply() guards (4/4 tools registered)!');
+  assert.equal(hostile.registeredTools.size, 4, 'hostileCtx must register all 4 tools');
+  assert.equal(resolvePlannerMode({}, hostileRes.hostServices), 'builtin-inspector');
 
+  const noInjectTools: ToolDefinition[] = [];
+  const hostileCtxNoInject = createStrictScopedProxy(
+    {
+      tools: { register: (t: ToolDefinition) => noInjectTools.push(t) },
+      effect: (fn: () => void) => fn(),
+      on() {},
+      get: () => undefined,
+    },
+    ['tools', 'effect', 'on', 'get']
+  );
+  assert.doesNotThrow(
+    () => apply(hostileCtxNoInject as any, {}),
+    'apply() fallback without ctx.inject must also survive hostile getters'
+  );
+  assert.equal(noInjectTools.length, 4, 'hostileCtxNoInject must register all 4 tools');
+  console.log('[Strict DSH 0.2 Contract] Verified bareCtx, hostileCtx & hostileCtxNoInject guards (4/4 tools)!');
+
+  // 0c. Pure unit checks for parseJsonDecision() and resolvePlannerMode()
+  assert.equal(parseJsonDecision(''), null);
+  assert.equal(parseJsonDecision('not json at all'), null);
+  assert.equal(parseJsonDecision('{}'), null);
+  assert.equal(parseJsonDecision('{"type":"click"}'), null);
+  const parsedAction = parseJsonDecision('```json\n{"type":"click","target":"#1","reason":"test"}\n```');
+  assert.deepEqual(parsedAction, { type: 'click', target: '#1', reason: 'test' });
+
+  const prevVisionKey = process.env.DSH_VISION_API_KEY;
+  try {
+    delete process.env.DSH_VISION_API_KEY;
+    const llmStub = { stream: () => {} };
+    assert.equal(
+      resolvePlannerMode({ customPlanner: async () => ({ type: 'scroll', deltaY: 100, reason: 'x' }) }, { llm: llmStub }),
+      'custom'
+    );
+    assert.equal(
+      resolvePlannerMode({ hostProvider: 'deepseek', hostModel: 'deepseek-chat' }, { llm: llmStub }),
+      'host-ctx-llm'
+    );
+    assert.equal(
+      resolvePlannerMode({}, { llm: llmStub }, {
+        agent: { model: { current: () => ({ provider: 'opencode-go', model: 'deepseek-v4.1-flash' }) } },
+      } as any),
+      'host-ctx-llm'
+    );
+    assert.equal(
+      resolvePlannerMode({}, { llm: llmStub }, {
+        agent: { session: { requestHeader: () => ({ config: { provider: 'deepseek', model: 'deepseek-reasoner' } }) } },
+      } as any),
+      'host-ctx-llm'
+    );
+    assert.equal(resolvePlannerMode({ visionApiKey: 'sk-test' }, {}), 'external-vision-api');
+    assert.equal(resolvePlannerMode({}, {}), 'builtin-inspector');
+    assert.equal(resolvePlannerMode({}, { llm: llmStub }), 'builtin-inspector');
+  } finally {
+    if (prevVisionKey !== undefined) process.env.DSH_VISION_API_KEY = prevVisionKey;
+    else delete process.env.DSH_VISION_API_KEY;
+  }
+  console.log('[Strict DSH 0.2 Contract] Verified parseJsonDecision() & resolvePlannerMode() unit checks!');
+
+  // 0d. Async secondary ctx.inject late-binding + child-fiber effect disposal check
+  const asyncHost = createCordisStrictCtx({ validateSchemas: false, deferInject: true });
+  const asyncCfg = { hostProvider: 'deepseek', hostModel: 'deepseek-chat' };
+  const asyncRes = apply(asyncHost.ctx, asyncCfg);
+  assert.equal(asyncRes.hostServices.llm, undefined);
+  assert.equal(asyncRes.hostServices.attachments, undefined);
+  assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'builtin-inspector');
+  assert.equal(asyncHost.pendingInjects.length, 2, 'apply() must register 2 independent ctx.inject child fibers');
+
+  const lateLlmStub = { stream: () => {} };
+  const lateAttachmentsStub = createAttachmentsStub();
+  let llmChildDisposer: (() => void) | undefined;
+
+  for (const entry of asyncHost.pendingInjects) {
+    if (entry.deps.includes('llm')) {
+      const subProxy = createStrictScopedProxy(
+        {
+          llm: lateLlmStub,
+          effect: (fn: () => (() => void) | void) => {
+            const d = fn();
+            if (typeof d === 'function') llmChildDisposer = d;
+            return d;
+          },
+        },
+        ['llm', 'effect']
+      );
+      entry.cb(subProxy);
+    } else if (entry.deps.includes('attachments')) {
+      const subProxy = createStrictScopedProxy(
+        {
+          attachments: lateAttachmentsStub,
+          effect: () => {},
+        },
+        ['attachments', 'effect']
+      );
+      entry.cb(subProxy);
+    }
+  }
+
+  assert.equal(asyncRes.hostServices.llm, lateLlmStub);
+  assert.equal(asyncRes.hostServices.attachments, lateAttachmentsStub);
+  assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'host-ctx-llm');
+  assert.ok(llmChildDisposer, 'llm secondary child fiber must register an unbind effect disposer');
+  llmChildDisposer!();
+  assert.equal(asyncRes.hostServices.llm, undefined);
+  assert.equal(resolvePlannerMode(asyncCfg, asyncRes.hostServices), 'builtin-inspector');
+  console.log('[Strict DSH 0.2 Contract] Verified async ctx.inject late-binding & child-fiber unbind!');
+
+  // Checks 1-5: End-to-end tool execution with headless Chromium & local static server
   const distDir = path.resolve('E:/AI_Work/Antigravity/aw-argon-edition/dist');
   const artifactDir = path.resolve('E:/AI_Work/Antigravity/dsh-plugin-visual-browser/artifacts/contract-test');
   fs.mkdirSync(artifactDir, { recursive: true });
 
   const srv = await startSilentStaticServer(distDir);
-
-  const registeredTools = new Map<string, ToolDefinition>();
-  const effectDisposers: Array<() => void> = [];
   let hostLlmCalls = 0;
 
-  // Authentic DSH 0.2.x ToolsService.register contract check + ctx.llm + ctx.attachments + ctx.effect
-  const strictDshCtx: DshCordisContext = {
-    tools: {
-      register(definition: ToolDefinition) {
-        const name = definition.name;
-        const output = definition.output;
-        if (
-          output === undefined ||
-          typeof output !== 'object' ||
-          typeof output.render !== 'function' ||
-          (output.presentationMeta !== undefined && typeof output.presentationMeta !== 'function')
-        ) {
-          throw new TypeError(`tool "${name}" must declare output { schema, render, presentationMeta? }`);
-        }
-        // Official @deepseek-ai/dsh-tools schema checks:
-        assertObjectJsonSchema(definition.parameters);
-        assertSupportedJsonSchema(output.schema);
-        const projected = projectToolSchema(definition, true);
-        assertObjectJsonSchema(projected.parameters);
+  const strictHost = createCordisStrictCtx({
+    validateSchemas: true,
+    services: {
+      attachments: createAttachmentsStub(),
+      llm: {
+        async *stream(_options: any) {
+          hostLlmCalls++;
+          if (hostLlmCalls === 1) {
+            yield {
+              type: 'text-delta',
+              text: JSON.stringify({
+                type: 'move_mouse',
+                points: [
+                  { x: 320, y: 440 },
+                  { x: 860, y: 420 },
+                ],
+                label: 'HOST-LLM SWEEP',
+                reason: 'Driven by native DSH ctx.llm stream (text payload)',
+              }),
+            };
+          } else {
+            yield {
+              type: 'text-delta',
+              delta: JSON.stringify({
+                type: 'complete',
+                report: 'COMPLETED / TASK_COMPLETED\n\nVerified native ctx.llm + ctx.attachments integration!',
+              }),
+            };
+          }
+        },
+      },
+    },
+  });
 
-        registeredTools.set(name, definition);
-        console.log(`[Strict DSH 0.2 Contract] Verified & registered tool: ${name}`);
-        return () => registeredTools.delete(name);
-      },
-    },
-    attachments: {
-      async saveImage(input: { data: Uint8Array; mediaType: string; name?: string }) {
-        const hash = crypto.createHash('sha256').update(input.data).digest('hex');
-        return {
-          attachmentId: `sha256:${hash}`,
-          mediaType: 'image/png',
-          bytes: input.data.byteLength,
-          width: 1440,
-          height: 900,
-          ...(input.name ? { name: input.name } : {}),
-        };
-      },
-    },
-    llm: {
-      async *stream(_options: any) {
-        hostLlmCalls++;
-        if (hostLlmCalls === 1) {
-          yield {
-            type: 'text-delta',
-            delta: JSON.stringify({
-              type: 'move_mouse',
-              points: [
-                { x: 320, y: 440 },
-                { x: 860, y: 420 },
-              ],
-              label: 'HOST-LLM SWEEP',
-              reason: 'Driven by native DSH ctx.llm stream',
-            }),
-          };
-        } else {
-          yield {
-            type: 'text-delta',
-            delta: JSON.stringify({
-              type: 'complete',
-              report: 'COMPLETED / TASK_COMPLETED\n\nVerified native ctx.llm + ctx.attachments integration!',
-            }),
-          };
-        }
-      },
-    },
-    effect(fn) {
-      const disposer = fn();
-      if (typeof disposer === 'function') effectDisposers.push(disposer);
-      return disposer;
-    },
-  };
-
-  apply(strictDshCtx, {
+  apply(strictHost.ctx, {
     mode: 'auto',
     backgroundSilent: true,
     artifactDir,
@@ -201,12 +360,14 @@ async function main() {
     hostModel: 'deepseek-chat',
   });
 
-  if (registeredTools.size !== 4) {
-    throw new Error(`Expected 4 tools registered, got ${registeredTools.size}`);
+  if (strictHost.registeredTools.size !== 4) {
+    throw new Error(`Expected 4 tools registered, got ${strictHost.registeredTools.size}`);
   }
-  if (effectDisposers.length === 0) {
+  if (strictHost.effectDisposers.length === 0) {
     throw new Error('Expected ctx.effect(() => disposer) to be registered');
   }
+
+  const allDisposers = [...strictHost.effectDisposers, ...hostile.effectDisposers];
 
   try {
     const controller = new AbortController();
@@ -221,15 +382,15 @@ async function main() {
     };
 
     // 1. Verify browser_set_cursor_trail
-    const trailDef = registeredTools.get('browser_set_cursor_trail')!;
+    const trailDef = strictHost.registeredTools.get('browser_set_cursor_trail')!;
     const trailVal = await trailDef.execute({ preset: 'comet-gold', trail_width: 4 }, fakeExec);
     const trailViolations = validateJsonSchemaValue(trailDef.output.schema, trailVal);
     if (trailViolations.length > 0) {
       throw new Error(`browser_set_cursor_trail output violations: ${trailViolations.join('; ')}`);
     }
 
-    // 2. Verify browser_quick_snapshot + ctx.attachments ImageBlock rendering
-    const snapDef = registeredTools.get('browser_quick_snapshot')!;
+    // 2. Verify browser_quick_snapshot + ctx.inject(['attachments']) ImageBlock rendering
+    const snapDef = strictHost.registeredTools.get('browser_quick_snapshot')!;
     const snapVal: any = await snapDef.execute({ url: srv.url }, fakeExec);
     const snapViolations = validateJsonSchemaValue(snapDef.output.schema, snapVal);
     if (snapViolations.length > 0) {
@@ -242,8 +403,8 @@ async function main() {
       throw new Error('Expected browser_quick_snapshot output.render to include an image ContentBlock from ctx.attachments');
     }
 
-    // 3. Verify browser_subagent_run using native ctx.llm + ctx.attachments
-    const runDef = registeredTools.get('browser_subagent_run')!;
+    // 3. Verify browser_subagent_run using Cordis-injected ctx.llm + ctx.attachments
+    const runDef = strictHost.registeredTools.get('browser_subagent_run')!;
     const runVal: any = await runDef.execute(
       {
         url: srv.url,
@@ -259,18 +420,126 @@ async function main() {
     }
     const runBlocks = runDef.output.render({}, runVal);
     console.log(`[Strict DSH 0.2 Contract] browser_subagent_run (hostLlmCalls=${hostLlmCalls}, planner_mode=${runVal.planner_mode}) rendered blocks: ${runBlocks.map((b: any) => b.type).join(', ')}`);
-    assert.equal(runVal.planner_mode, 'host-ctx-llm', 'Expected planner_mode to be host-ctx-llm when ctx.llm is provided');
+    assert.equal(runVal.planner_mode, 'host-ctx-llm', 'Expected planner_mode to be host-ctx-llm when ctx.llm is injected');
+    assert.equal(runVal.host_services?.llm, true);
+    assert.equal(runVal.host_services?.attachments, true);
+    assert.equal(runVal.planner_detail?.fallback_count, 0);
 
-    // 4. Execute browser_quick_snapshot on hostileCtx to verify getAttachmentsService does not throw during execute()
-    const hostileSnapDef = hostileTools.find((t) => t.name === 'browser_quick_snapshot')!;
+    // 4. Execute browser_quick_snapshot on hostileCtx to verify zero throw on uninjected attachments
+    const hostileSnapDef = hostile.registeredTools.get('browser_quick_snapshot')!;
     const hostileSnapVal: any = await hostileSnapDef.execute({ url: srv.url }, fakeExec);
     const hostileSnapViolations = validateJsonSchemaValue(hostileSnapDef.output.schema, hostileSnapVal);
     assert.equal(hostileSnapViolations.length, 0, `hostileCtx snapshot output violations: ${hostileSnapViolations.join('; ')}`);
     console.log('[Strict DSH 0.2 Contract] Verified browser_quick_snapshot on hostileCtx (no throw on uninjected attachments)!');
 
-    console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS (P0 + P1 + P2) PASSED!');
+    // 5a. Issue #4 repro: empty llm.stream() + exec.agent.model.current() falls back to builtin inspector cleanly
+    const emptyLlmTools = new Map<string, ToolDefinition>();
+    const emptyLlmCtx = {
+      tools: { register: (t: ToolDefinition) => emptyLlmTools.set(t.name, t) },
+      effect: (fn: () => (() => void) | void) => {
+        const d = fn();
+        if (typeof d === 'function') allDisposers.push(d);
+        return d;
+      },
+      on() {},
+      get: (name: string) =>
+        name === 'llm' ? { stream: () => (async function* () {})() } : undefined,
+    };
+    apply(emptyLlmCtx as any, { mode: 'auto', backgroundSilent: true, artifactDir });
+    const emptyRunDef = emptyLlmTools.get('browser_subagent_run')!;
+    const emptyExec = {
+      ...fakeExec,
+      agent: { model: { current: () => ({ provider: 'opencode-go', model: 'deepseek-v4.1-flash' }) } },
+    };
+    const emptyRunVal: any = await emptyRunDef.execute(
+      { url: srv.url, role: 'QA', task_prompt: 'Verify title without crashing on empty stream', max_steps: 1 },
+      emptyExec
+    );
+    assert.equal(validateJsonSchemaValue(emptyRunDef.output.schema, emptyRunVal).length, 0);
+    assert.equal(emptyRunVal.status, 'COMPLETED');
+    assert.equal(emptyRunVal.planner_mode, 'host-ctx-llm-fallback');
+    assert.equal(emptyRunVal.planner_detail?.last_fallback_reason, 'EMPTY_STREAM');
+    assert.ok((emptyRunVal.planner_detail?.fallback_count ?? 0) >= 1);
+    console.log('[Strict DSH 0.2 Contract] 5a Verified empty llm.stream() graceful fallback (EMPTY_STREAM)!');
+
+    // 5b. Issue #4 regression: error chunk on image attachment triggers automatic text-only retry
+    const retryHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream(options: any) {
+            const content: any[] = options?.messages?.[0]?.content ?? [];
+            const hasImage = content.some((b) => b?.type === 'image');
+            if (hasImage) {
+              yield { type: 'error', error: 'image input not supported' };
+              return;
+            }
+            yield {
+              type: 'text-delta',
+              text: JSON.stringify({
+                type: 'complete',
+                report: 'COMPLETED / TEXT_ONLY_RETRY_OK',
+              }),
+            };
+          },
+        },
+      },
+    });
+    apply(retryHost.ctx, {
+      mode: 'auto',
+      backgroundSilent: true,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...retryHost.effectDisposers);
+    const retryRunDef = retryHost.registeredTools.get('browser_subagent_run')!;
+    const retryRunVal: any = await retryRunDef.execute(
+      { url: srv.url, role: 'Retry Verifier', task_prompt: 'Trigger text-only retry', max_steps: 2 },
+      fakeExec
+    );
+    assert.equal(retryRunVal.status, 'COMPLETED');
+    assert.equal(retryRunVal.planner_mode, 'host-ctx-llm');
+    assert.equal(retryRunVal.planner_detail?.fallback_count, 0);
+    assert.equal(retryRunVal.planner_detail?.llm_steps?.[0]?.retried_text_only, true);
+    console.log('[Strict DSH 0.2 Contract] 5b Verified image-rejected error chunk triggers text-only retry!');
+
+    // 5c. Issue #4 regression: unrecognized chunks + plain prose text record diagnostics & fall back
+    const proseHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        llm: {
+          async *stream() {
+            yield { type: 'weird-event', foo: 123 };
+            yield { type: 'text-delta', text: 'Sorry, plain prose response' };
+          },
+        },
+      },
+    });
+    apply(proseHost.ctx, {
+      mode: 'auto',
+      backgroundSilent: true,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...proseHost.effectDisposers);
+    const proseRunDef = proseHost.registeredTools.get('browser_subagent_run')!;
+    const proseRunVal: any = await proseRunDef.execute(
+      { url: srv.url, role: 'Prose Verifier', task_prompt: 'Test prose fallback diagnostics', max_steps: 1 },
+      fakeExec
+    );
+    assert.equal(proseRunVal.status, 'COMPLETED');
+    assert.equal(proseRunVal.planner_mode, 'host-ctx-llm-fallback');
+    assert.equal(proseRunVal.planner_detail?.last_fallback_reason, 'INVALID_JSON_DECISION');
+    assert.equal(proseRunVal.planner_detail?.llm_steps?.[0]?.chunk_types?.['weird-event'], 1);
+    assert.ok(proseRunVal.planner_detail?.llm_steps?.[0]?.sample_unrecognized_keys?.includes('foo'));
+    console.log('[Strict DSH 0.2 Contract] 5c Verified unrecognized chunk diagnostics & prose fallback!');
+
+    console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS (P0 + P1 + P2 + ISSUE #3/#4) PASSED!');
   } finally {
-    for (const d of effectDisposers) d();
+    for (const d of allDisposers) d();
     await srv.close();
   }
 }

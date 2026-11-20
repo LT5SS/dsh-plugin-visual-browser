@@ -100,30 +100,181 @@ Respond ONLY with a single valid JSON object matching one of these actions:
 - {"type":"pause_for_takeover","blockReason":"LOGIN_REQUIRED","message":"..."}
 - {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}`;
 
-/** Extracts the first JSON object from a model text response (handles markdown code fences gracefully). */
-export function parseJsonDecision(rawText: string): SubagentActionDecision {
-  const trimmed = rawText.trim();
+export interface PlannerStepDiagnostic {
+  step: number;
+  backend: 'host-ctx-llm' | 'external-vision-api';
+  chunk_count: number;
+  chunk_types: Record<string, number>;
+  sample_unrecognized_keys?: string[];
+  text_length: number;
+  text_preview?: string;
+  retried_text_only?: boolean;
+  stream_error?: string;
+  fallback_reason?: string;
+}
+
+function isPoint2D(value: unknown): value is Point2D {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as any).x === 'number' &&
+    Number.isFinite((value as any).x) &&
+    typeof (value as any).y === 'number' &&
+    Number.isFinite((value as any).y)
+  );
+}
+
+/** Validates that a parsed JSON object matches one of the 9 supported SubagentActionDecision variants. */
+export function isValidSubagentDecision(value: unknown): value is SubagentActionDecision {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const d = value as Record<string, unknown>;
+  switch (d.type) {
+    case 'navigate':
+      return typeof d.url === 'string' && d.url.trim().length > 0;
+    case 'move_mouse':
+      return (
+        (Array.isArray(d.points) && d.points.length > 0 && d.points.every(isPoint2D)) ||
+        isPoint2D(d.points)
+      );
+    case 'hover':
+    case 'click':
+      return d.target !== undefined && d.target !== null && (typeof d.target === 'string' ? d.target.length > 0 : isPoint2D(d.target));
+    case 'type_text':
+      return typeof d.target === 'string' && d.target.length > 0 && typeof d.text === 'string';
+    case 'scroll':
+      return typeof d.deltaY === 'number' && Number.isFinite(d.deltaY);
+    case 'set_cursor_style':
+      return d.style !== null && typeof d.style === 'object' && !Array.isArray(d.style);
+    case 'complete':
+      return typeof d.report === 'string';
+    case 'pause_for_takeover':
+      return typeof d.blockReason === 'string' && d.blockReason.length > 0 && typeof d.message === 'string';
+    default:
+      return false;
+  }
+}
+
+/**
+ * Extracts and structurally validates the first JSON decision object from a model text response.
+ * Returns `null` (never throws) on empty strings, prose, malformed JSON, or invalid action shapes.
+ */
+export function parseJsonDecision(rawText: string): SubagentActionDecision | null {
+  const trimmed = String(rawText ?? '').trim();
+  if (!trimmed) return null;
+
   const fenceMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
   const candidate = fenceMatch ? fenceMatch[1].trim() : trimmed;
   const firstBrace = candidate.indexOf('{');
   const lastBrace = candidate.lastIndexOf('}');
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    return JSON.parse(candidate.slice(firstBrace, lastBrace + 1)) as SubagentActionDecision;
+  if (firstBrace < 0 || lastBrace <= firstBrace) {
+    return null;
   }
-  return JSON.parse(candidate) as SubagentActionDecision;
+
+  try {
+    const parsed = JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
+    return isValidSubagentDecision(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const TEXT_DELTA_CHUNK_TYPES = new Set([
+  'text-delta',
+  'content-delta',
+  'output_text_delta',
+  'output-text-delta',
+]);
+const FULL_TEXT_CHUNK_TYPES = new Set(['text', 'output-text', 'output_text']);
+const RECOGNIZED_NON_TEXT_CHUNK_TYPES = new Set([
+  'reasoning-delta',
+  'reasoning',
+  'thinking-delta',
+  'thinking',
+  'start',
+  'finish',
+  'step-start',
+  'step-finish',
+  'message-start',
+  'message-end',
+  'done',
+  'usage',
+  'metadata',
+  'source',
+  'tool-call',
+  'tool-result',
+  'response',
+]);
+
+function firstStringField(obj: Record<string, any>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    if (typeof obj[key] === 'string') return obj[key];
+  }
+  return undefined;
+}
+
+/**
+ * Normalizes diverse host `ctx.llm.stream()` chunk shapes and records unknown schemas for diagnostics.
+ */
+export function extractHostStreamChunk(chunk: unknown): {
+  kind: string;
+  text: string;
+  error?: string;
+  unrecognizedKeys?: string[];
+} {
+  if (typeof chunk === 'string') {
+    return { kind: 'string', text: chunk };
+  }
+  if (!chunk || typeof chunk !== 'object') {
+    return { kind: typeof chunk, text: '' };
+  }
+
+  const obj = chunk as Record<string, any>;
+  const kind = typeof obj.type === 'string' ? obj.type : 'unknown';
+
+  if (TEXT_DELTA_CHUNK_TYPES.has(kind)) {
+    const text = firstStringField(obj, ['delta', 'text', 'textDelta', 'content']);
+    if (text !== undefined) return { kind, text };
+    return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
+  }
+
+  if (FULL_TEXT_CHUNK_TYPES.has(kind)) {
+    const text = firstStringField(obj, ['text', 'delta', 'content']);
+    if (text !== undefined) return { kind, text };
+    return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
+  }
+
+  if (kind === 'error') {
+    const rawErr =
+      obj.error?.message ??
+      obj.message ??
+      (typeof obj.error === 'string' ? obj.error : JSON.stringify(obj.error ?? 'Unknown stream error'));
+    return { kind, text: '', error: String(rawErr).slice(0, 300) };
+  }
+
+  if (RECOGNIZED_NON_TEXT_CHUNK_TYPES.has(kind)) {
+    return { kind, text: '' };
+  }
+
+  return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
 }
 
 /**
  * Creates a planner backed by DSH 0.2's native `ctx.llm` runtime service when available.
+ * Automatically retries text-only when an image attachment causes failure, records chunk
+ * diagnostics, and degrades cleanly to `fallbackPlanner` (default: `createBuiltinInspectorPlanner()`)
+ * instead of throwing on empty streams or non-JSON responses.
  */
 export function createDshHostLlmPlanner(opts: {
   llm: any;
   attachments?: any;
   provider: string;
   model: string;
+  fallbackPlanner?: SubagentPlanner;
+  onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner {
+  const fallback = opts.fallbackPlanner ?? createBuiltinInspectorPlanner();
+
   return async (ctx: SubagentPlannerContext): Promise<SubagentActionDecision> => {
-    const contentBlocks: any[] = [];
     const entries = ctx.history.getEntries();
     const archived = entries.filter((e) => e.imageBase64 === null).map((e) => `- ${e.compactText}`);
 
@@ -134,9 +285,10 @@ export function createDshHostLlmPlanner(opts: {
     for (const entry of entries.filter((e) => e.imageBase64 !== null)) {
       promptText += `\n---\n**Action Executed**: ${entry.actionTaken}\n${entry.fullHudText}\n`;
     }
-    contentBlocks.push({ type: 'text', text: promptText });
+    const textBlock = { type: 'text', text: promptText };
 
     // Attach latest screenshot via ctx.attachments if supported by host
+    let imageBlock: any | undefined;
     const latestPath = ctx.latestObservation.screenshotPath;
     if (opts.attachments && typeof opts.attachments.saveImage === 'function' && fs.existsSync(latestPath)) {
       try {
@@ -145,53 +297,124 @@ export function createDshHostLlmPlanner(opts: {
           mediaType: 'image/png',
           name: path.basename(latestPath),
         });
-        contentBlocks.push({ type: 'image', attachment: ref });
+        imageBlock = { type: 'image', attachment: ref };
       } catch {
         // Fallback to text-only HUD if attachment admission fails
       }
     }
 
-    const stream = opts.llm.stream({
-      provider: opts.provider,
-      model: opts.model,
-      systemPrompt: SUBAGENT_SYSTEM_PROMPT,
-      messages: [
-        {
-          id: `msg-${crypto.randomUUID()}`,
-          role: 'user',
-          content: contentBlocks,
-          source: { kind: 'user' },
-        },
-      ],
-      signal: ctx.signal,
-    });
+    const runStreamAttempt = async (blocks: any[]) => {
+      let fullText = '';
+      let chunkCount = 0;
+      const chunkTypes: Record<string, number> = {};
+      let sampleUnrecognizedKeys: string[] | undefined;
+      let streamError: string | undefined;
+      let threw = false;
 
-    let fullText = '';
-    for await (const chunk of stream) {
-      if (chunk.type === 'text-delta' && typeof chunk.delta === 'string') {
-        fullText += chunk.delta;
-      } else if (chunk.type === 'text' && typeof chunk.text === 'string') {
-        fullText += chunk.text;
+      try {
+        const stream = await opts.llm.stream({
+          provider: opts.provider,
+          model: opts.model,
+          systemPrompt: SUBAGENT_SYSTEM_PROMPT,
+          messages: [
+            {
+              id: `msg-${crypto.randomUUID()}`,
+              role: 'user',
+              content: blocks,
+              source: { kind: 'user' },
+            },
+          ],
+          signal: ctx.signal,
+        });
+
+        if (!stream || typeof (stream as any)[Symbol.asyncIterator] !== 'function') {
+          streamError = 'Host llm.stream() did not return an async iterable';
+          threw = true;
+        } else {
+          for await (const chunk of stream) {
+            chunkCount++;
+            const parsedChunk = extractHostStreamChunk(chunk);
+            chunkTypes[parsedChunk.kind] = (chunkTypes[parsedChunk.kind] ?? 0) + 1;
+            if (parsedChunk.text) fullText += parsedChunk.text;
+            if (!sampleUnrecognizedKeys && parsedChunk.unrecognizedKeys?.length) {
+              sampleUnrecognizedKeys = parsedChunk.unrecognizedKeys;
+            }
+            if (!streamError && parsedChunk.error) {
+              streamError = parsedChunk.error;
+            }
+          }
+        }
+      } catch (err: any) {
+        if (ctx.signal?.aborted) throw err;
+        streamError = String(err?.message ?? err).slice(0, 300);
+        threw = true;
       }
+
+      return { fullText, chunkCount, chunkTypes, sampleUnrecognizedKeys, streamError, threw };
+    };
+
+    let attempt = await runStreamAttempt(imageBlock ? [textBlock, imageBlock] : [textBlock]);
+    let decision = parseJsonDecision(attempt.fullText);
+    let retriedTextOnly = false;
+
+    if (!decision && imageBlock && !ctx.signal?.aborted) {
+      retriedTextOnly = true;
+      attempt = await runStreamAttempt([textBlock]);
+      decision = parseJsonDecision(attempt.fullText);
     }
 
-    return parseJsonDecision(fullText);
+    const diag: PlannerStepDiagnostic = {
+      step: ctx.stepIndex,
+      backend: 'host-ctx-llm',
+      chunk_count: attempt.chunkCount,
+      chunk_types: attempt.chunkTypes,
+      ...(attempt.sampleUnrecognizedKeys ? { sample_unrecognized_keys: attempt.sampleUnrecognizedKeys } : {}),
+      text_length: attempt.fullText.length,
+      ...(retriedTextOnly ? { retried_text_only: true } : {}),
+      ...(attempt.streamError ? { stream_error: attempt.streamError } : {}),
+    };
+
+    if (decision) {
+      opts.onStepDiagnostic?.(diag);
+      return decision;
+    }
+
+    let fallbackReason: string;
+    if (attempt.threw) {
+      fallbackReason = 'HOST_LLM_STREAM_ERROR';
+    } else if (attempt.chunkCount === 0) {
+      fallbackReason = 'EMPTY_STREAM';
+    } else if (attempt.streamError) {
+      fallbackReason = 'HOST_LLM_ERROR_CHUNK';
+    } else if (attempt.fullText.trim().length === 0) {
+      fallbackReason = 'EMPTY_TEXT_OUTPUT';
+    } else {
+      fallbackReason = 'INVALID_JSON_DECISION';
+      diag.text_preview = attempt.fullText.trim().slice(0, 200);
+    }
+    diag.fallback_reason = fallbackReason;
+    opts.onStepDiagnostic?.(diag);
+
+    return fallback(ctx);
   };
 }
 
 /**
  * Creates a Vision LLM planner talking to any OpenAI-compatible multimodal endpoint.
- * Includes timeout, AbortSignal propagation, and automatic fallback for gateways that reject response_format.
+ * Includes timeout, AbortSignal propagation, gateway compatibility retry, and safe fallback.
  */
 export function createOpenAIVisionPlanner(opts: {
   apiKey: string;
   baseUrl?: string;
   model?: string;
   timeoutMs?: number;
+  fallbackPlanner?: SubagentPlanner;
+  onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner {
   const baseUrl = (opts.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
   const model = opts.model || 'gpt-4o-mini';
   const timeoutMs = opts.timeoutMs ?? 45000;
+  const fallback = opts.fallbackPlanner ?? createBuiltinInspectorPlanner();
 
   return async (ctx: SubagentPlannerContext): Promise<SubagentActionDecision> => {
     const messages = ctx.history.buildMultimodalMessages(SUBAGENT_SYSTEM_PROMPT, ctx.taskPrompt);
@@ -211,7 +434,7 @@ export function createOpenAIVisionPlanner(opts: {
         body.response_format = { type: 'json_object' };
       }
 
-      const res = await fetch(`${baseUrl}/chat/completions`, {
+      return fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -220,21 +443,67 @@ export function createOpenAIVisionPlanner(opts: {
         body: JSON.stringify(body),
         signal,
       });
-      return res;
     };
 
-    let res = await callApi(true);
-    if (!res.ok && res.status === 400) {
-      // Retry without response_format for OpenAI-compatible gateways that don't support json_object mode with vision
-      res = await callApi(false);
-    }
+    try {
+      let res = await callApi(true);
+      if (!res.ok && res.status === 400) {
+        // Retry without response_format for OpenAI-compatible gateways that don't support json_object mode with vision
+        res = await callApi(false);
+      }
 
-    if (!res.ok) {
-      throw new Error(`Vision LLM request failed: HTTP ${res.status} ${await res.text()}`);
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        opts.onStepDiagnostic?.({
+          step: ctx.stepIndex,
+          backend: 'external-vision-api',
+          chunk_count: 0,
+          chunk_types: {},
+          text_length: 0,
+          stream_error: `HTTP ${res.status} ${errBody}`.trim().slice(0, 300),
+          fallback_reason: 'VISION_API_HTTP_ERROR',
+        });
+        return fallback(ctx);
+      }
+
+      const data = (await res.json()) as any;
+      const rawContent = String(data?.choices?.[0]?.message?.content ?? '');
+      const decision = parseJsonDecision(rawContent);
+      if (decision) {
+        opts.onStepDiagnostic?.({
+          step: ctx.stepIndex,
+          backend: 'external-vision-api',
+          chunk_count: 1,
+          chunk_types: { completion: 1 },
+          text_length: rawContent.length,
+        });
+        return decision;
+      }
+
+      const empty = rawContent.trim().length === 0;
+      opts.onStepDiagnostic?.({
+        step: ctx.stepIndex,
+        backend: 'external-vision-api',
+        chunk_count: 1,
+        chunk_types: { completion: 1 },
+        text_length: rawContent.length,
+        ...(!empty ? { text_preview: rawContent.trim().slice(0, 200) } : {}),
+        fallback_reason: empty ? 'EMPTY_TEXT_OUTPUT' : 'INVALID_JSON_DECISION',
+      });
+      return fallback(ctx);
+    } catch (err: any) {
+      if (ctx.signal?.aborted) throw err;
+      opts.onStepDiagnostic?.({
+        step: ctx.stepIndex,
+        backend: 'external-vision-api',
+        chunk_count: 0,
+        chunk_types: {},
+        text_length: 0,
+        stream_error: String(err?.message ?? err).slice(0, 300),
+        fallback_reason: 'VISION_API_REQUEST_ERROR',
+      });
+      return fallback(ctx);
     }
-    const data = (await res.json()) as any;
-    const rawContent = data.choices?.[0]?.message?.content || '{}';
-    return parseJsonDecision(rawContent);
   };
 }
 
@@ -248,7 +517,7 @@ export function createBuiltinInspectorPlanner(): SubagentPlanner {
     const { stepIndex, maxSteps, latestObservation, history } = ctx;
     const { scroll, domStats, interactiveElements, health } = latestObservation;
 
-    if (stepIndex === 1) {
+    if (stepIndex === 1 && maxSteps > 1) {
       return {
         type: 'move_mouse',
         points: [

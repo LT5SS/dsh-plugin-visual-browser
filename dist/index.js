@@ -25,67 +25,82 @@ export const inject = ['tools'];
 export function toLosslessJson(value) {
     return JSON.parse(JSON.stringify(value));
 }
+function safeRead(read) {
+    try {
+        return read();
+    }
+    catch {
+        return undefined;
+    }
+}
 /**
- * Safely reads an optional Cordis service (such as `baseDir`, `attachments`, `llm`).
- * In Cordis 4.x, property getters for services not listed in `inject` throw instead of returning
- * `undefined`, so both `ctx.get?.(name)` and `ctx[name]` must be guarded with `try/catch`.
+ * Safely binds optional Cordis host services (`llm`, `attachments`) using secondary child fibers
+ * (`ctx.inject([serviceName], callback)`) so missing optional services remain pending cleanly
+ * without blocking top-level plugin activation or throwing on uninjected Cordis 4.x property getters.
  */
-function getHostService(ctx, serviceName) {
-    try {
-        const viaGet = ctx?.get?.(serviceName);
-        if (viaGet !== undefined)
-            return viaGet;
+function bindOptionalHostServices(ctx, hostServices) {
+    if (!ctx)
+        return;
+    const serviceNames = ['llm', 'attachments'];
+    const injectFn = safeRead(() => ctx.inject);
+    if (typeof injectFn === 'function') {
+        for (const serviceName of serviceNames) {
+            try {
+                injectFn.call(ctx, [serviceName], (sub) => {
+                    const service = safeRead(() => sub?.[serviceName]);
+                    if (service !== undefined) {
+                        hostServices[serviceName] = service;
+                        if (typeof sub?.effect === 'function') {
+                            sub.effect(() => () => {
+                                if (hostServices[serviceName] === service) {
+                                    hostServices[serviceName] = undefined;
+                                }
+                            }, `dsh-plugin-visual-browser.unbind.${serviceName}`);
+                        }
+                    }
+                });
+            }
+            catch {
+                /* secondary injection unavailable on this mock host */
+            }
+        }
+        return;
     }
-    catch {
-        /* service not injected or getter threw */
+    // Fallback only for legacy non-Cordis test stubs that expose services directly without ctx.inject
+    for (const serviceName of serviceNames) {
+        const service = safeRead(() => ctx?.[serviceName]);
+        if (service !== undefined) {
+            hostServices[serviceName] = service;
+        }
     }
-    try {
-        const service = ctx?.[serviceName];
-        if (service !== undefined)
-            return service;
+}
+function getEffectiveHostServices(hostServices, ctx) {
+    const result = {};
+    const hasInjectApi = typeof safeRead(() => ctx?.inject) === 'function';
+    for (const serviceName of ['llm', 'attachments']) {
+        result[serviceName] =
+            hostServices[serviceName] ??
+                safeRead(() => ctx?.get?.(serviceName)) ??
+                (hasInjectApi ? undefined : safeRead(() => ctx?.[serviceName]));
     }
-    catch {
-        /* service not injected on this host */
-    }
-    return undefined;
+    return result;
 }
 /**
  * Resolves the default absolute artifact directory anchored to:
  * 1. Explicit `config.artifactDir` (from cordis.yml)
  * 2. `DSH_BROWSER_ARTIFACT_DIR` env var
- * 3. Host Cordis `baseDir` (active profile / pack directory in DSH Desktop & CLI)
- * 4. `DSH_HOME` env var or `~/.dsh` fallback
+ * 3. `DSH_HOME` env var (set by DSH Desktop pack launcher) or `~/.dsh` fallback
  */
-export function resolveDefaultArtifactDir(configuredDir, ctx) {
-    const readHostString = (read) => {
-        try {
-            const value = read();
-            return typeof value === 'string' && value.length > 0 ? value : undefined;
-        }
-        catch {
-            return undefined;
-        }
-    };
-    const ctxAny = ctx;
-    const hostBaseDir = readHostString(() => ctxAny?.get?.('baseDir')) ??
-        readHostString(() => ctxAny?.baseDir) ??
-        readHostString(() => ctxAny?.root?.config?.baseDir);
+export function resolveDefaultArtifactDir(configuredDir, _ctx) {
     const raw = configuredDir ||
         process.env.DSH_BROWSER_ARTIFACT_DIR ||
-        (hostBaseDir ? path.join(hostBaseDir, 'artifacts', 'dsh-browser') : undefined) ||
         path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'artifacts', 'dsh-browser');
     return path.resolve(raw);
 }
-function getAttachmentsService(ctx) {
-    return getHostService(ctx, 'attachments');
-}
-function getLlmService(ctx) {
-    return getHostService(ctx, 'llm');
-}
-async function tryRegisterImageAttachment(ctx, screenshotPath) {
+async function tryRegisterImageAttachment(hostServices, ctx, screenshotPath) {
     if (!screenshotPath || !fs.existsSync(screenshotPath))
         return null;
-    const attachments = getAttachmentsService(ctx);
+    const attachments = getEffectiveHostServices(hostServices, ctx).attachments;
     if (!attachments || typeof attachments.saveImage !== 'function')
         return null;
     try {
@@ -110,52 +125,106 @@ function renderToolContent(textSummary, imageAttachment) {
     }
     return blocks;
 }
-function resolveSubagentPlanner(ctx, config, exec) {
-    if (config.customPlanner) {
-        return { planner: config.customPlanner, plannerMode: 'custom' };
+/**
+ * Resolves the provider/model route from plugin overrides or the active DSH tool execution context.
+ */
+export function resolveHostLlmRoute(config, exec) {
+    const agentAny = exec?.agent;
+    const selection = safeRead(() => agentAny?.model?.current?.()) ??
+        safeRead(() => agentAny?.session?.requestHeader?.()?.config) ??
+        safeRead(() => agentAny?.session?.config) ??
+        safeRead(() => agentAny?.config);
+    const provider = config.hostProvider || selection?.provider;
+    const model = config.hostModel || selection?.model;
+    if (typeof provider === 'string' && provider.length > 0 && typeof model === 'string' && model.length > 0) {
+        return { provider, model };
     }
-    // 1. Prefer DSH 0.2 native `ctx.llm` service if available and a model route is known
-    const llm = getLlmService(ctx);
-    if (llm && typeof llm.stream === 'function') {
-        const agentAny = exec?.agent;
-        const agentSelection = agentAny?.model?.current?.() ?? agentAny?.session?.requestHeader?.()?.config;
-        const provider = config.hostProvider || agentSelection?.provider;
-        const model = config.hostModel || agentSelection?.model;
-        if (provider && model) {
+    return null;
+}
+/**
+ * Resolves which planner backend will handle `browser_subagent_run` given config and bound host services.
+ */
+export function resolvePlannerMode(config, hostServices = {}, exec) {
+    if (config.customPlanner) {
+        return 'custom';
+    }
+    if (hostServices.llm &&
+        typeof hostServices.llm.stream === 'function' &&
+        resolveHostLlmRoute(config, exec)) {
+        return 'host-ctx-llm';
+    }
+    if (config.visionApiKey || process.env.DSH_VISION_API_KEY) {
+        return 'external-vision-api';
+    }
+    return 'builtin-inspector';
+}
+function resolveSubagentPlanner(hostServices, ctx, config, exec) {
+    const effectiveServices = getEffectiveHostServices(hostServices, ctx);
+    const initialMode = resolvePlannerMode(config, effectiveServices, exec);
+    const route = initialMode === 'host-ctx-llm' ? resolveHostLlmRoute(config, exec) : null;
+    const tracker = {
+        initialMode,
+        effectiveMode: initialMode,
+        ...(route ? { provider: route.provider, model: route.model } : {}),
+        fallbackCount: 0,
+        steps: [],
+    };
+    const onStepDiagnostic = (diag) => {
+        tracker.steps.push(diag);
+        if (diag.fallback_reason) {
+            tracker.fallbackCount++;
+            tracker.lastFallbackReason = diag.fallback_reason;
+            tracker.effectiveMode =
+                initialMode === 'host-ctx-llm' ? 'host-ctx-llm-fallback' : 'external-vision-api-fallback';
+        }
+    };
+    if (initialMode === 'custom' && config.customPlanner) {
+        return { planner: config.customPlanner, tracker, effectiveServices };
+    }
+    if (initialMode === 'host-ctx-llm' && effectiveServices.llm && route) {
+        return {
+            planner: createDshHostLlmPlanner({
+                llm: effectiveServices.llm,
+                attachments: effectiveServices.attachments,
+                provider: route.provider,
+                model: route.model,
+                onStepDiagnostic,
+            }),
+            tracker,
+            effectiveServices,
+        };
+    }
+    if (initialMode === 'external-vision-api') {
+        const apiKey = config.visionApiKey || process.env.DSH_VISION_API_KEY;
+        if (apiKey) {
             return {
-                planner: createDshHostLlmPlanner({
-                    llm,
-                    attachments: getAttachmentsService(ctx),
-                    provider,
-                    model,
+                planner: createOpenAIVisionPlanner({
+                    apiKey,
+                    baseUrl: config.visionBaseUrl || process.env.DSH_VISION_BASE_URL,
+                    model: config.visionModel || process.env.DSH_VISION_MODEL,
+                    onStepDiagnostic,
                 }),
-                plannerMode: 'host-ctx-llm',
+                tracker,
+                effectiveServices,
             };
         }
     }
-    // 2. Next check explicit OpenAI-compatible Vision API key
-    const apiKey = config.visionApiKey || process.env.DSH_VISION_API_KEY;
-    if (apiKey) {
-        return {
-            planner: createOpenAIVisionPlanner({
-                apiKey,
-                baseUrl: config.visionBaseUrl || process.env.DSH_VISION_BASE_URL,
-                model: config.visionModel || process.env.DSH_VISION_MODEL,
-            }),
-            plannerMode: 'external-vision-api',
-        };
-    }
-    // 3. Zero-config deterministic visual walkthrough fallback (never hard-crashes)
+    // Zero-config deterministic visual walkthrough fallback (never hard-crashes)
     return {
         planner: createBuiltinInspectorPlanner(),
-        plannerMode: 'builtin-inspector',
+        tracker,
+        effectiveServices,
     };
 }
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */
-export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserSubagentRunner()) {
-    const artifactRoot = resolveDefaultArtifactDir(config.artifactDir, ctx);
+export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserSubagentRunner(), hostServices) {
+    const resolvedServices = hostServices ?? {};
+    if (!hostServices) {
+        bindOptionalHostServices(ctx, resolvedServices);
+    }
+    const artifactRoot = resolveDefaultArtifactDir(config.artifactDir);
     let activeCursorStyle = {
         preset: 'cyber-neon',
         ...(config.cursorStyle || {}),
@@ -213,7 +282,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             const style = args.cursor_preset
                 ? { ...activeCursorStyle, preset: args.cursor_preset }
                 : activeCursorStyle;
-            const { planner, plannerMode } = resolveSubagentPlanner(ctx, config, exec);
+            const { planner, tracker, effectiveServices } = resolveSubagentPlanner(resolvedServices, ctx, config, exec);
             const res = await runner.runTask({
                 role: String(args.role || 'Browser Subagent'),
                 taskPrompt: String(args.task_prompt),
@@ -233,11 +302,25 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 },
                 planner,
             });
-            const imageAttachment = await tryRegisterImageAttachment(ctx, res.hostFacts.latestScreenshot);
+            const imageAttachment = await tryRegisterImageAttachment(resolvedServices, ctx, res.hostFacts.latestScreenshot);
             return toLosslessJson({
                 status: res.status,
                 subagent_id: res.subagentId,
-                planner_mode: plannerMode,
+                planner_mode: tracker.effectiveMode,
+                planner_detail: {
+                    initial_mode: tracker.initialMode,
+                    effective_mode: tracker.effectiveMode,
+                    ...(tracker.provider ? { provider: tracker.provider } : {}),
+                    ...(tracker.model ? { model: tracker.model } : {}),
+                    fallback_count: tracker.fallbackCount,
+                    ...(tracker.lastFallbackReason ? { last_fallback_reason: tracker.lastFallbackReason } : {}),
+                    ...(tracker.steps.length > 0 ? { llm_steps: tracker.steps } : {}),
+                },
+                host_services: {
+                    llm: Boolean(effectiveServices.llm && typeof effectiveServices.llm.stream === 'function'),
+                    attachments: Boolean(effectiveServices.attachments &&
+                        typeof effectiveServices.attachments.saveImage === 'function'),
+                },
                 host_facts_block: res.hostFactsBlock,
                 subagent_report: res.subagentReport,
                 approval_card: res.approvalCard ?? null,
@@ -282,7 +365,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
         },
         async execute(args, exec) {
             const res = await runner.resumeTask(String(args.subagent_id), args.user_note ? String(args.user_note) : undefined, exec?.signal);
-            const imageAttachment = await tryRegisterImageAttachment(ctx, res.hostFacts.latestScreenshot);
+            const imageAttachment = await tryRegisterImageAttachment(resolvedServices, ctx, res.hostFacts.latestScreenshot);
             return toLosslessJson({
                 status: res.status,
                 subagent_id: res.subagentId,
@@ -400,7 +483,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 const tools = new AtomicBrowserToolset(session, path.join(artifactRoot, 'quick-snapshots'));
                 const res = await tools.navigate(String(args.url), 1200);
                 exec?.signal?.throwIfAborted();
-                const imageAttachment = await tryRegisterImageAttachment(ctx, res.observation.screenshotPath);
+                const imageAttachment = await tryRegisterImageAttachment(resolvedServices, ctx, res.observation.screenshotPath);
                 return toLosslessJson({
                     screenshot_path: res.observation.screenshotPath.replace(/\\/g, '/'),
                     hud_summary: res.llmSummary,
@@ -422,7 +505,9 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
  */
 export function apply(ctx, config = {}) {
     const runner = new BrowserSubagentRunner();
-    const tools = createVisualBrowserTools(ctx, config, runner);
+    const hostServices = {};
+    bindOptionalHostServices(ctx, hostServices);
+    const tools = createVisualBrowserTools(ctx, config, runner, hostServices);
     for (const tool of tools) {
         ctx.tools.register(tool);
     }
@@ -436,5 +521,5 @@ export function apply(ctx, config = {}) {
     else {
         ctx.on?.('dispose', disposeAll);
     }
-    return { runner, tools };
+    return { runner, tools, hostServices };
 }

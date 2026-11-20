@@ -1,4 +1,4 @@
-import { type ToolDefinition } from '@deepseek-ai/dsh-tools';
+import { type ToolDefinition, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { BrowserRuntimeMode, VirtualCursorStyleConfig } from './driver/types.js';
 import { BrowserSubagentRunner, type SubagentPlanner } from './subagent/runner.js';
 export * from './driver/types.js';
@@ -19,9 +19,15 @@ export interface DshCordisContext {
     llm?: any;
     attachments?: any;
     get?: (name: string) => any;
+    inject?: (deps: string[] | Record<string, any>, callback: (ctx: any) => void) => any;
     effect?: (fn: () => (() => void) | void, label?: string) => any;
     on?: (event: string, listener: (...args: any[]) => void) => void;
 }
+export interface OptionalHostServices {
+    llm?: any;
+    attachments?: any;
+}
+export type PlannerMode = 'custom' | 'host-ctx-llm' | 'host-ctx-llm-fallback' | 'external-vision-api' | 'external-vision-api-fallback' | 'builtin-inspector';
 export interface VisualBrowserPluginConfig {
     mode?: BrowserRuntimeMode;
     cdpEndpoint?: string;
@@ -53,18 +59,29 @@ export declare function toLosslessJson(value: unknown): any;
  * Resolves the default absolute artifact directory anchored to:
  * 1. Explicit `config.artifactDir` (from cordis.yml)
  * 2. `DSH_BROWSER_ARTIFACT_DIR` env var
- * 3. Host Cordis `baseDir` (active profile / pack directory in DSH Desktop & CLI)
- * 4. `DSH_HOME` env var or `~/.dsh` fallback
+ * 3. `DSH_HOME` env var (set by DSH Desktop pack launcher) or `~/.dsh` fallback
  */
-export declare function resolveDefaultArtifactDir(configuredDir?: string, ctx?: DshCordisContext): string;
+export declare function resolveDefaultArtifactDir(configuredDir?: string, _ctx?: DshCordisContext): string;
+/**
+ * Resolves the provider/model route from plugin overrides or the active DSH tool execution context.
+ */
+export declare function resolveHostLlmRoute(config: VisualBrowserPluginConfig, exec?: Partial<ToolRunContext>): {
+    provider: string;
+    model: string;
+} | null;
+/**
+ * Resolves which planner backend will handle `browser_subagent_run` given config and bound host services.
+ */
+export declare function resolvePlannerMode(config: VisualBrowserPluginConfig, hostServices?: OptionalHostServices, exec?: Partial<ToolRunContext>): PlannerMode;
 /**
  * Builds the 4 DSH 0.2.x `ToolDefinition` objects using official `defineTool()`.
  */
-export declare function createVisualBrowserTools(ctx: DshCordisContext, config?: VisualBrowserPluginConfig, runner?: BrowserSubagentRunner): ToolDefinition[];
+export declare function createVisualBrowserTools(ctx: DshCordisContext, config?: VisualBrowserPluginConfig, runner?: BrowserSubagentRunner, hostServices?: OptionalHostServices): ToolDefinition[];
 /**
  * DeepSeek Harness (Cordis) Plugin Entry Point
  */
 export declare function apply(ctx: DshCordisContext, config?: VisualBrowserPluginConfig): {
     runner: BrowserSubagentRunner;
     tools: ToolDefinition[];
+    hostServices: OptionalHostServices;
 };

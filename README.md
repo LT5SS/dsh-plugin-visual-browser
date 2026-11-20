@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.1.2 — DSH 0.2.x Verified Bundle Release)
+# `dsh-plugin-visual-browser` (v1.1.3 — DSH 0.2.x Verified Bundle Release)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -10,7 +10,7 @@
    - 使用官方 `defineTool()` 构建全部 4 个工具定义，具备完整的 JSON Schema `parameters` 与 `output: { schema, render }` 声明（通过宿主 `assertSupportedJsonSchema` + `assertObjectJsonSchema` 真契约校验）；
    - **`dsh.bundle.patch` 标准 Bundle 清单**：支持通过 `dsh plugin --profile <profile> add link:<abs_path>` 直接写入 `dsh.profile.bundles`；
    - **`peerDependencies` 零副本冲突**：`@deepseek-ai/dsh-tools` 与 `@deepseek-ai/cordis` 声明为 `peerDependencies`，运行时直接复用 DSH 宿主实例的包与 Symbol，不产生私有副本分叉；
-   - **原生对接 `ctx.llm` 与 `ctx.attachments`**：子代理默认直接复用 DSH 宿主当前配置的模型路由（无需额外配置 API Key），且截图自动通过 `ctx.attachments.saveImage()` 登记为 `{ type: 'image', attachment }` 内容块，让主模型真正“看”到画面；
+   - **原生对接 `ctx.llm` 与 `ctx.attachments`（Cordis 4.x 二级注入 + 自动降级诊断）**：通过 `ctx.inject(['llm'], ...)` 与 `ctx.inject(['attachments'], ...)` 惰性绑定宿主可选服务（服务未注册时不阻塞极简宿主启动）；若当前宿主模型拒绝图片附件会自动回退为纯文本重试，若遇到空流或非 JSON 输出则安全降级至 `builtin-inspector`，并在输出中附带 `planner_mode` 与 `planner_detail` 诊断信息；截图通过 `ctx.attachments.saveImage()` 登记为 `{ type: 'image', attachment }` 内容块；
    - **协作式取消（`exec.signal`）与生命周期清理（`ctx.effect`）**：用户在 DSH 中断对话时立即关闭后台浏览器进程；插件卸载时通过 `ctx.effect(() => disposer)` 自动回收所有挂起态会话。
 2. **双模自适应 + 100% 后台静默（零焦点抢占）**
    - **DSH Electron 桌面端模式**：检测到 `DSH_WEBVIEW_CDP_URL` 时自动挂载右侧边栏内置 `<webview>`；
@@ -22,7 +22,7 @@
 4. **独立 Browser Subagent 循环 + 截图滑动窗口（省 80%+ 视觉 Token）**
    - 子循环内部默认只保留最近 3 张高清截图，旧步骤自动压缩为单行文字轨迹，不污染主 Agent 上下文；
    - 宿主代码强制生成不可伪造的 `[BROWSER_HOST_FACTS]` 校验头；
-   - 截图目录优先锚定宿主 `ctx.baseDir`（当前激活的 DSH profile / pack 目录）或环境变量 `DSH_BROWSER_ARTIFACT_DIR`，不会落到找不到的外部目录。
+   - 截图目录优先按 `config.artifactDir` → `DSH_BROWSER_ARTIFACT_DIR` → `DSH_HOME/artifacts/dsh-browser` → `~/.dsh/artifacts/dsh-browser` 解析（桌面 pack 模式下会跟随宿主注入的 `DSH_HOME`），不会落到找不到的外部目录。
 5. **自动门禁检测与原位人工接管（Approval Cards & Resume）**
    - 自动检测登录墙、支付结算页或 CAPTCHA 人机验证（绝不尝试绕过验证码），在原标签页挂起会话并返回 `DSH_BROWSER_TAKEOVER_CARD`，用户完成后可通过 `browser_subagent_resume` 原位继续。
 
@@ -48,7 +48,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.1.2+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.1.3+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）
@@ -85,7 +85,7 @@ dsh --patch ./cordis.yml --profile web
 | 环境变量 | 说明 |
 | :--- | :--- |
 | `DSH_BROWSER_EXECUTABLE` | 自定义本机 Chrome / Edge 可执行文件绝对路径 |
-| `DSH_BROWSER_ARTIFACT_DIR` | 自定义截图保存目录绝对路径（未设置时优先取宿主 `ctx.baseDir/artifacts/dsh-browser`） |
+| `DSH_BROWSER_ARTIFACT_DIR` | 自定义截图保存目录绝对路径（未设置时依次回退 `DSH_HOME/artifacts/dsh-browser` 与 `~/.dsh/artifacts/dsh-browser`） |
 | `DSH_WEBVIEW_CDP_URL` | 若需显式指定 DSH 内置 Webview 或外部浏览器的 CDP 调试端点 |
 | `DSH_VISION_API_KEY` | 可选：若不走宿主 `ctx.llm`，可单独指定外部 OpenAI 兼容多模态 API Key |
 

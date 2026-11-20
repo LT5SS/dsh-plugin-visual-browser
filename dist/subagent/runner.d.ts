@@ -94,26 +94,59 @@ interface PausedSubagentState {
     maxSteps: number;
 }
 export declare const SUBAGENT_SYSTEM_PROMPT = "You are an isolated Visual Browser Subagent inside DeepSeek Harness (DSH).\nYou operate a background browser equipped with a physical Bezier virtual cursor.\nAt each step you receive:\n1. A compact archive of earlier steps (images evicted to save context);\n2. The latest 1-3 viewport screenshots with the virtual cursor & trail visible;\n3. The 3-in-1 Observation HUD (scroll metrics, DOM/tech stats, console/network errors, and numbered #ref interactive controls).\n\nRespond ONLY with a single valid JSON object matching one of these actions:\n- {\"type\":\"move_mouse\",\"points\":[{\"x\":300,\"y\":400},{\"x\":800,\"y\":420}],\"label\":\"SWEEP\",\"reason\":\"...\"}\n- {\"type\":\"hover\",\"target\":\"#3\",\"reason\":\"...\"}\n- {\"type\":\"click\",\"target\":\"#8\",\"reason\":\"...\"}\n- {\"type\":\"type_text\",\"target\":\"#5\",\"text\":\"hello\",\"pressEnter\":true,\"reason\":\"...\"}\n- {\"type\":\"scroll\",\"deltaY\":800,\"reason\":\"...\"}\n- {\"type\":\"navigate\",\"url\":\"https://...\",\"reason\":\"...\"}\n- {\"type\":\"pause_for_takeover\",\"blockReason\":\"LOGIN_REQUIRED\",\"message\":\"...\"}\n- {\"type\":\"complete\",\"report\":\"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report...\"}";
-/** Extracts the first JSON object from a model text response (handles markdown code fences gracefully). */
-export declare function parseJsonDecision(rawText: string): SubagentActionDecision;
+export interface PlannerStepDiagnostic {
+    step: number;
+    backend: 'host-ctx-llm' | 'external-vision-api';
+    chunk_count: number;
+    chunk_types: Record<string, number>;
+    sample_unrecognized_keys?: string[];
+    text_length: number;
+    text_preview?: string;
+    retried_text_only?: boolean;
+    stream_error?: string;
+    fallback_reason?: string;
+}
+/** Validates that a parsed JSON object matches one of the 9 supported SubagentActionDecision variants. */
+export declare function isValidSubagentDecision(value: unknown): value is SubagentActionDecision;
+/**
+ * Extracts and structurally validates the first JSON decision object from a model text response.
+ * Returns `null` (never throws) on empty strings, prose, malformed JSON, or invalid action shapes.
+ */
+export declare function parseJsonDecision(rawText: string): SubagentActionDecision | null;
+/**
+ * Normalizes diverse host `ctx.llm.stream()` chunk shapes and records unknown schemas for diagnostics.
+ */
+export declare function extractHostStreamChunk(chunk: unknown): {
+    kind: string;
+    text: string;
+    error?: string;
+    unrecognizedKeys?: string[];
+};
 /**
  * Creates a planner backed by DSH 0.2's native `ctx.llm` runtime service when available.
+ * Automatically retries text-only when an image attachment causes failure, records chunk
+ * diagnostics, and degrades cleanly to `fallbackPlanner` (default: `createBuiltinInspectorPlanner()`)
+ * instead of throwing on empty streams or non-JSON responses.
  */
 export declare function createDshHostLlmPlanner(opts: {
     llm: any;
     attachments?: any;
     provider: string;
     model: string;
+    fallbackPlanner?: SubagentPlanner;
+    onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner;
 /**
  * Creates a Vision LLM planner talking to any OpenAI-compatible multimodal endpoint.
- * Includes timeout, AbortSignal propagation, and automatic fallback for gateways that reject response_format.
+ * Includes timeout, AbortSignal propagation, gateway compatibility retry, and safe fallback.
  */
 export declare function createOpenAIVisionPlanner(opts: {
     apiKey: string;
     baseUrl?: string;
     model?: string;
     timeoutMs?: number;
+    fallbackPlanner?: SubagentPlanner;
+    onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner;
 /**
  * Built-in Zero-Config Autonomous Visual Walkthrough Planner.
