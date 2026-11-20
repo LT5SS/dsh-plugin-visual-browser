@@ -470,7 +470,7 @@ export function buildVirtualCursorInitScript(
           <path id="__dsh_vc_arrow_path__" d="M3 3 L11 24 L14.8 15.2 L23.5 11.5 Z" fill="#ff3b28" stroke="#ffffff" stroke-width="2" stroke-linejoin="round" fill-rule="evenodd" style="pointer-events:none"/>
         </svg>
         <img id="__dsh_vc_custom_img__" alt="" style="position:absolute;left:-3px;top:-3px;width:28px;height:28px;margin:0;padding:0;border:0;object-fit:contain;display:none;opacity:1;box-sizing:border-box;pointer-events:none;transform-origin:top left;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.55))" />
-        <div id="__dsh_vc_scroll_ind__" style="position:absolute;left:-26px;top:-9px;width:18px;height:20px;margin:0;padding:0;box-sizing:border-box;display:none;align-items:center;justify-content:center;border-radius:6px;background:rgba(12,14,20,0.92);border:1.5px solid #00f0ff;color:#00f0ff;font-size:13px;font-weight:900;line-height:1;box-shadow:0 0 10px rgba(0,240,255,0.75);opacity:1;pointer-events:none">↕</div>
+        <div id="__dsh_vc_scroll_ind__" style="position:absolute;left:-26px;top:-13px;width:18px;height:26px;margin:0;padding:0;box-sizing:border-box;display:none;flex-direction:column;align-items:center;justify-content:center;gap:1px;border-radius:6px;background:rgba(12,14,20,0.92);border:1.5px solid #00f0ff;color:#00f0ff;line-height:1;box-shadow:0 0 10px rgba(0,240,255,0.75);opacity:1;pointer-events:none"><span class="up" style="display:flex;align-items:center;justify-content:center;width:12px;height:9px;margin:0;padding:0;border:0;line-height:1;opacity:0.28;transform:scale(1);filter:none;transform-origin:center center;transition:opacity 120ms, transform 120ms;pointer-events:none"><svg width="10" height="7" viewBox="0 0 10 7" style="display:block;width:10px;height:7px;margin:0;padding:0;border:0;opacity:1;overflow:visible;pointer-events:none"><path d="M5 0.6 L9.4 6.4 L0.6 6.4 Z" fill="currentColor" style="pointer-events:none"/></svg></span><span class="down" style="display:flex;align-items:center;justify-content:center;width:12px;height:9px;margin:0;padding:0;border:0;line-height:1;opacity:0.28;transform:scale(1);filter:none;transform-origin:center center;transition:opacity 120ms, transform 120ms;pointer-events:none"><svg width="10" height="7" viewBox="0 0 10 7" style="display:block;width:10px;height:7px;margin:0;padding:0;border:0;opacity:1;overflow:visible;pointer-events:none"><path d="M0.6 0.6 L9.4 0.6 L5 6.4 Z" fill="currentColor" style="pointer-events:none"/></svg></span></div>
         <div id="__dsh_vc_badge__" style="position:absolute;left:22px;top:18px;width:auto;height:auto;margin:0;padding:3px 9px;box-sizing:border-box;border-radius:999px;background:rgba(12,14,20,0.92);border:1.3px solid #00f0ff;color:#f5f8ff;font-size:10.5px;font-weight:700;line-height:1.3;letter-spacing:0.06em;white-space:nowrap;box-shadow:0 6px 16px rgba(0,0,0,0.45);opacity:1;pointer-events:none">
           DSH · (120, 120) · READY
         </div>
@@ -749,13 +749,43 @@ export function buildVirtualCursorInitScript(
     }
 
     if (scrollInd) {
+      const scrollUp = scrollInd.querySelector('.up');
+      const scrollDown = scrollInd.querySelector('.down');
       if (state.scrollActive && !state.dragActive) {
+        const isDown = state.scrollDir >= 0;
+        const activeShadow = 'drop-shadow(0 0 6px ' + s.rippleColor + ')';
         scrollInd.style.display = 'flex';
         scrollInd.style.borderColor = s.rippleColor;
         scrollInd.style.color = s.rippleColor;
         scrollInd.style.boxShadow = s.trailGlow ? '0 0 10px ' + s.rippleColor : 'none';
+        if (scrollUp) {
+          scrollUp.style.color = s.rippleColor;
+          scrollUp.style.opacity = isDown ? '0.28' : '1';
+          scrollUp.style.transform = isDown ? 'scale(1)' : 'scale(1.15)';
+          scrollUp.style.filter = isDown ? 'none' : activeShadow;
+          const upPath = scrollUp.querySelector('path');
+          if (upPath) upPath.setAttribute('fill', s.rippleColor);
+        }
+        if (scrollDown) {
+          scrollDown.style.color = s.rippleColor;
+          scrollDown.style.opacity = isDown ? '1' : '0.28';
+          scrollDown.style.transform = isDown ? 'scale(1.15)' : 'scale(1)';
+          scrollDown.style.filter = isDown ? activeShadow : 'none';
+          const downPath = scrollDown.querySelector('path');
+          if (downPath) downPath.setAttribute('fill', s.rippleColor);
+        }
       } else {
         scrollInd.style.display = 'none';
+        if (scrollUp) {
+          scrollUp.style.opacity = '0.28';
+          scrollUp.style.transform = 'scale(1)';
+          scrollUp.style.filter = 'none';
+        }
+        if (scrollDown) {
+          scrollDown.style.opacity = '0.28';
+          scrollDown.style.transform = 'scale(1)';
+          scrollDown.style.filter = 'none';
+        }
       }
     }
 

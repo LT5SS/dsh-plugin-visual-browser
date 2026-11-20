@@ -2103,47 +2103,167 @@ async function main() {
       );
       assert.ok(dragEvents.down >= 1 && dragEvents.move >= 6 && dragEvents.up >= 1, `Expected real mouse drag events, got ${JSON.stringify(dragEvents)}`);
 
-      // Test scroll ↕ visual indicator & vertical pulse + 400ms auto-restore
+      // Test scroll directional indicator (.up/.down SVG highlight) & vertical pulse + 400ms auto-restore
       const motionTools = new AtomicBrowserToolset(motionVisSession, path.join(artifactDir, 'motion-vis'));
-      const scrollRes = await motionTools.scroll(500, 120);
-      assert.ok(scrollRes.action.includes('Scrolled by 500'));
-      const duringScroll = await safeEvaluate(
+      const scrollResDown = await motionTools.scroll(400, 60);
+      assert.ok(scrollResDown.action.includes('Scrolled by 400'));
+      const duringScrollDown = await safeEvaluate(
         motionVisSession.page,
         () => {
-          const ind = document.getElementById('__dsh_vc_scroll_ind__');
+          const ind = document.getElementById('__dsh_vc_scroll_ind__') as HTMLElement | null;
+          const up = ind?.querySelector('.up') as HTMLElement | null;
+          const down = ind?.querySelector('.down') as HTMLElement | null;
           const pulse = document.getElementById('__dsh_vc_scroll_pulse__');
           const badge = document.getElementById('__dsh_vc_badge__');
+          const rect = ind?.getBoundingClientRect();
           return {
             indDisplay: ind ? getComputedStyle(ind).display : 'none',
-            indText: ind?.textContent?.trim() ?? '',
+            flexDir: ind ? getComputedStyle(ind).flexDirection : '',
+            width: rect ? Math.round(rect.width) : 0,
+            height: rect ? Math.round(rect.height) : 0,
+            upSvgPaths: up ? up.querySelectorAll('svg path').length : 0,
+            downSvgPaths: down ? down.querySelectorAll('svg path').length : 0,
+            upOpacity: up ? Number(getComputedStyle(up).opacity) : -1,
+            downOpacity: down ? Number(getComputedStyle(down).opacity) : -1,
+            upTransform: up?.style.transform ?? '',
+            downTransform: down?.style.transform ?? '',
+            upFilter: up?.style.filter ?? '',
+            downFilter: down?.style.filter ?? '',
             pulseLines: pulse ? pulse.querySelectorAll('line').length : 0,
             badge: badge?.textContent ?? '',
           };
         },
-        { indDisplay: 'none', indText: '', pulseLines: 0, badge: '' },
+        {
+          indDisplay: 'none',
+          flexDir: '',
+          width: 0,
+          height: 0,
+          upSvgPaths: 0,
+          downSvgPaths: 0,
+          upOpacity: -1,
+          downOpacity: -1,
+          upTransform: '',
+          downTransform: '',
+          upFilter: '',
+          downFilter: '',
+          pulseLines: 0,
+          badge: '',
+        },
         0
       );
-      assert.notEqual(duringScroll.indDisplay, 'none', 'Expected ↕ indicator visible during scroll');
-      assert.equal(duringScroll.indText, '↕');
-      assert.ok(duringScroll.pulseLines >= 3, `Expected vertical scroll pulse lines, got ${duringScroll.pulseLines}`);
-      assert.ok(duringScroll.badge.includes('SCROLL'), `Expected SCROLL badge, got ${duringScroll.badge}`);
+      assert.equal(duringScrollDown.indDisplay, 'flex', 'Expected scroll indicator visible during scroll down');
+      assert.equal(duringScrollDown.flexDir, 'column');
+      assert.equal(duringScrollDown.width, 18);
+      assert.equal(duringScrollDown.height, 26);
+      assert.equal(duringScrollDown.upSvgPaths, 1);
+      assert.equal(duringScrollDown.downSvgPaths, 1);
+      assert.ok(duringScrollDown.downOpacity > 0.9, `Expected .down highlighted on scroll(+400), got opacity=${duringScrollDown.downOpacity}`);
+      assert.ok(duringScrollDown.upOpacity < 0.4, `Expected .up dimmed on scroll(+400), got opacity=${duringScrollDown.upOpacity}`);
+      assert.ok(duringScrollDown.downTransform.includes('scale(1.15)'), `Expected .down scale(1.15), got ${duringScrollDown.downTransform}`);
+      assert.ok(duringScrollDown.downFilter.includes('drop-shadow('), `Expected .down drop-shadow, got ${duringScrollDown.downFilter}`);
+      assert.equal(duringScrollDown.upTransform, 'scale(1)');
+      assert.equal(duringScrollDown.upFilter, 'none');
+      assert.ok(duringScrollDown.pulseLines >= 3, `Expected vertical scroll pulse lines, got ${duringScrollDown.pulseLines}`);
+      assert.ok(duringScrollDown.badge.includes('SCROLL'), `Expected SCROLL badge, got ${duringScrollDown.badge}`);
+
+      const scrollResUp = await motionTools.scroll(-200, 60);
+      assert.ok(scrollResUp.action.includes('Scrolled by -200'));
+      const duringScrollUp = await safeEvaluate(
+        motionVisSession.page,
+        () => {
+          const ind = document.getElementById('__dsh_vc_scroll_ind__') as HTMLElement | null;
+          const up = ind?.querySelector('.up') as HTMLElement | null;
+          const down = ind?.querySelector('.down') as HTMLElement | null;
+          const pulse = document.getElementById('__dsh_vc_scroll_pulse__');
+          return {
+            indDisplay: ind ? getComputedStyle(ind).display : 'none',
+            upOpacity: up ? Number(getComputedStyle(up).opacity) : -1,
+            downOpacity: down ? Number(getComputedStyle(down).opacity) : -1,
+            upTransform: up?.style.transform ?? '',
+            downTransform: down?.style.transform ?? '',
+            upFilter: up?.style.filter ?? '',
+            downFilter: down?.style.filter ?? '',
+            pulseLines: pulse ? pulse.querySelectorAll('line').length : 0,
+          };
+        },
+        {
+          indDisplay: 'none',
+          upOpacity: -1,
+          downOpacity: -1,
+          upTransform: '',
+          downTransform: '',
+          upFilter: '',
+          downFilter: '',
+          pulseLines: 0,
+        },
+        0
+      );
+      assert.equal(duringScrollUp.indDisplay, 'flex', 'Expected scroll indicator visible during scroll up');
+      assert.ok(duringScrollUp.upOpacity > 0.9, `Expected .up highlighted on scroll(-200), got opacity=${duringScrollUp.upOpacity}`);
+      assert.ok(duringScrollUp.downOpacity < 0.4, `Expected .down dimmed on scroll(-200), got opacity=${duringScrollUp.downOpacity}`);
+      assert.ok(duringScrollUp.upTransform.includes('scale(1.15)'), `Expected .up scale(1.15), got ${duringScrollUp.upTransform}`);
+      assert.ok(duringScrollUp.upFilter.includes('drop-shadow('), `Expected .up drop-shadow, got ${duringScrollUp.upFilter}`);
+      assert.equal(duringScrollUp.downTransform, 'scale(1)');
+      assert.equal(duringScrollUp.downFilter, 'none');
+      assert.ok(duringScrollUp.pulseLines >= 3, `Expected vertical scroll pulse lines on scroll up, got ${duringScrollUp.pulseLines}`);
 
       await motionVisSession.page.waitForTimeout(450);
       const afterScrollRestore = await safeEvaluate(
         motionVisSession.page,
         () => {
-          const ind = document.getElementById('__dsh_vc_scroll_ind__');
+          const ind = document.getElementById('__dsh_vc_scroll_ind__') as HTMLElement | null;
+          const up = ind?.querySelector('.up') as HTMLElement | null;
+          const down = ind?.querySelector('.down') as HTMLElement | null;
           const pulse = document.getElementById('__dsh_vc_scroll_pulse__');
           return {
             indDisplay: ind ? getComputedStyle(ind).display : 'none',
             pulseLines: pulse ? pulse.querySelectorAll('line').length : 0,
+            upOpacity: up?.style.opacity ?? '',
+            downOpacity: down?.style.opacity ?? '',
+            upTransform: up?.style.transform ?? '',
+            downTransform: down?.style.transform ?? '',
+            upFilter: up?.style.filter ?? '',
+            downFilter: down?.style.filter ?? '',
           };
         },
-        { indDisplay: 'none', pulseLines: 0 },
+        {
+          indDisplay: 'none',
+          pulseLines: 0,
+          upOpacity: '',
+          downOpacity: '',
+          upTransform: '',
+          downTransform: '',
+          upFilter: '',
+          downFilter: '',
+        },
         0
       );
-      assert.equal(afterScrollRestore.indDisplay, 'none', 'Expected ↕ indicator hidden after 400ms');
+      assert.equal(afterScrollRestore.indDisplay, 'none', 'Expected scroll indicator hidden after 400ms');
       assert.equal(afterScrollRestore.pulseLines, 0, 'Expected scroll pulse cleared after 400ms');
+      assert.equal(afterScrollRestore.upOpacity, '0.28', 'Expected .up opacity reset on hide');
+      assert.equal(afterScrollRestore.downOpacity, '0.28', 'Expected .down opacity reset on hide');
+      assert.equal(afterScrollRestore.upTransform, 'scale(1)');
+      assert.equal(afterScrollRestore.downTransform, 'scale(1)');
+      assert.equal(afterScrollRestore.upFilter, 'none');
+      assert.equal(afterScrollRestore.downFilter, 'none');
+
+      // Ensure next scroll starts cleanly with the new direction and does not inherit previous highlight
+      await motionTools.scroll(300, 60);
+      const afterNextScroll = await safeEvaluate(
+        motionVisSession.page,
+        () => {
+          const ind = document.getElementById('__dsh_vc_scroll_ind__') as HTMLElement | null;
+          const up = ind?.querySelector('.up') as HTMLElement | null;
+          const down = ind?.querySelector('.down') as HTMLElement | null;
+          return {
+            upOpacity: up ? Number(getComputedStyle(up).opacity) : -1,
+            downOpacity: down ? Number(getComputedStyle(down).opacity) : -1,
+          };
+        },
+        { upOpacity: -1, downOpacity: -1 },
+        0
+      );
+      assert.ok(afterNextScroll.downOpacity > 0.9 && afterNextScroll.upOpacity < 0.4, `Expected fresh downward highlight after prior upward scroll, got ${JSON.stringify(afterNextScroll)}`);
 
       // Subagent runner end-to-end with { type: 'drag' }
       const subagentDragRunner = new BrowserSubagentRunner();
