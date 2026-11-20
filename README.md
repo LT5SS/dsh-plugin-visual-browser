@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.1.3 — DSH 0.2.x Verified Bundle Release)
+# `dsh-plugin-visual-browser` (v1.1.4 — DSH 0.2.x Verified Bundle Release)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -10,7 +10,7 @@
    - 使用官方 `defineTool()` 构建全部 4 个工具定义，具备完整的 JSON Schema `parameters` 与 `output: { schema, render }` 声明（通过宿主 `assertSupportedJsonSchema` + `assertObjectJsonSchema` 真契约校验）；
    - **`dsh.bundle.patch` 标准 Bundle 清单**：支持通过 `dsh plugin --profile <profile> add link:<abs_path>` 直接写入 `dsh.profile.bundles`；
    - **`peerDependencies` 零副本冲突**：`@deepseek-ai/dsh-tools` 与 `@deepseek-ai/cordis` 声明为 `peerDependencies`，运行时直接复用 DSH 宿主实例的包与 Symbol，不产生私有副本分叉；
-   - **原生对接 `ctx.llm` 与 `ctx.attachments`（Cordis 4.x 二级注入 + 自动降级诊断）**：通过 `ctx.inject(['llm'], ...)` 与 `ctx.inject(['attachments'], ...)` 惰性绑定宿主可选服务（服务未注册时不阻塞极简宿主启动）；若当前宿主模型拒绝图片附件会自动回退为纯文本重试，若遇到空流或非 JSON 输出则安全降级至 `builtin-inspector`，并在输出中附带 `planner_mode` 与 `planner_detail` 诊断信息；截图通过 `ctx.attachments.saveImage()` 登记为 `{ type: 'image', attachment }` 内容块；
+   - **原生对接 `ctx.llm` 与 `ctx.attachments`（Cordis 4.x 二级注入 + 自动降级诊断）**：通过 `ctx.inject(['llm'], ...)` 与 `ctx.inject(['attachments'], ...)` 惰性绑定宿主可选服务（服务未注册时不阻塞极简宿主启动）；若当前宿主模型拒绝图片附件会自动回退为纯文本重试，若遇到空流或非 JSON 输出则安全降级至 `builtin-inspector`，在工具渲染文本末尾直接输出 `— planner: ... | host services: ... | route: ...` 诊断摘要并将 `diagnostics.json` 落盘到同级截图目录；截图通过 `ctx.attachments.saveImage()` 登记为 `{ type: 'image', attachment }` 内容块；
    - **协作式取消（`exec.signal`）与生命周期清理（`ctx.effect`）**：用户在 DSH 中断对话时立即关闭后台浏览器进程；插件卸载时通过 `ctx.effect(() => disposer)` 自动回收所有挂起态会话。
 2. **双模自适应 + 100% 后台静默（零焦点抢占）**
    - **DSH Electron 桌面端模式**：检测到 `DSH_WEBVIEW_CDP_URL` 时自动挂载右侧边栏内置 `<webview>`；
@@ -48,7 +48,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.1.3+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.1.4+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）

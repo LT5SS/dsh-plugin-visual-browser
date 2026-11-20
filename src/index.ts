@@ -214,6 +214,24 @@ function renderToolContent(textSummary: string, imageAttachment?: any): any[] {
 }
 
 /**
+ * Formats the single-line planner & host-service diagnostics footer appended to `browser_subagent_run`
+ * rendered output so the model, UI, and DSH session logs can observe the active routing & fallback reason.
+ */
+export function formatPlannerDiagnosticsLine(value: any): string {
+  const d = value?.planner_detail ?? {};
+  const hs = value?.host_services ?? {};
+  const downgraded = Boolean(d.initial_mode && d.initial_mode !== d.effective_mode);
+  const route = d.provider && d.model ? ` | route: ${d.provider}/${d.model}` : '';
+  return (
+    `\n\n— planner: ${value?.planner_mode ?? '?'}` +
+    (downgraded
+      ? ` (initial ${d.initial_mode}${d.last_fallback_reason ? `, reason ${d.last_fallback_reason}` : ''}, fallbacks ${d.fallback_count ?? '?'})`
+      : '') +
+    ` | host services: llm ${hs.llm ? 'yes' : 'no'}, attachments ${hs.attachments ? 'yes' : 'no'}${route}`
+  );
+}
+
+/**
  * Resolves the provider/model route from plugin overrides or the active DSH tool execution context.
  */
 export function resolveHostLlmRoute(
@@ -277,7 +295,7 @@ function resolveSubagentPlanner(
 ): { planner: SubagentPlanner; tracker: PlannerExecutionTracker; effectiveServices: OptionalHostServices } {
   const effectiveServices = getEffectiveHostServices(hostServices, ctx);
   const initialMode = resolvePlannerMode(config, effectiveServices, exec);
-  const route = initialMode === 'host-ctx-llm' ? resolveHostLlmRoute(config, exec) : null;
+  const route = resolveHostLlmRoute(config, exec);
 
   const tracker: PlannerExecutionTracker = {
     initialMode,
@@ -405,8 +423,8 @@ export function createVisualBrowserTools(
         },
       },
       render(_args, value: any) {
-        const text = `${value.host_facts_block}\n\n${value.subagent_report}`;
-        return renderToolContent(text, value.image_attachment);
+        const text = `${value?.host_facts_block ?? ''}\n\n${value?.subagent_report ?? ''}${formatPlannerDiagnosticsLine(value)}`;
+        return renderToolContent(text, value?.image_attachment);
       },
     },
     async execute(args, exec) {
@@ -447,26 +465,59 @@ export function createVisualBrowserTools(
         res.hostFacts.latestScreenshot
       );
 
+      const plannerDetail = {
+        initial_mode: tracker.initialMode,
+        effective_mode: tracker.effectiveMode,
+        ...(tracker.provider ? { provider: tracker.provider } : {}),
+        ...(tracker.model ? { model: tracker.model } : {}),
+        fallback_count: tracker.fallbackCount,
+        ...(tracker.lastFallbackReason ? { last_fallback_reason: tracker.lastFallbackReason } : {}),
+        ...(tracker.steps.length > 0 ? { llm_steps: tracker.steps } : {}),
+      };
+
+      const hostServicesStatus = {
+        llm: Boolean(effectiveServices.llm && typeof effectiveServices.llm.stream === 'function'),
+        attachments: Boolean(
+          effectiveServices.attachments &&
+            typeof effectiveServices.attachments.saveImage === 'function'
+        ),
+      };
+
+      let diagnosticsPath: string | undefined;
+      try {
+        const subagentDir = path.join(artifactRoot, res.subagentId);
+        const targetFile = path.join(subagentDir, 'diagnostics.json');
+        await fs.promises.mkdir(subagentDir, { recursive: true });
+        await fs.promises.writeFile(
+          targetFile,
+          JSON.stringify(
+            toLosslessJson({
+              timestamp: new Date().toISOString(),
+              status: res.status,
+              subagent_id: res.subagentId,
+              planner_mode: tracker.effectiveMode,
+              planner_detail: plannerDetail,
+              host_services: hostServicesStatus,
+              steps: res.contextStats,
+              host_facts: res.hostFacts,
+            }),
+            null,
+            2
+          ),
+          'utf8'
+        );
+        diagnosticsPath = targetFile.replace(/\\/g, '/');
+      } catch {
+        /* non-fatal: diagnostics write failure must not break main tool result */
+      }
+
       return toLosslessJson({
         status: res.status,
         subagent_id: res.subagentId,
         planner_mode: tracker.effectiveMode,
-        planner_detail: {
-          initial_mode: tracker.initialMode,
-          effective_mode: tracker.effectiveMode,
-          ...(tracker.provider ? { provider: tracker.provider } : {}),
-          ...(tracker.model ? { model: tracker.model } : {}),
-          fallback_count: tracker.fallbackCount,
-          ...(tracker.lastFallbackReason ? { last_fallback_reason: tracker.lastFallbackReason } : {}),
-          ...(tracker.steps.length > 0 ? { llm_steps: tracker.steps } : {}),
-        },
-        host_services: {
-          llm: Boolean(effectiveServices.llm && typeof effectiveServices.llm.stream === 'function'),
-          attachments: Boolean(
-            effectiveServices.attachments &&
-              typeof effectiveServices.attachments.saveImage === 'function'
-          ),
-        },
+        planner_detail: plannerDetail,
+        host_services: hostServicesStatus,
+        ...(diagnosticsPath ? { diagnostics_path: diagnosticsPath } : {}),
         host_facts_block: res.hostFactsBlock,
         subagent_report: res.subagentReport,
         approval_card: res.approvalCard ?? null,

@@ -63,6 +63,11 @@ export declare function toLosslessJson(value: unknown): any;
  */
 export declare function resolveDefaultArtifactDir(configuredDir?: string, _ctx?: DshCordisContext): string;
 /**
+ * Formats the single-line planner & host-service diagnostics footer appended to `browser_subagent_run`
+ * rendered output so the model, UI, and DSH session logs can observe the active routing & fallback reason.
+ */
+export declare function formatPlannerDiagnosticsLine(value: any): string;
+/**
  * Resolves the provider/model route from plugin overrides or the active DSH tool execution context.
  */
 export declare function resolveHostLlmRoute(config: VisualBrowserPluginConfig, exec?: Partial<ToolRunContext>): {

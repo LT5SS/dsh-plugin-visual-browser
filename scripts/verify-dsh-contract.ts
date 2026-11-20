@@ -425,6 +425,53 @@ async function main() {
     assert.equal(runVal.host_services?.attachments, true);
     assert.equal(runVal.planner_detail?.fallback_count, 0);
 
+    const runRenderedText = runBlocks.find((b: any) => b.type === 'text')?.text ?? '';
+    assert.ok(runRenderedText.includes('— planner: host-ctx-llm'));
+    assert.ok(runRenderedText.includes('llm yes, attachments yes'));
+    assert.ok(runRenderedText.includes('route: deepseek/deepseek-chat'));
+    assert.equal(typeof runVal.diagnostics_path, 'string');
+    assert.equal(
+      path.resolve(runVal.diagnostics_path),
+      path.resolve(artifactDir, runVal.subagent_id, 'diagnostics.json')
+    );
+    assert.ok(fs.existsSync(runVal.diagnostics_path), 'Expected diagnostics.json to be written on disk');
+    const runDiagJson = JSON.parse(fs.readFileSync(runVal.diagnostics_path, 'utf8'));
+    assert.equal(runDiagJson.status, 'COMPLETED');
+    assert.equal(runDiagJson.planner_mode, 'host-ctx-llm');
+    assert.equal(runDiagJson.planner_detail?.provider, 'deepseek');
+    assert.equal(runDiagJson.planner_detail?.model, 'deepseek-chat');
+    assert.equal(runDiagJson.host_services?.llm, true);
+    assert.equal(runDiagJson.host_services?.attachments, true);
+
+    // 3b. Acceptance #2 & boundary checks for output.render() formatting (v1.1.4)
+    const fakeFallbackValue = {
+      host_facts_block: '[BROWSER_HOST_FACTS]',
+      subagent_report: 'Synthetic fallback report',
+      planner_mode: 'host-ctx-llm-fallback',
+      planner_detail: {
+        initial_mode: 'host-ctx-llm',
+        effective_mode: 'host-ctx-llm-fallback',
+        fallback_count: 1,
+        last_fallback_reason: 'EMPTY_STREAM',
+      },
+      host_services: { llm: true, attachments: false },
+    };
+    const fakeRenderText = runDef.output.render({}, fakeFallbackValue)[0].text;
+    assert.ok(fakeRenderText.includes('\n\n— planner:'));
+    assert.ok(fakeRenderText.includes('host-ctx-llm-fallback'));
+    assert.ok(fakeRenderText.includes('EMPTY_STREAM'));
+    assert.ok(fakeRenderText.includes('llm yes'));
+    assert.ok(fakeRenderText.includes('attachments no'));
+
+    const sparseRenderText = runDef.output.render({}, { host_facts_block: 'h', subagent_report: 'r' })[0].text;
+    assert.ok(sparseRenderText.includes('— planner: ?'));
+    assert.ok(sparseRenderText.includes('llm no, attachments no'));
+
+    const resumeDef = strictHost.registeredTools.get('browser_subagent_resume')!;
+    const resumeRenderText = resumeDef.output.render({}, { host_facts_block: 'h', subagent_report: 'r' })[0].text;
+    assert.ok(!resumeRenderText.includes('— planner:'), 'browser_subagent_resume must not append planner footer');
+    console.log('[Strict DSH 0.2 Contract] Verified output.render() diagnostics line & diagnostics.json persistence!');
+
     // 4. Execute browser_quick_snapshot on hostileCtx to verify zero throw on uninjected attachments
     const hostileSnapDef = hostile.registeredTools.get('browser_quick_snapshot')!;
     const hostileSnapVal: any = await hostileSnapDef.execute({ url: srv.url }, fakeExec);
@@ -460,6 +507,19 @@ async function main() {
     assert.equal(emptyRunVal.planner_mode, 'host-ctx-llm-fallback');
     assert.equal(emptyRunVal.planner_detail?.last_fallback_reason, 'EMPTY_STREAM');
     assert.ok((emptyRunVal.planner_detail?.fallback_count ?? 0) >= 1);
+    const emptyRenderedText = emptyRunDef.output.render({}, emptyRunVal).find((b: any) => b.type === 'text')?.text ?? '';
+    assert.ok(
+      emptyRenderedText.includes(
+        '— planner: host-ctx-llm-fallback (initial host-ctx-llm, reason EMPTY_STREAM, fallbacks 1) | host services: llm yes, attachments no'
+      )
+    );
+    assert.ok(emptyRenderedText.includes('route: opencode-go/deepseek-v4.1-flash'));
+    assert.equal(typeof emptyRunVal.diagnostics_path, 'string');
+    assert.ok(fs.existsSync(emptyRunVal.diagnostics_path));
+    const emptyDiagJson = JSON.parse(fs.readFileSync(emptyRunVal.diagnostics_path, 'utf8'));
+    assert.equal(emptyDiagJson.planner_detail?.last_fallback_reason, 'EMPTY_STREAM');
+    assert.equal(emptyDiagJson.planner_detail?.provider, 'opencode-go');
+    assert.equal(emptyDiagJson.planner_detail?.model, 'deepseek-v4.1-flash');
     console.log('[Strict DSH 0.2 Contract] 5a Verified empty llm.stream() graceful fallback (EMPTY_STREAM)!');
 
     // 5b. Issue #4 regression: error chunk on image attachment triggers automatic text-only retry
