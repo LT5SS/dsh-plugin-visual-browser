@@ -35,6 +35,7 @@ export class PageSnapshotSampler {
     session;
     outputDir;
     stepCounter = 0;
+    snapshotGen = 0;
     constructor(session, outputDir) {
         this.session = session;
         this.outputDir = outputDir;
@@ -45,8 +46,13 @@ export class PageSnapshotSampler {
     getNextStepNumber() {
         return this.stepCounter + 1;
     }
+    getSnapshotGen() {
+        return this.snapshotGen;
+    }
     async captureSnapshot(tag = 'step') {
         this.stepCounter++;
+        this.snapshotGen++;
+        const currentGen = this.snapshotGen;
         const page = this.session.page;
         const safeTag = tag.replace(/[^a-zA-Z0-9_-]/g, '_');
         const filename = `step_${String(this.stepCounter).padStart(2, '0')}_${safeTag}.png`;
@@ -93,7 +99,7 @@ export class PageSnapshotSampler {
             interactiveElements: [],
             cursorState: null,
         };
-        const extracted = await safeEvaluate(page, () => {
+        const extracted = await safeEvaluate(page, ({ gen }) => {
             const vw = window.innerWidth;
             const vh = window.innerHeight;
             const sx = Math.round(window.scrollX);
@@ -102,8 +108,11 @@ export class PageSnapshotSampler {
             const sh = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0, vh);
             const maxScroll = Math.max(1, sh - vh);
             const progress = Math.min(100, Math.max(0, Math.round((sy / maxScroll) * 100)));
-            // Clear previous dsh-ref attributes
-            document.querySelectorAll('[data-dsh-ref]').forEach((el) => el.removeAttribute('data-dsh-ref'));
+            // Clear previous dsh-ref & generation attributes
+            document.querySelectorAll('[data-dsh-ref]').forEach((el) => {
+                el.removeAttribute('data-dsh-ref');
+                el.removeAttribute('data-dsh-gen');
+            });
             const selectorQuery = [
                 'a[href]',
                 'area[href]',
@@ -139,13 +148,142 @@ export class PageSnapshotSampler {
                 refIdx++;
                 const refId = `#${refIdx}`;
                 el.setAttribute('data-dsh-ref', String(refIdx));
-                const rawText = el.getAttribute('aria-label') ||
+                el.setAttribute('data-dsh-gen', String(gen));
+                const explicitAria = el.getAttribute('aria-label')?.trim() || '';
+                let visibleText = '';
+                if (!explicitAria) {
+                    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+                    const parts = [];
+                    let curNode = walker.nextNode();
+                    while (curNode) {
+                        const txtVal = curNode.nodeValue ? curNode.nodeValue.trim() : '';
+                        if (txtVal) {
+                            let nodeHidden = false;
+                            let curEl = curNode.parentElement;
+                            const clipBoxes = [];
+                            while (curEl) {
+                                if (curEl.getAttribute('aria-hidden') === 'true') {
+                                    nodeHidden = true;
+                                    break;
+                                }
+                                const ncs = window.getComputedStyle(curEl);
+                                if (ncs.display === 'none' ||
+                                    ncs.visibility === 'hidden' ||
+                                    Number(ncs.opacity) < 0.05) {
+                                    nodeHidden = true;
+                                    break;
+                                }
+                                const pr = curEl.getBoundingClientRect();
+                                if (pr.width < 1 || pr.height < 1) {
+                                    nodeHidden = true;
+                                    break;
+                                }
+                                if (ncs.overflow === 'hidden' ||
+                                    ncs.overflow === 'clip' ||
+                                    ncs.overflowX === 'hidden' ||
+                                    ncs.overflowX === 'clip' ||
+                                    ncs.overflowY === 'hidden' ||
+                                    ncs.overflowY === 'clip') {
+                                    clipBoxes.push({ left: pr.left, right: pr.right, top: pr.top, bottom: pr.bottom });
+                                }
+                                if (curEl === el)
+                                    break;
+                                curEl = curEl.parentElement;
+                            }
+                            if (!nodeHidden) {
+                                const range = document.createRange();
+                                range.selectNodeContents(curNode);
+                                const rr = range.getBoundingClientRect();
+                                if (rr.width < 0.5 || rr.height < 0.5) {
+                                    nodeHidden = true;
+                                }
+                                else {
+                                    for (let ci = 0; ci < clipBoxes.length; ci++) {
+                                        const cb = clipBoxes[ci];
+                                        if (rr.right <= cb.left + 0.5 ||
+                                            rr.left >= cb.right - 0.5 ||
+                                            rr.bottom <= cb.top + 0.5 ||
+                                            rr.top >= cb.bottom - 0.5) {
+                                            nodeHidden = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (!nodeHidden) {
+                                parts.push(txtVal);
+                            }
+                        }
+                        curNode = walker.nextNode();
+                    }
+                    visibleText = parts.join(' ').replace(/\s+/g, ' ').trim();
+                }
+                const rawText = explicitAria ||
+                    visibleText ||
                     el.innerText ||
                     el.getAttribute('placeholder') ||
                     el.getAttribute('title') ||
                     el.getAttribute('href') ||
                     '';
-                const cleanLabel = rawText.replace(/\s+/g, ' ').trim().slice(0, 56) || `<${el.tagName.toLowerCase()}>`;
+                let normText = rawText.replace(/\s+/g, ' ').trim();
+                if (normText) {
+                    const explicitRepeat = /^(.*?)\s*[×x]\s*(\d+)$/i.exec(normText);
+                    if (explicitRepeat && explicitRepeat[1].trim() && Number(explicitRepeat[2]) >= 2) {
+                        const unit = explicitRepeat[1].trim();
+                        const suffix = ` (×${explicitRepeat[2]})`;
+                        const maxUnit = Math.max(8, 56 - suffix.length);
+                        normText =
+                            (unit.length > maxUnit ? unit.slice(0, maxUnit).trimEnd() : unit) + suffix;
+                    }
+                    else {
+                        const words = normText.split(' ');
+                        let collapsed = '';
+                        if (words.length >= 2) {
+                            const half = Math.floor(words.length / 2);
+                            for (let unitLen = 1; unitLen <= half; unitLen++) {
+                                if (words.length % unitLen !== 0)
+                                    continue;
+                                let allMatch = true;
+                                for (let wi = unitLen; wi < words.length; wi++) {
+                                    if (words[wi] !== words[wi % unitLen]) {
+                                        allMatch = false;
+                                        break;
+                                    }
+                                }
+                                if (allMatch) {
+                                    const repeatCount = words.length / unitLen;
+                                    const unitStr = words.slice(0, unitLen).join(' ');
+                                    const suffix = ` (×${repeatCount})`;
+                                    const maxUnit = Math.max(8, 56 - suffix.length);
+                                    collapsed =
+                                        (unitStr.length > maxUnit ? unitStr.slice(0, maxUnit).trimEnd() : unitStr) +
+                                            suffix;
+                                    break;
+                                }
+                            }
+                        }
+                        else if (normText.length >= 4) {
+                            const halfC = Math.floor(normText.length / 2);
+                            for (let cl = 2; cl <= halfC; cl++) {
+                                if (normText.length % cl !== 0)
+                                    continue;
+                                const unitStr = normText.slice(0, cl);
+                                const repeatCount = normText.length / cl;
+                                if (unitStr.repeat(repeatCount) === normText) {
+                                    const suffix = ` (×${repeatCount})`;
+                                    const maxUnit = Math.max(8, 56 - suffix.length);
+                                    collapsed =
+                                        (unitStr.length > maxUnit ? unitStr.slice(0, maxUnit).trimEnd() : unitStr) +
+                                            suffix;
+                                    break;
+                                }
+                            }
+                        }
+                        if (collapsed)
+                            normText = collapsed;
+                    }
+                }
+                const cleanLabel = normText.slice(0, 56) || `<${el.tagName.toLowerCase()}>`;
                 let selectorHint = el.tagName.toLowerCase();
                 if (el.id) {
                     selectorHint += `#${el.id}`;
@@ -248,6 +386,7 @@ export class PageSnapshotSampler {
                 cursorState,
             };
         }, fallbackExtracted, {
+            arg: { gen: currentGen },
             retries: 2,
             onDegraded: () => {
                 degradedReason = 'sampler degraded: navigation race';
@@ -270,6 +409,7 @@ export class PageSnapshotSampler {
             this.session.motion.getPosition();
         return {
             stepIndex: this.stepCounter,
+            snapshotGen: currentGen,
             timestamp: new Date().toISOString(),
             screenshotPath,
             cursorPosition: syncedPos,
@@ -281,19 +421,32 @@ export class PageSnapshotSampler {
         };
     }
     formatObservationForLLM(obs) {
-        const { scroll, domStats, health, interactiveElements, cursorPosition, navigation } = obs;
+        const { scroll, domStats, health, interactiveElements, cursorPosition, navigation, scrollDiagnostic } = obs;
         const lines = [
             `### [Step ${obs.stepIndex}] Page Observation HUD`,
             ...(obs.degradedReason ? [`- **Notice**: ${obs.degradedReason}`] : []),
             `- **URL**: ${domStats.url} ("${domStats.title}")`,
             ...(navigation
                 ? [
-                    `- **Navigation**: wait_until=${navigation.wait_until}, timed_out=${navigation.timed_out}, elapsed_ms=${navigation.elapsed_ms}, final_url=${navigation.final_url}`,
+                    `- **Navigation**: wait_until=${navigation.wait_until}, timed_out=${navigation.timed_out}, elapsed_ms=${navigation.elapsed_ms}, final_url=${navigation.final_url}` +
+                        (navigation.retries ? `, retries=${navigation.retries}` : ''),
                 ]
                 : []),
             `- **Screenshot**: ${obs.screenshotPath}`,
             `- **Virtual Cursor**: (${Math.round(cursorPosition.x)}, ${Math.round(cursorPosition.y)})`,
             `- **Scroll Progress**: ${scroll.scrollProgressPercent}% (Y: ${scroll.scrollY} / ${scroll.scrollHeight}px, Viewport: ${scroll.viewportWidth}x${scroll.viewportHeight})`,
+            ...(scrollDiagnostic
+                ? [
+                    `- **Scroll Result**: attempted=${scrollDiagnostic.attempted}, effective_dom_delta=${scrollDiagnostic.effective_dom_delta}, dom_scrollable=${scrollDiagnostic.dom_scrollable}, visual_changed=${scrollDiagnostic.visual_changed}, at_boundary=${scrollDiagnostic.at_boundary}, locked=${scrollDiagnostic.locked}` +
+                        (scrollDiagnostic.locked
+                            ? ' (scroll locked — do not retry scroll; use clicks, drags, or nav links instead)'
+                            : scrollDiagnostic.at_boundary
+                                ? ' (reached scroll boundary)'
+                                : !scrollDiagnostic.dom_scrollable && scrollDiagnostic.visual_changed
+                                    ? ' (native scrollbar fixed, but visual canvas/scene responded to wheel)'
+                                    : ''),
+                ]
+                : []),
             `- **DOM & Tech**: canvas=${domStats.counts.canvas}, svg=${domStats.counts.svg}, video=${domStats.counts.video}, img=${domStats.counts.img}, section=${domStats.counts.section}, openDialogs=${domStats.counts.openDialogs} | Tech=[${domStats.detectedTechHints.join(', ')}] | htmlData=${JSON.stringify(domStats.htmlDataAttributes)}`,
             ...(domStats.counts.canvas > 0
                 ? [

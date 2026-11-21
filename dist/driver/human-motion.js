@@ -202,16 +202,72 @@ export class HumanMotionController {
         }
         return { ...this.pos };
     }
-    async hoverSelector(selector, opts = {}) {
+    async probeSelector(selector, timeoutMs) {
+        const isRef = /^\[data-dsh-ref="(\d+)"\]$/.test(selector.trim());
         const loc = this.page.locator(selector).first();
-        await loc.waitFor({ state: 'visible', timeout: 8000 });
-        const box = await loc.boundingBox();
-        if (!box) {
-            throw new Error(`Cannot resolve boundingBox for selector: ${selector}`);
+        let visible = await loc.isVisible().catch(() => false);
+        if (!visible) {
+            if (isRef) {
+                return {
+                    ok: false,
+                    blocked: 'REF_STALE',
+                    hint: 'target not visible; page may have advanced — re-observe and pick another target',
+                };
+            }
+            const waitBudget = Math.max(200, Math.min(8000, timeoutMs ?? 1200));
+            visible = await loc
+                .waitFor({ state: 'visible', timeout: waitBudget })
+                .then(() => true)
+                .catch(() => false);
+            if (!visible) {
+                return {
+                    ok: false,
+                    blocked: 'ELEMENT_NOT_FOUND',
+                    hint: `Target ${selector} not visible within ${waitBudget}ms`,
+                };
+            }
         }
-        const cx = box.x + box.width * 0.5;
-        const cy = box.y + box.height * 0.5;
-        return this.moveTo(cx, cy, {
+        const box = await loc.boundingBox().catch(() => null);
+        if (!box || box.width < 2 || box.height < 2) {
+            return {
+                ok: false,
+                blocked: isRef ? 'REF_STALE' : 'ELEMENT_NOT_FOUND',
+                hint: 'target boundingBox missing or collapsed (<2px); page may have advanced — re-observe and pick another target',
+            };
+        }
+        const styleFresh = await safeEvaluate(this.page, (sel) => {
+            const el = document.querySelector(sel);
+            if (!el || !el.isConnected)
+                return false;
+            const cs = window.getComputedStyle(el);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) < 0.05) {
+                return false;
+            }
+            const r = el.getBoundingClientRect();
+            return r.width >= 2 && r.height >= 2;
+        }, true, { arg: selector, retries: 0 });
+        if (!styleFresh) {
+            return {
+                ok: false,
+                blocked: isRef ? 'REF_STALE' : 'ELEMENT_NOT_FOUND',
+                hint: 'target became hidden/transparent before action; re-observe and pick another target',
+            };
+        }
+        return {
+            ok: true,
+            center: {
+                x: Math.round(box.x + box.width * 0.5),
+                y: Math.round(box.y + box.height * 0.5),
+            },
+            box,
+        };
+    }
+    async hoverSelector(selector, opts = {}) {
+        const probe = await this.probeSelector(selector, opts.timeoutMs ?? 1200);
+        if (!probe.ok) {
+            throw new Error(probe.hint);
+        }
+        return this.moveTo(probe.center.x, probe.center.y, {
             ...opts,
             label: opts.label ?? `HOVER ${selector}`,
         });
@@ -366,31 +422,45 @@ export class HumanMotionController {
         };
     }
     async clickSelector(selector, opts = {}) {
-        const pt = await this.hoverSelector(selector, {
+        const probe = await this.probeSelector(selector, opts.timeoutMs);
+        if (!probe.ok) {
+            return {
+                ok: false,
+                x: this.pos.x,
+                y: this.pos.y,
+                at: { x: this.pos.x, y: this.pos.y },
+                blocked: probe.blocked,
+                hit: selector,
+                hint: probe.hint,
+            };
+        }
+        await this.moveTo(probe.center.x, probe.center.y, {
             ...opts,
             label: `AIM ${selector}`,
         });
-        return this.clickAt(pt.x, pt.y, {
+        return this.clickAt(probe.center.x, probe.center.y, {
             ...opts,
             steps: 2,
             durationMs: 20,
             label: opts.label ?? `CLICK ${selector}`,
         });
     }
-    async resolvePoint(target) {
+    async resolveTargetPoint(target, timeoutMs = 1200) {
         if (typeof target !== 'string') {
-            return { x: target.x, y: target.y };
+            return { ok: true, point: { x: target.x, y: target.y } };
         }
-        const loc = this.page.locator(target).first();
-        await loc.waitFor({ state: 'visible', timeout: 8000 });
-        const box = await loc.boundingBox();
-        if (!box) {
-            throw new Error(`Cannot resolve boundingBox for target: ${target}`);
+        const probe = await this.probeSelector(target, timeoutMs);
+        if (!probe.ok) {
+            return { ok: false, blocked: probe.blocked, hit: target, hint: probe.hint };
         }
-        return {
-            x: Math.round(box.x + box.width * 0.5),
-            y: Math.round(box.y + box.height * 0.5),
-        };
+        return { ok: true, point: probe.center };
+    }
+    async resolvePoint(target) {
+        const res = await this.resolveTargetPoint(target, 1200);
+        if (!res.ok) {
+            throw new Error(`Cannot resolve boundingBox for target: ${String(target)} (${res.hint})`);
+        }
+        return res.point;
     }
     /**
      * Performs a physical mouse drag (`move(from)` -> `down()` -> Bezier interpolation -> `up()`),

@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { NavigationDiagnostic, Point2D } from '../driver/types.js';
+import type { NavigationDiagnostic, Point2D, ScrollDiagnostic } from '../driver/types.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
 /** Returns true when a Playwright error stems from mid-evaluation navigation or frame detachment. */
 export declare function isNavigationRaceError(error: unknown): boolean;
@@ -75,14 +75,18 @@ export interface PageObservation {
     health: TelemetryHealthReport;
     degradedReason?: string;
     navigation?: NavigationDiagnostic;
+    scrollDiagnostic?: ScrollDiagnostic;
+    snapshotGen?: number;
 }
 export declare class PageSnapshotSampler {
     private session;
     private outputDir;
     private stepCounter;
+    private snapshotGen;
     constructor(session: BrowserSession, outputDir: string);
     getOutputDir(): string;
     getNextStepNumber(): number;
+    getSnapshotGen(): number;
     captureSnapshot(tag?: string): Promise<PageObservation>;
     formatObservationForLLM(obs: PageObservation): string;
 }

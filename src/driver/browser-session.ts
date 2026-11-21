@@ -30,6 +30,13 @@ const LOCAL_BROWSER_CANDIDATES = [
   '/usr/bin/chromium-browser',
 ].filter(Boolean) as string[];
 
+export function isTransientNavigationError(error: unknown): boolean {
+  const message = String((error as any)?.message ?? error);
+  return /ERR_NETWORK_CHANGED|ERR_CONNECTION_RESET|ERR_CONNECTION_ABORTED|ERR_CONNECTION_CLOSED|ERR_TIMED_OUT/i.test(
+    message
+  );
+}
+
 export function findLocalBrowserExecutable(): string {
   for (const candidate of LOCAL_BROWSER_CANDIDATES) {
     if (fs.existsSync(candidate)) {
@@ -343,42 +350,55 @@ export class BrowserSession {
     }
 
     let timedOut = false;
+    let retries = 0;
+    let recoveredFrom: string | undefined;
     this.navigatingViaSession = true;
     try {
-      try {
-        await this.page.goto(url, { waitUntil, timeout: effectiveTimeoutMs });
-      } catch (error) {
-        if (!/Timeout/i.test(String((error as Error)?.message ?? error))) {
-          throw error;
-        }
-        timedOut = true;
-        const currentUrl = (() => {
-          try {
-            return this.page.url();
-          } catch {
-            return '';
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await this.page.goto(url, { waitUntil, timeout: effectiveTimeoutMs });
+          break;
+        } catch (error) {
+          const msg = String((error as Error)?.message ?? error);
+          if (attempt === 0 && isTransientNavigationError(error)) {
+            retries = 1;
+            recoveredFrom = msg.replace(/\s+/g, ' ').trim().slice(0, 160);
+            await this.page.waitForTimeout(400).catch(() => {});
+            continue;
           }
-        })();
-        const targetIsBlank = /^about:blank$/i.test(url.trim());
-        const currentIsBlank = !currentUrl || currentUrl === 'about:blank';
-        const isChromeError = /^chrome-error:\/\//i.test(currentUrl);
-        const stuckOnPreviousDoc =
-          curDoc !== nextDoc &&
-          curDoc !== 'about:blank' &&
-          this.stripUrlHash(currentUrl) === curDoc;
-        const readyState = await safeEvaluate(
-          this.page,
-          () => String(document.readyState || ''),
-          '',
-          0
-        ).catch(() => '');
+          if (!/Timeout/i.test(msg)) {
+            throw error;
+          }
+          timedOut = true;
+          const currentUrl = (() => {
+            try {
+              return this.page.url();
+            } catch {
+              return '';
+            }
+          })();
+          const targetIsBlank = /^about:blank$/i.test(url.trim());
+          const currentIsBlank = !currentUrl || currentUrl === 'about:blank';
+          const isChromeError = /^chrome-error:\/\//i.test(currentUrl);
+          const stuckOnPreviousDoc =
+            curDoc !== nextDoc &&
+            curDoc !== 'about:blank' &&
+            this.stripUrlHash(currentUrl) === curDoc;
+          const readyState = await safeEvaluate(
+            this.page,
+            () => String(document.readyState || ''),
+            '',
+            0
+          ).catch(() => '');
 
-        if (
-          isChromeError ||
-          stuckOnPreviousDoc ||
-          (!targetIsBlank && currentIsBlank && readyState !== 'complete')
-        ) {
-          throw error;
+          if (
+            isChromeError ||
+            stuckOnPreviousDoc ||
+            (!targetIsBlank && currentIsBlank && readyState !== 'complete')
+          ) {
+            throw error;
+          }
+          break;
         }
       }
 
@@ -397,6 +417,7 @@ export class BrowserSession {
       timed_out: timedOut,
       elapsed_ms: Math.max(0, Date.now() - startedAt),
       final_url: this.page.url(),
+      ...(retries > 0 ? { retries, recovered_from: recoveredFrom } : {}),
     };
   }
 

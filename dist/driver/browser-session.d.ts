@@ -2,6 +2,7 @@ import { type Browser, type BrowserContext, type Page } from 'playwright-core';
 import type { BrowserRuntimeMode, BrowserSessionOptions, BrowserWindowMode, NavigateWaitUntil, NavigationDiagnostic } from './types.js';
 import { HumanMotionController } from './human-motion.js';
 import { TelemetryCollector } from '../sampler/telemetry-collector.js';
+export declare function isTransientNavigationError(error: unknown): boolean;
 export declare function findLocalBrowserExecutable(): string;
 export declare class BrowserSession {
     readonly options: Required<Pick<BrowserSessionOptions, 'mode' | 'viewport' | 'backgroundSilent'>> & BrowserSessionOptions;

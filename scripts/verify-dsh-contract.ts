@@ -52,6 +52,47 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
     const openStreams = new Set<http.ServerResponse>();
     const server = http.createServer((req, res) => {
       const cleanUrl = (req.url || '/').split('?')[0];
+      if (cleanUrl === '/__auto-advance-fixture.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Auto Advance Fixture</title></head>
+<body style="margin:0;padding:24px;font-family:sans-serif;">
+  <h1 id="status-msg">Splash Active</h1>
+  <p>
+    <button id="auto-hide-btn" style="padding:10px 18px;margin-right:12px;">Enter</button>
+    <button id="alt-hide-btn" style="padding:10px 18px;margin-right:12px;">Enter No Audio</button>
+    <button id="main-action-btn" style="padding:10px 18px;" onclick="window.__mainClicked=(window.__mainClicked||0)+1;document.getElementById('status-msg').textContent='Main Done';">Main Scene Action</button>
+  </p>
+</body>
+</html>`);
+        return;
+      }
+      if (cleanUrl === '/__dedup-fixture.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>HUD Label Dedup Fixture</title></head>
+<body style="margin:0;padding:24px;font-family:sans-serif;">
+  <p><button id="dup-btn" style="padding:8px 14px;"><span style="display:none">SecretHidden</span><span aria-hidden="true">AriaGhost</span><span>Enter</span> <span>Enter</span></button></p>
+  <p><button id="clipped-btn" style="position:relative;overflow:hidden;display:inline-block;width:96px;height:26px;padding:2px;"><span>ClippedKeep</span><span style="position:absolute;left:240px;top:0;white-space:nowrap;">ClippedOffscreen</span></button></p>
+  <p><a id="wrap-link" href="#wrapped">Our 2025 Wrapped Our 2025 Wrapped Our 2025 Wrapped</a></p>
+</body>
+</html>`);
+        return;
+      }
+      if (cleanUrl === '/__locked-scroll-fixture.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Locked Scroll Fixture</title><style>html,body{height:100vh;width:100vw;overflow:hidden;margin:0;padding:24px;font-family:sans-serif;}</style></head>
+<body>
+  <h1>Locked Viewport</h1>
+  <p>Scroll height equals viewport height with overflow:hidden.</p>
+</body>
+</html>`);
+        return;
+      }
       if (cleanUrl === '/__never-ending-stream') {
         openStreams.add(res);
         res.on('close', () => openStreams.delete(res));
@@ -2684,6 +2725,193 @@ async function main() {
     const hudCheckSnap: any = await navQuickDef.execute({ url: `${srv.url}__layer-iframe.html` }, fakeExec);
     assert.ok(!String(hudCheckSnap.hud_summary).includes('WebGL canvas'), 'Non-canvas page must not emit WebGL canvas notice');
     console.log('[Strict DSH 0.2 Contract] 5p Verified non-fatal goto timeout, domcontentloaded default + settle, navigation diagnostics & WebGL canvas HUD notice!');
+
+    // 5q. TASK-v1.3.3: Fast REF_STALE (<2s, no throw), error budget (REF_STALE separate from consecutive 3-failure cutoff), if_present click, HUD label dedup, transient network retry, scroll diagnostics
+    // 1) Fast REF_STALE + recoverable recovery + diagnostics.json + if_present skip
+    const staleHost = createCordisStrictCtx({ validateSchemas: false });
+    let staleStep = 0;
+    const staleRes = apply(staleHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      artifactDir,
+      customPlanner: async () => {
+        staleStep++;
+        const sess = staleRes.runner.getSharedSession();
+        if (staleStep === 1) {
+          assert.ok(sess, 'Expected active shared session for REF_STALE check');
+          await safeEvaluate(
+            sess!.page,
+            () => {
+              const btn = document.getElementById('auto-hide-btn');
+              if (btn) btn.style.display = 'none';
+              const h1 = document.getElementById('status-msg');
+              if (h1) h1.textContent = 'Main Scene Ready';
+            },
+            undefined,
+            0
+          );
+          return { type: 'click', target: '#1', reason: 'Click stale auto-hide Enter button' };
+        }
+        if (staleStep === 2) {
+          // Click another auto-hidden button via if_present: true -> skips cleanly as success
+          await safeEvaluate(
+            sess!.page,
+            () => {
+              const alt = document.getElementById('alt-hide-btn');
+              if (alt) alt.style.display = 'none';
+            },
+            undefined,
+            0
+          );
+          return { type: 'click', target: '#1', if_present: true, reason: 'Optional click already dismissed loader' };
+        }
+        if (staleStep === 3) {
+          return { type: 'click', target: '#main-action-btn', reason: 'Click remaining visible Main Scene Action' };
+        }
+        return { type: 'complete', report: 'STALE_RECOVERY_OK' };
+      },
+    });
+    allDisposers.push(...staleHost.effectDisposers);
+    const staleRunDef = staleHost.registeredTools.get('browser_subagent_run')!;
+    const t0Stale = Date.now();
+    const staleRunVal: any = await staleRunDef.execute(
+      {
+        url: `${srv.url}__auto-advance-fixture.html`,
+        role: 'Stale Recovery Verifier',
+        task_prompt: 'Verify fast REF_STALE recovery and if_present click',
+        max_steps: 6,
+        window_mode: 'headless',
+      },
+      fakeExec
+    );
+    const staleElapsedMs = Date.now() - t0Stale;
+    assert.equal(staleRunVal.status, 'COMPLETED');
+    assert.ok(staleRunVal.subagent_report.includes('STALE_RECOVERY_OK'));
+    assert.ok(staleElapsedMs < 6500, `Expected fast fail on REF_STALE (no 8s hang!), took ${staleElapsedMs}ms`);
+    const staleDiag = JSON.parse(fs.readFileSync(staleRunVal.diagnostics_path, 'utf8'));
+    const staleClickStep = (staleDiag.planner_detail?.llm_steps ?? []).find((s: any) => s.action?.blocked === 'REF_STALE');
+    assert.ok(staleClickStep, `Expected blocked: REF_STALE step in diagnostics.json, got ${JSON.stringify(staleDiag.planner_detail?.llm_steps)}`);
+    assert.equal(staleClickStep.action.ok, false);
+    assert.equal(staleClickStep.action.ref, '#1');
+    const ifPresentStep = (staleDiag.planner_detail?.llm_steps ?? []).find((s: any) => s.action?.skipped === true);
+    assert.ok(ifPresentStep && ifPresentStep.action.ok === true, 'Expected skipped: true step logged for if_present click');
+    await staleRes.runner.closeAllSessions();
+
+    // 2) Error budget: different REF_STALE targets do NOT trip budget, while 3 consecutive non-stale failures stop gracefully with ERROR_BUDGET_EXHAUSTED
+    const budgetHost = createCordisStrictCtx({ validateSchemas: false });
+    let budgetStep = 0;
+    const budgetRes = apply(budgetHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      customPlanner: async () => {
+        budgetStep++;
+        if (budgetStep === 1) {
+          return { type: 'click', target: '[data-dsh-ref="998"]', reason: 'First stale ref #998 (0 budget cost)' };
+        }
+        if (budgetStep === 2) {
+          return { type: 'click', target: '[data-dsh-ref="999"]', reason: 'Different stale ref #999 (still 0 budget cost)' };
+        }
+        return { type: 'click', target: '#does-not-exist-anywhere', reason: `Missing CSS selector attempt #${budgetStep}` };
+      },
+    });
+    allDisposers.push(...budgetHost.effectDisposers);
+    const budgetRunDef = budgetHost.registeredTools.get('browser_subagent_run')!;
+    const budgetVal: any = await budgetRunDef.execute(
+      {
+        url: `${srv.url}__auto-advance-fixture.html`,
+        role: 'Budget Verifier',
+        task_prompt: 'Verify REF_STALE exemption vs 3 consecutive non-stale cutoff',
+        max_steps: 10,
+        window_mode: 'headless',
+      },
+      fakeExec
+    );
+    assert.equal(budgetVal.status, 'MAX_STEPS_REACHED');
+    assert.equal(budgetVal.reason, 'ERROR_BUDGET_EXHAUSTED');
+    assert.equal(budgetStep, 5, `Expected 2 different REF_STALE (0 cost) + 3 ELEMENT_NOT_FOUND = 5 steps, got ${budgetStep}`);
+    await budgetRes.runner.closeAllSessions();
+
+    // 3) HUD visible-only label extraction + periodic dedup (×N) + 4) Transient nav retry + 5) Scroll structured diagnostics
+    const v133Session = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+    }).start();
+    try {
+      const v133Tools = new AtomicBrowserToolset(v133Session, path.join(artifactDir, 'v133-checks'));
+      const dedupNav = await v133Tools.navigate(`${srv.url}__dedup-fixture.html`, 150);
+      const dedupEls = dedupNav.observation.interactiveElements;
+      const dupBtn = dedupEls.find((e) => e.selectorHint.includes('dup-btn'));
+      const clippedBtn = dedupEls.find((e) => e.selectorHint.includes('clipped-btn'));
+      const wrapLink = dedupEls.find((e) => e.selectorHint.includes('wrap-link'));
+      assert.equal(dupBtn?.label, 'Enter (×2)', `Expected hidden spans stripped and duplicate folded, got ${JSON.stringify(dupBtn)}`);
+      assert.equal(clippedBtn?.label, 'ClippedKeep', `Expected offscreen clipped span excluded, got ${JSON.stringify(clippedBtn)}`);
+      assert.equal(wrapLink?.label, 'Our 2025 Wrapped (×3)', `Expected repeated anchor folded to (×3), got ${JSON.stringify(wrapLink)}`);
+
+      // Transient network error retry in navigate(): first throws ERR_NETWORK_CHANGED, second succeeds
+      const realGoto = v133Session.page.goto.bind(v133Session.page);
+      let injectedTransient = 0;
+      (v133Session.page as any).goto = async (u: string, opts?: any) => {
+        injectedTransient++;
+        if (injectedTransient === 1) {
+          throw new Error('page.goto: net::ERR_NETWORK_CHANGED at ' + u);
+        }
+        return realGoto(u, opts);
+      };
+      const recoveredNav = await v133Session.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded', 10000);
+      assert.equal(injectedTransient, 2, 'Expected navigate() to retry once on net::ERR_NETWORK_CHANGED');
+      assert.equal(recoveredNav.retries, 1);
+      assert.ok(String(recoveredNav.recovered_from ?? '').includes('ERR_NETWORK_CHANGED'));
+
+      // Non-transient DNS failure throws immediately without retry
+      let dnsCalls = 0;
+      (v133Session.page as any).goto = async () => {
+        dnsCalls++;
+        throw new Error('page.goto: net::ERR_NAME_NOT_RESOLVED');
+      };
+      await assert.rejects(
+        () => v133Session.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded', 5000),
+        /ERR_NAME_NOT_RESOLVED/
+      );
+      assert.equal(dnsCalls, 1, 'ERR_NAME_NOT_RESOLVED must not retry');
+      (v133Session.page as any).goto = realGoto;
+
+      // Scroll structured diagnostics: scrollable mid -> at_boundary -> overflow:hidden locked
+      const sc1 = await v133Tools.scroll(500, 60);
+      assert.ok((sc1.scroll?.effective_dom_delta ?? 0) > 100, `Expected positive scroll delta, got ${JSON.stringify(sc1.scroll)}`);
+      assert.equal(sc1.scroll?.dom_scrollable, true);
+      assert.equal(sc1.scroll?.at_boundary, false);
+      assert.equal(sc1.scroll?.locked, false);
+
+      await safeEvaluate(
+        v133Session.page,
+        () => {
+          const se = document.scrollingElement || document.documentElement;
+          window.scrollTo(0, se.scrollHeight);
+        },
+        undefined,
+        0
+      );
+      const scBoundary = await v133Tools.scroll(500, 60);
+      assert.equal(scBoundary.scroll?.effective_dom_delta, 0);
+      assert.equal(scBoundary.scroll?.dom_scrollable, true);
+      assert.equal(scBoundary.scroll?.at_boundary, true);
+      assert.equal(scBoundary.scroll?.locked, false, 'Scroll at bottom boundary MUST NOT be misclassified as locked');
+
+      await v133Tools.navigate(`${srv.url}__locked-scroll-fixture.html`, 100);
+      const scLocked = await v133Tools.scroll(700, 60);
+      assert.equal(scLocked.scroll?.attempted, 700);
+      assert.equal(scLocked.scroll?.effective_dom_delta, 0);
+      assert.equal(scLocked.scroll?.dom_scrollable, false);
+      assert.equal(scLocked.scroll?.at_boundary, false);
+      assert.equal(scLocked.scroll?.locked, true, `Expected overflow:hidden viewport flagged locked: true, got ${JSON.stringify(scLocked.scroll)}`);
+      assert.ok(scLocked.llmSummary.includes('locked=true'), 'Expected HUD Scroll Result line with locked=true');
+    } finally {
+      await v133Session.close();
+    }
+    console.log('[Strict DSH 0.2 Contract] 5q Verified REF_STALE fail-fast, error budget, if_present, HUD dedup, transient nav retry & scroll diagnostics!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

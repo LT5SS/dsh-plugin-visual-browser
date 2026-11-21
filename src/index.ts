@@ -991,15 +991,18 @@ export function createVisualBrowserTools(
           onActionResult: (info) => {
             const actionSummary: Record<string, unknown> = {
               ...summarizeDecisionAction(info.decision),
+              ok: info.ok,
               ...(info.blocked ? { blocked: info.blocked } : {}),
+              ...(info.skipped ? { skipped: true } : {}),
               ...(info.hit ? { hit: info.hit } : {}),
               ...(info.at ? { at: info.at } : {}),
               ...(info.midFrame ? { mid_frame: info.midFrame } : {}),
+              ...(info.scroll ? { scroll: info.scroll } : {}),
             };
             const existing = tracker.steps.find((s) => s.step === info.stepIndex);
             if (existing) {
               existing.action = actionSummary;
-            } else if (info.blocked || info.midFrame) {
+            } else if (info.blocked || info.midFrame || info.scroll || !info.ok || info.skipped) {
               tracker.steps.push({
                 step: info.stepIndex,
                 backend:
@@ -1027,6 +1030,7 @@ export function createVisualBrowserTools(
         const diagnosticsPath = await writeDiagnostics({
           timestamp: new Date().toISOString(),
           status: res.status,
+          ...(res.reason ? { reason: res.reason } : {}),
           subagent_id: res.subagentId,
           window_mode: effectiveWindowMode,
           ...(res.navigation ? { navigation: res.navigation } : {}),
@@ -1054,6 +1058,7 @@ export function createVisualBrowserTools(
         return toLosslessJson({
           status: res.status,
           subagent_id: res.subagentId,
+          ...(res.reason ? { reason: res.reason } : {}),
           ...(res.navigation ? { navigation: res.navigation } : {}),
           planner_mode: tracker.effectiveMode,
           planner_detail: plannerDetail,

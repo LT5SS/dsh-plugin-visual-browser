@@ -1,5 +1,5 @@
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { NavigateWaitUntil, NavigationDiagnostic, Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
+import type { ActionBlockedReason, NavigateWaitUntil, NavigationDiagnostic, Point2D, ScrollDiagnostic, VirtualCursorStyleConfig } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
 export interface DomInspectSample {
     tag: string;
@@ -22,13 +22,16 @@ export interface AtomicToolResult {
     observation: PageObservation;
     llmSummary: string;
     ok?: boolean;
-    blocked?: 'PLUGIN_UI_LAYER';
+    blocked?: ActionBlockedReason;
+    ref?: string;
+    skipped?: boolean;
     hit?: string;
     at?: Point2D;
     hint?: string;
     midFrame?: string;
     midFramePath?: string;
     navigation?: NavigationDiagnostic;
+    scroll?: ScrollDiagnostic;
     extraData?: unknown;
 }
 /**
@@ -48,7 +51,10 @@ export declare class AtomicBrowserToolset {
     setCursorStyle(style: VirtualCursorStyleConfig): Promise<void>;
     moveMouse(target: Point2D | Point2D[], label?: string): Promise<AtomicToolResult>;
     hover(target: string | Point2D): Promise<AtomicToolResult>;
-    click(target: string | Point2D, waitMs?: number): Promise<AtomicToolResult>;
+    click(target: string | Point2D, waitMs?: number, opts?: {
+        ifPresent?: boolean;
+        timeoutMs?: number;
+    }): Promise<AtomicToolResult>;
     typeText(target: string, text: string, pressEnter?: boolean): Promise<AtomicToolResult>;
     drag(from: string | Point2D, to: string | Point2D, steps?: number, waitMs?: number, opts?: {
         keepSelection?: boolean;

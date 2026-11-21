@@ -5,6 +5,23 @@ export interface NavigationDiagnostic {
   timed_out: boolean;
   elapsed_ms: number;
   final_url: string;
+  retries?: number;
+  recovered_from?: string;
+}
+
+export type ActionBlockedReason =
+  | 'PLUGIN_UI_LAYER'
+  | 'REF_STALE'
+  | 'ELEMENT_NOT_FOUND'
+  | 'ACTION_TIMEOUT';
+
+export interface ScrollDiagnostic {
+  attempted: number;
+  effective_dom_delta: number;
+  dom_scrollable: boolean;
+  visual_changed: boolean;
+  at_boundary: boolean;
+  locked: boolean;
 }
 
 export type BrowserRuntimeMode =
@@ -133,7 +150,9 @@ export interface ClickHitTestResult {
 export interface ClickActionResult extends Point2D {
   ok: boolean;
   at: Point2D;
-  blocked?: 'PLUGIN_UI_LAYER';
+  blocked?: ActionBlockedReason;
+  ref?: string;
+  skipped?: boolean;
   hit?: string;
   element?: string;
   hint?: string;
@@ -144,7 +163,7 @@ export interface DragActionResult {
   from: Point2D;
   to: Point2D;
   steps: number;
-  blocked?: 'PLUGIN_UI_LAYER';
+  blocked?: ActionBlockedReason;
   hit?: string;
   at?: Point2D;
   hint?: string;
@@ -157,4 +176,5 @@ export interface MotionOptions {
   arcCurvature?: number;
   label?: string;
   keepSelection?: boolean;
+  timeoutMs?: number;
 }

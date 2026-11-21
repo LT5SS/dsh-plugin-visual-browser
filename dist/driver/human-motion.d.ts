@@ -1,5 +1,5 @@
 import type { Page } from 'playwright-core';
-import type { ClickActionResult, ClickHitTestResult, DragActionResult, MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
+import type { ActionBlockedReason, ClickActionResult, ClickHitTestResult, DragActionResult, MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
 export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
 export declare class HumanMotionController {
     private page;
@@ -39,6 +39,20 @@ export declare class HumanMotionController {
      */
     moveTo(targetX: number, targetY: number, opts?: MotionOptions): Promise<Point2D>;
     sweepPath(waypoints: Point2D[], opts?: MotionOptions): Promise<Point2D>;
+    probeSelector(selector: string, timeoutMs?: number): Promise<{
+        ok: true;
+        center: Point2D;
+        box: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+        };
+    } | {
+        ok: false;
+        blocked: ActionBlockedReason;
+        hint: string;
+    }>;
     hoverSelector(selector: string, opts?: MotionOptions): Promise<Point2D>;
     /**
      * Performs a Top-Layer-aware hit test at `(x, y)` before dispatching any real mouse click,
@@ -47,6 +61,15 @@ export declare class HumanMotionController {
     hitTestAt(x: number, y: number): Promise<ClickHitTestResult>;
     clickAt(x: number, y: number, opts?: MotionOptions): Promise<ClickActionResult>;
     clickSelector(selector: string, opts?: MotionOptions): Promise<ClickActionResult>;
+    resolveTargetPoint(target: string | Point2D, timeoutMs?: number): Promise<{
+        ok: true;
+        point: Point2D;
+    } | {
+        ok: false;
+        blocked: ActionBlockedReason;
+        hit: string;
+        hint: string;
+    }>;
     resolvePoint(target: string | Point2D): Promise<Point2D>;
     /**
      * Performs a physical mouse drag (`move(from)` -> `down()` -> Bezier interpolation -> `up()`),

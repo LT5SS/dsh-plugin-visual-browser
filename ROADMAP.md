@@ -66,3 +66,11 @@
 - **交付物**：
   1. `src/index.ts` & `cordis.yml`：标准 DSH 插件入口。
   2. `src/guardrails/takeover.ts`：平时 100% 后台静默；仅当遇到登录、支付或验证码时，通过 DSH Approval Card 提示用户，并支持一键弹出该页面或通过 Screencast 画面流完成人工接管，完成后再次退回后台。
+
+---
+
+## v1.3.4 规划（TODO）
+
+- **`inspect_region(x, y, radius, zoom)` 局部 2× 放大能力**：针对全屏 WebGL / `<canvas>` 站点（`#ref` 为空、只能靠全屏截图盲估坐标）提供按需 2× 局部放大定位视图。
+- **`<canvas>` 交互响应探针**：结合局部微像素差分、指针光标形态（`pointer` / `grab`）及 URL/DOM 变化，自动辅助判断坐标交互是否在 Canvas 内生效。
+- **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性。

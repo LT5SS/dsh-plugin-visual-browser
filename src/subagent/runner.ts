@@ -3,10 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserSession } from '../driver/browser-session.js';
 import type {
+  ActionBlockedReason,
   BrowserSessionOptions,
   NavigateWaitUntil,
   NavigationDiagnostic,
   Point2D,
+  ScrollDiagnostic,
   VirtualCursorStyleConfig,
 } from '../driver/types.js';
 import { AtomicBrowserToolset } from '../tools/atomic-tools.js';
@@ -30,7 +32,7 @@ export type SubagentActionDecision =
     }
   | { type: 'move_mouse'; points: Point2D | Point2D[]; label?: string; reason: string }
   | { type: 'hover'; target: string | Point2D; reason: string }
-  | { type: 'click'; target: string | Point2D; reason: string }
+  | { type: 'click'; target: string | Point2D; if_present?: boolean; reason: string }
   | {
       type: 'drag';
       from: string | Point2D;
@@ -87,11 +89,13 @@ export interface SubagentTaskRequest {
     stepIndex: number;
     decision: SubagentActionDecision;
     ok: boolean;
-    blocked?: 'PLUGIN_UI_LAYER';
+    blocked?: ActionBlockedReason;
+    skipped?: boolean;
     hit?: string;
     at?: Point2D;
     hint?: string;
     midFrame?: string;
+    scroll?: ScrollDiagnostic;
   }) => void;
   planner?: SubagentPlanner;
 }
@@ -140,6 +144,7 @@ Respond ONLY with a single valid JSON object matching one of these actions:
 - {"type":"move_mouse","points":[{"x":300,"y":400},{"x":800,"y":420}],"label":"SWEEP","reason":"..."}
 - {"type":"hover","target":"#3","reason":"..."}
 - {"type":"click","target":"#8","reason":"..."}
+- {"type":"click","target":"#1","if_present":true,"reason":"..."} (optional: skip cleanly without failure if splash/banner already auto-dismissed)
 - {"type":"drag","from":"#2","to":{"x":640,"y":380},"steps":12,"reason":"..."}
 - {"type":"type_text","target":"#5","text":"hello","pressEnter":true,"reason":"..."}
 - {"type":"scroll","deltaY":800,"reason":"..."}
@@ -184,10 +189,18 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         points_count: Array.isArray(decision.points) ? decision.points.length : 1,
         ...(decision.label ? { label: decision.label } : {}),
       };
-    case 'hover':
     case 'click':
       return {
-        type: decision.type,
+        type: 'click',
+        target: decision.target,
+        ...(typeof decision.target === 'string' && decision.target.startsWith('#')
+          ? { ref: decision.target }
+          : {}),
+        ...(decision.if_present ? { if_present: true } : {}),
+      };
+    case 'hover':
+      return {
+        type: 'hover',
         target: decision.target,
         ...(typeof decision.target === 'string' && decision.target.startsWith('#')
           ? { ref: decision.target }
@@ -270,8 +283,15 @@ export function isValidSubagentDecision(value: unknown): value is SubagentAction
         isPoint2D(d.points)
       );
     case 'hover':
-    case 'click':
       return d.target !== undefined && d.target !== null && (typeof d.target === 'string' ? d.target.length > 0 : isPoint2D(d.target));
+    case 'click': {
+      const targetOk =
+        d.target !== undefined &&
+        d.target !== null &&
+        (typeof d.target === 'string' ? d.target.length > 0 : isPoint2D(d.target));
+      const ifPresentOk = d.if_present === undefined || typeof d.if_present === 'boolean';
+      return targetOk && ifPresentOk;
+    }
     case 'drag': {
       const fromOk =
         d.from !== undefined &&
@@ -1293,6 +1313,9 @@ export class BrowserSubagentRunner {
     let latestObs = state.latestObs;
     let latestNavigation = state.latestNavigation;
     let keepSessionAlive = false;
+    let consecutiveFailures = 0;
+    let lastStaleTarget: string | null = null;
+    let sameStaleCount = 0;
 
     const pauseNow = async (
       nextStep: number,
@@ -1454,28 +1477,93 @@ export class BrowserSubagentRunner {
           continue;
         }
 
-        let actionResult;
-        if (decision.type === 'move_mouse') {
-          actionResult = await tools.moveMouse(decision.points, decision.label ?? 'SUBAGENT SWEEP');
-        } else if (decision.type === 'hover') {
-          actionResult = await tools.hover(decision.target);
-        } else if (decision.type === 'click') {
-          actionResult = await tools.click(decision.target, 320);
-        } else if (decision.type === 'drag') {
-          actionResult = await tools.drag(decision.from, decision.to, decision.steps ?? 12, 200, {
-            keepSelection: decision.keepSelection,
-            signal: req.signal,
+        let actionResult: Awaited<ReturnType<AtomicBrowserToolset['click']>>;
+        try {
+          if (decision.type === 'move_mouse') {
+            actionResult = await tools.moveMouse(decision.points, decision.label ?? 'SUBAGENT SWEEP');
+          } else if (decision.type === 'hover') {
+            actionResult = await tools.hover(decision.target);
+          } else if (decision.type === 'click') {
+            actionResult = await tools.click(decision.target, 320, {
+              ifPresent: decision.if_present,
+            });
+          } else if (decision.type === 'drag') {
+            actionResult = await tools.drag(decision.from, decision.to, decision.steps ?? 12, 200, {
+              keepSelection: decision.keepSelection,
+              signal: req.signal,
+            });
+          } else if (decision.type === 'type_text') {
+            actionResult = await tools.typeText(
+              decision.target,
+              decision.text,
+              decision.pressEnter ?? false
+            );
+          } else if (decision.type === 'scroll') {
+            actionResult = await tools.scroll(decision.deltaY, 220);
+          } else {
+            throw new Error(`Unsupported decision: ${JSON.stringify(decision)}`);
+          }
+        } catch (actionErr: any) {
+          if (req.signal?.aborted) {
+            throw actionErr;
+          }
+          if (!session.isAlive()) {
+            const lostAt = new Date().toISOString();
+            this.writeSessionLostDiagnostics(req.artifactDir, subagentId, lostAt, 'user_closed_window');
+            return this.buildSessionLostResult(
+              subagentId,
+              req.role,
+              hostFacts.getFacts(),
+              hostFacts.formatHostFactsBlock(),
+              history.getStats()
+            );
+          }
+          const errMsg = String(actionErr?.message ?? actionErr).replace(/\s+/g, ' ').trim().slice(0, 240);
+          const blockedCode: ActionBlockedReason = /Timeout/i.test(errMsg)
+            ? 'ACTION_TIMEOUT'
+            : /REF_STALE/i.test(errMsg)
+              ? 'REF_STALE'
+              : 'ELEMENT_NOT_FOUND';
+          const recoveryObs = await tools.sampler.captureSnapshot('action_failed').catch(() => latestObs);
+          const failPayload = JSON.stringify({
+            ok: false,
+            blocked: blockedCode,
+            error: errMsg,
           });
-        } else if (decision.type === 'type_text') {
-          actionResult = await tools.typeText(
-            decision.target,
-            decision.text,
-            decision.pressEnter ?? false
-          );
-        } else if (decision.type === 'scroll') {
-          actionResult = await tools.scroll(decision.deltaY, 220);
+          actionResult = {
+            ok: false,
+            blocked: blockedCode,
+            hint: errMsg,
+            action: `Action ${decision.type} failed (${blockedCode}): ${errMsg}`,
+            observation: recoveryObs,
+            llmSummary: `[ACTION_FAILED] ${failPayload}\n\n${tools.sampler.formatObservationForLLM(recoveryObs)}`,
+          };
+        }
+
+        const isSuccess = actionResult.ok !== false && !actionResult.blocked;
+        if (isSuccess) {
+          consecutiveFailures = 0;
+          lastStaleTarget = null;
+          sameStaleCount = 0;
+        } else if (actionResult.blocked === 'REF_STALE') {
+          const targetKey =
+            typeof (decision as any).target === 'string'
+              ? (decision as any).target
+              : JSON.stringify((decision as any).target ?? (decision as any).from ?? '');
+          if (targetKey && targetKey === lastStaleTarget) {
+            sameStaleCount++;
+            if (sameStaleCount >= 2) {
+              consecutiveFailures++;
+              sameStaleCount = 0;
+            }
+          } else {
+            lastStaleTarget = targetKey || null;
+            sameStaleCount = 1;
+          }
         } else {
-          throw new Error(`Unsupported decision: ${JSON.stringify(decision)}`);
+          lastStaleTarget = null;
+          sameStaleCount = 0;
+          consecutiveFailures++;
         }
 
         req.onActionResult?.({
@@ -1483,10 +1571,12 @@ export class BrowserSubagentRunner {
           decision,
           ok: actionResult.ok !== false,
           blocked: actionResult.blocked,
+          skipped: actionResult.skipped,
           hit: actionResult.hit,
           at: actionResult.at,
           hint: actionResult.hint,
           ...(actionResult.midFrame ? { midFrame: actionResult.midFrame } : {}),
+          ...(actionResult.scroll ? { scroll: actionResult.scroll } : {}),
         });
 
         hostFacts.recordStep(actionResult.observation.screenshotPath);
@@ -1496,6 +1586,20 @@ export class BrowserSubagentRunner {
           actionResult.llmSummary
         );
         latestObs = actionResult.observation;
+
+        if (consecutiveFailures >= 3) {
+          return {
+            subagentId,
+            role: req.role,
+            status: 'MAX_STEPS_REACHED',
+            reason: 'ERROR_BUDGET_EXHAUSTED',
+            subagentReport: `Stopped cleanly after ${consecutiveFailures} consecutive recoverable action failures.\n\nLast failure: ${actionResult.action}\nLatest URL: ${latestObs.domStats.url}`,
+            hostFactsBlock: hostFacts.formatHostFactsBlock(),
+            hostFacts: hostFacts.getFacts(),
+            contextStats: history.getStats(),
+            ...(latestNavigation ? { navigation: latestNavigation } : {}),
+          };
+        }
 
         if (await session.checkHumanTakeoverRequested()) {
           return await pauseNow(

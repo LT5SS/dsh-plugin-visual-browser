@@ -53,31 +53,74 @@ export class AtomicBrowserToolset {
     async hover(target) {
         if (typeof target === 'string') {
             const selector = resolveTargetSelector(target);
-            await this.session.motion.hoverSelector(selector, { label: `HOVER ${target}` });
+            const probe = await this.session.motion.resolveTargetPoint(selector, 1200);
+            if (!probe.ok) {
+                const observation = await this.sampler.captureSnapshot('hover_refused');
+                const refusalJson = JSON.stringify({
+                    ok: false,
+                    blocked: probe.blocked,
+                    ref: target,
+                    hit: probe.hit,
+                    hint: probe.hint,
+                });
+                return {
+                    ok: false,
+                    blocked: probe.blocked,
+                    ref: target,
+                    hit: probe.hit,
+                    hint: probe.hint,
+                    action: `Hover target unavailable (${target}): ${probe.blocked}`,
+                    observation,
+                    llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+                };
+            }
+            await this.session.motion.moveTo(probe.point.x, probe.point.y, { label: `HOVER ${target}` });
         }
         else {
             await this.session.motion.moveTo(target.x, target.y, { label: `HOVER (${target.x},${target.y})` });
         }
         const observation = await this.sampler.captureSnapshot('hover');
         return {
+            ok: true,
             action: `Hovered over ${typeof target === 'string' ? target : `(${target.x},${target.y})`}`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };
     }
-    async click(target, waitMs = 240) {
+    async click(target, waitMs = 240, opts) {
         const clickRes = typeof target === 'string'
             ? await this.session.motion.clickSelector(resolveTargetSelector(target), {
                 label: `CLICK ${target}`,
+                timeoutMs: opts?.timeoutMs,
             })
             : await this.session.motion.clickAt(target.x, target.y, {
                 label: `CLICK (${target.x},${target.y})`,
             });
-        if (!clickRes.ok && clickRes.blocked === 'PLUGIN_UI_LAYER') {
+        if (!clickRes.ok && clickRes.blocked) {
+            const targetLabel = typeof target === 'string' ? target : `(${target.x},${target.y})`;
+            if (opts?.ifPresent &&
+                (clickRes.blocked === 'REF_STALE' || clickRes.blocked === 'ELEMENT_NOT_FOUND')) {
+                const observation = await this.sampler.captureSnapshot('click_if_present_skipped');
+                const skipInfo = JSON.stringify({
+                    ok: true,
+                    skipped: true,
+                    reason: clickRes.blocked,
+                    target: targetLabel,
+                });
+                return {
+                    ok: true,
+                    skipped: true,
+                    ...(typeof target === 'string' ? { ref: target } : {}),
+                    action: `Optional click skipped (${clickRes.blocked}): ${targetLabel} no longer present`,
+                    observation,
+                    llmSummary: `[OPTIONAL_CLICK_SKIPPED] ${skipInfo}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+                };
+            }
             const observation = await this.sampler.captureSnapshot('click_blocked');
             const refusalJson = JSON.stringify({
                 ok: false,
                 blocked: clickRes.blocked,
+                ...(typeof target === 'string' ? { ref: target } : {}),
                 at: clickRes.at,
                 hit: clickRes.hit,
                 hint: clickRes.hint,
@@ -85,10 +128,11 @@ export class AtomicBrowserToolset {
             return {
                 ok: false,
                 blocked: clickRes.blocked,
+                ...(typeof target === 'string' ? { ref: target } : {}),
                 hit: clickRes.hit,
                 at: clickRes.at,
                 hint: clickRes.hint,
-                action: `Blocked click at (${Math.round(clickRes.at.x)},${Math.round(clickRes.at.y)}) by ${clickRes.blocked} (${clickRes.hit ?? 'overlay'})`,
+                action: `Blocked click (${targetLabel}) by ${clickRes.blocked} (${clickRes.hit ?? 'target'})`,
                 observation,
                 llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
             };
@@ -108,11 +152,12 @@ export class AtomicBrowserToolset {
         const focusRes = await this.session.motion.clickSelector(selector, {
             label: `FOCUS ${target}`,
         });
-        if (!focusRes.ok && focusRes.blocked === 'PLUGIN_UI_LAYER') {
+        if (!focusRes.ok && focusRes.blocked) {
             const observation = await this.sampler.captureSnapshot('type_blocked');
             const refusalJson = JSON.stringify({
                 ok: false,
                 blocked: focusRes.blocked,
+                ref: target,
                 at: focusRes.at,
                 hit: focusRes.hit,
                 hint: focusRes.hint,
@@ -120,10 +165,11 @@ export class AtomicBrowserToolset {
             return {
                 ok: false,
                 blocked: focusRes.blocked,
+                ref: target,
                 hit: focusRes.hit,
                 at: focusRes.at,
                 hint: focusRes.hint,
-                action: `Blocked typeText focus at (${Math.round(focusRes.at.x)},${Math.round(focusRes.at.y)}) by ${focusRes.blocked} (${focusRes.hit ?? 'overlay'})`,
+                action: `Blocked typeText focus (${target}) by ${focusRes.blocked} (${focusRes.hit ?? 'target'})`,
                 observation,
                 llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
             };
@@ -144,8 +190,50 @@ export class AtomicBrowserToolset {
     async drag(from, to, steps = 12, waitMs = 200, opts) {
         const fromTarget = typeof from === 'string' ? resolveTargetSelector(from) : from;
         const toTarget = typeof to === 'string' ? resolveTargetSelector(to) : to;
-        const fromPt = await this.session.motion.resolvePoint(fromTarget);
-        const toPt = await this.session.motion.resolvePoint(toTarget);
+        const fromResolved = await this.session.motion.resolveTargetPoint(fromTarget, 1200);
+        if (!fromResolved.ok) {
+            const observation = await this.sampler.captureSnapshot('drag_blocked');
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: fromResolved.blocked,
+                ...(typeof from === 'string' ? { ref: from } : {}),
+                hit: fromResolved.hit,
+                hint: fromResolved.hint,
+            });
+            return {
+                ok: false,
+                blocked: fromResolved.blocked,
+                ...(typeof from === 'string' ? { ref: from } : {}),
+                hit: fromResolved.hit,
+                hint: fromResolved.hint,
+                action: `Blocked drag origin (${String(from)}) by ${fromResolved.blocked}`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        const toResolved = await this.session.motion.resolveTargetPoint(toTarget, 1200);
+        if (!toResolved.ok) {
+            const observation = await this.sampler.captureSnapshot('drag_blocked');
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: toResolved.blocked,
+                ...(typeof to === 'string' ? { ref: to } : {}),
+                hit: toResolved.hit,
+                hint: toResolved.hint,
+            });
+            return {
+                ok: false,
+                blocked: toResolved.blocked,
+                ...(typeof to === 'string' ? { ref: to } : {}),
+                hit: toResolved.hit,
+                hint: toResolved.hint,
+                action: `Blocked drag destination (${String(to)}) by ${toResolved.blocked}`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        const fromPt = fromResolved.point;
+        const toPt = toResolved.point;
         const midFilename = `step_${String(this.sampler.getNextStepNumber()).padStart(2, '0')}_drag_mid.png`;
         const midFullPath = path.join(this.sampler.getOutputDir(), midFilename);
         let capturedMidPath;
@@ -204,11 +292,94 @@ export class AtomicBrowserToolset {
             : directionOrDelta === 'down'
                 ? 760
                 : -760;
+        const beforeState = await safeEvaluate(this.session.page, () => {
+            const se = document.scrollingElement || document.documentElement || document.body;
+            const vw = window.innerWidth || 1;
+            const vh = window.innerHeight || 1;
+            const csBody = document.body ? window.getComputedStyle(document.body) : null;
+            const csHtml = window.getComputedStyle(document.documentElement);
+            const scrollHeight = Math.round(se ? se.scrollHeight : document.documentElement.scrollHeight || vh);
+            const clientHeight = Math.round(se ? se.clientHeight : vh);
+            const overflowHidden = (csHtml.overflowY === 'hidden' && (!csBody || csBody.overflowY === 'hidden')) ||
+                (csBody?.overflowY === 'hidden' && scrollHeight <= clientHeight + 2) ||
+                (csHtml.overflowY === 'hidden' && scrollHeight <= clientHeight + 2);
+            return {
+                scrollTop: Math.round(se ? se.scrollTop : window.scrollY || 0),
+                scrollHeight,
+                clientHeight,
+                vw,
+                vh,
+                overflowHidden,
+                url: window.location.href,
+                textLen: (document.body?.innerText || '').trim().length,
+            };
+        }, {
+            scrollTop: 0,
+            scrollHeight: 0,
+            clientHeight: 0,
+            vw: 1280,
+            vh: 720,
+            overflowHidden: false,
+            url: '',
+            textLen: 0,
+        }, 0);
+        const cursorPos = this.session.motion.getPosition();
+        const probeClip = beforeState.vw >= 320 && beforeState.vh >= 240
+            ? {
+                x: cursorPos.x > beforeState.vw * 0.5
+                    ? Math.max(16, Math.floor(beforeState.vw * 0.12))
+                    : Math.max(16, Math.floor(beforeState.vw * 0.56)),
+                y: Math.max(56, Math.floor((beforeState.vh - Math.min(180, Math.floor(beforeState.vh * 0.35))) * 0.5)),
+                width: Math.min(260, Math.floor(beforeState.vw * 0.35)),
+                height: Math.min(180, Math.floor(beforeState.vh * 0.35)),
+            }
+            : null;
+        const beforeProbe = probeClip
+            ? await this.session.page
+                .screenshot({ clip: probeClip, type: 'jpeg', quality: 65 })
+                .catch(() => null)
+            : null;
         await this.session.motion.smoothScroll(deltaY, 18, 380);
         if (waitMs > 0)
             await this.session.page.waitForTimeout(waitMs);
+        const afterState = await safeEvaluate(this.session.page, () => {
+            const se = document.scrollingElement || document.documentElement || document.body;
+            return {
+                scrollTop: Math.round(se ? se.scrollTop : window.scrollY || 0),
+                url: window.location.href,
+                textLen: (document.body?.innerText || '').trim().length,
+            };
+        }, { scrollTop: beforeState.scrollTop, url: beforeState.url, textLen: beforeState.textLen }, 0);
+        const effectiveDomDelta = Math.round(afterState.scrollTop - beforeState.scrollTop);
+        const domScrollable = beforeState.scrollHeight > beforeState.clientHeight + 2 && !beforeState.overflowHidden;
+        const atBoundary = domScrollable &&
+            ((deltaY > 0 && beforeState.scrollTop + beforeState.clientHeight >= beforeState.scrollHeight - 2) ||
+                (deltaY < 0 && beforeState.scrollTop <= 2));
+        let visualChanged = effectiveDomDelta !== 0 ||
+            afterState.url !== beforeState.url ||
+            afterState.textLen !== beforeState.textLen;
+        if (!visualChanged && beforeProbe && probeClip) {
+            const afterProbe = await this.session.page
+                .screenshot({ clip: probeClip, type: 'jpeg', quality: 65 })
+                .catch(() => null);
+            if (afterProbe) {
+                visualChanged = !beforeProbe.equals(afterProbe);
+            }
+        }
+        const locked = effectiveDomDelta === 0 && !visualChanged && (!domScrollable || !atBoundary);
+        const scrollDiag = {
+            attempted: Math.round(deltaY),
+            effective_dom_delta: effectiveDomDelta,
+            dom_scrollable: domScrollable,
+            visual_changed: visualChanged,
+            at_boundary: atBoundary,
+            locked,
+        };
         const observation = await this.sampler.captureSnapshot('scroll');
+        observation.scrollDiagnostic = scrollDiag;
         return {
+            ok: true,
+            scroll: scrollDiag,
             action: `Scrolled by ${deltaY}px`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),
