@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { Point2D } from '../driver/types.js';
+import type { NavigationDiagnostic, Point2D } from '../driver/types.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
 
 const NAVIGATION_RACE_PATTERN =
@@ -120,6 +120,7 @@ export interface PageObservation {
   interactiveElements: InteractiveElementNode[];
   health: TelemetryHealthReport;
   degradedReason?: string;
+  navigation?: NavigationDiagnostic;
 }
 
 export class PageSnapshotSampler {
@@ -402,15 +403,25 @@ export class PageSnapshotSampler {
   }
 
   public formatObservationForLLM(obs: PageObservation): string {
-    const { scroll, domStats, health, interactiveElements, cursorPosition } = obs;
+    const { scroll, domStats, health, interactiveElements, cursorPosition, navigation } = obs;
     const lines: string[] = [
       `### [Step ${obs.stepIndex}] Page Observation HUD`,
       ...(obs.degradedReason ? [`- **Notice**: ${obs.degradedReason}`] : []),
       `- **URL**: ${domStats.url} ("${domStats.title}")`,
+      ...(navigation
+        ? [
+            `- **Navigation**: wait_until=${navigation.wait_until}, timed_out=${navigation.timed_out}, elapsed_ms=${navigation.elapsed_ms}, final_url=${navigation.final_url}`,
+          ]
+        : []),
       `- **Screenshot**: ${obs.screenshotPath}`,
       `- **Virtual Cursor**: (${Math.round(cursorPosition.x)}, ${Math.round(cursorPosition.y)})`,
       `- **Scroll Progress**: ${scroll.scrollProgressPercent}% (Y: ${scroll.scrollY} / ${scroll.scrollHeight}px, Viewport: ${scroll.viewportWidth}x${scroll.viewportHeight})`,
       `- **DOM & Tech**: canvas=${domStats.counts.canvas}, svg=${domStats.counts.svg}, video=${domStats.counts.video}, img=${domStats.counts.img}, section=${domStats.counts.section}, openDialogs=${domStats.counts.openDialogs} | Tech=[${domStats.detectedTechHints.join(', ')}] | htmlData=${JSON.stringify(domStats.htmlDataAttributes)}`,
+      ...(domStats.counts.canvas > 0
+        ? [
+            `- **Canvas Notice**: tech: WebGL canvas — interactive content may live inside <canvas> and is not addressable by #ref`,
+          ]
+        : []),
       `- **Runtime Health**: ConsoleErrors=${health.consoleErrorsCount}, FailedRequests=${health.failedRequestsCount}/${health.totalRequests}`,
       ``,
       `#### Visible Interactive Controls (${interactiveElements.length} in viewport):`,

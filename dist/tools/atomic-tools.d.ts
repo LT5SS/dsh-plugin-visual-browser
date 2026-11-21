@@ -1,5 +1,5 @@
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
+import type { NavigateWaitUntil, NavigationDiagnostic, Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
 export interface DomInspectSample {
     tag: string;
@@ -28,6 +28,7 @@ export interface AtomicToolResult {
     hint?: string;
     midFrame?: string;
     midFramePath?: string;
+    navigation?: NavigationDiagnostic;
     extraData?: unknown;
 }
 /**
@@ -40,7 +41,10 @@ export declare class AtomicBrowserToolset {
     readonly session: BrowserSession;
     readonly sampler: PageSnapshotSampler;
     constructor(session: BrowserSession, snapshotDir: string);
-    navigate(url: string, waitMs?: number): Promise<AtomicToolResult>;
+    navigate(url: string, waitMs?: number, opts?: {
+        waitUntil?: NavigateWaitUntil;
+        timeoutMs?: number;
+    }): Promise<AtomicToolResult>;
     setCursorStyle(style: VirtualCursorStyleConfig): Promise<void>;
     moveMouse(target: Point2D | Point2D[], label?: string): Promise<AtomicToolResult>;
     hover(target: string | Point2D): Promise<AtomicToolResult>;

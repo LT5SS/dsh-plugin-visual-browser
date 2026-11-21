@@ -2,7 +2,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserSession } from '../driver/browser-session.js';
-import type { BrowserSessionOptions, Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
+import type {
+  BrowserSessionOptions,
+  NavigateWaitUntil,
+  NavigationDiagnostic,
+  Point2D,
+  VirtualCursorStyleConfig,
+} from '../driver/types.js';
 import { AtomicBrowserToolset } from '../tools/atomic-tools.js';
 import { HostFactsTracker, type HostFactsData } from './host-facts.js';
 import { SlidingWindowHistory, type SlidingContextStats } from './sliding-context.js';
@@ -15,7 +21,13 @@ import {
 } from '../guardrails/takeover.js';
 
 export type SubagentActionDecision =
-  | { type: 'navigate'; url: string; reason: string }
+  | {
+      type: 'navigate';
+      url: string;
+      waitUntil?: NavigateWaitUntil;
+      timeoutMs?: number;
+      reason: string;
+    }
   | { type: 'move_mouse'; points: Point2D | Point2D[]; label?: string; reason: string }
   | { type: 'hover'; target: string | Point2D; reason: string }
   | { type: 'click'; target: string | Point2D; reason: string }
@@ -54,6 +66,8 @@ export interface SubagentTaskRequest {
   role: string;
   taskPrompt: string;
   startUrl: string;
+  waitUntil?: NavigateWaitUntil;
+  timeoutMs?: number;
   artifactDir: string;
   maxSteps?: number;
   /** Sliding window size: max recent screenshots kept in VLM context (default: 3) */
@@ -99,6 +113,7 @@ export interface SubagentRunResult {
   hostFacts: HostFactsData;
   contextStats: SlidingContextStats;
   approvalCard?: DshApprovalCardPayload;
+  navigation?: NavigationDiagnostic;
 }
 
 interface PausedSubagentState {
@@ -111,6 +126,7 @@ interface PausedSubagentState {
   planner: SubagentPlanner;
   nextStep: number;
   maxSteps: number;
+  latestNavigation?: NavigationDiagnostic;
 }
 
 export const SUBAGENT_SYSTEM_PROMPT = `You are an isolated Visual Browser Subagent inside DeepSeek Harness (DSH).
@@ -237,8 +253,17 @@ export function isValidSubagentDecision(value: unknown): value is SubagentAction
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const d = value as Record<string, unknown>;
   switch (d.type) {
-    case 'navigate':
-      return typeof d.url === 'string' && d.url.trim().length > 0;
+    case 'navigate': {
+      const waitUntilOk =
+        d.waitUntil === undefined ||
+        d.waitUntil === 'domcontentloaded' ||
+        d.waitUntil === 'load' ||
+        d.waitUntil === 'networkidle';
+      const timeoutOk =
+        d.timeoutMs === undefined ||
+        (typeof d.timeoutMs === 'number' && Number.isFinite(d.timeoutMs) && d.timeoutMs >= 1000);
+      return typeof d.url === 'string' && d.url.trim().length > 0 && waitUntilOk && timeoutOk;
+    }
     case 'move_mouse':
       return (
         (Array.isArray(d.points) && d.points.length > 0 && d.points.every(isPoint2D)) ||
@@ -1103,7 +1128,10 @@ export class BrowserSubagentRunner {
         };
       }
 
-      const initRes = await tools.navigate(req.startUrl, 1200);
+      const initRes = await tools.navigate(req.startUrl, 600, {
+        waitUntil: req.waitUntil,
+        timeoutMs: req.timeoutMs,
+      });
       req.signal?.throwIfAborted();
       hostFacts.recordStep(initRes.observation.screenshotPath);
       history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
@@ -1119,6 +1147,7 @@ export class BrowserSubagentRunner {
         nextStep: 1,
         maxSteps,
         latestObs: initRes.observation,
+        latestNavigation: initRes.navigation,
         isSharedSession: isShared,
       });
     } catch (err) {
@@ -1235,6 +1264,7 @@ export class BrowserSubagentRunner {
         nextStep,
         maxSteps,
         latestObs: postTakeoverObs,
+        latestNavigation: paused.latestNavigation,
         isSharedSession: false,
       });
     } catch (err) {
@@ -1261,6 +1291,7 @@ export class BrowserSubagentRunner {
     const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps, isSharedSession } =
       state;
     let latestObs = state.latestObs;
+    let latestNavigation = state.latestNavigation;
     let keepSessionAlive = false;
 
     const pauseNow = async (
@@ -1284,6 +1315,7 @@ export class BrowserSubagentRunner {
         planner,
         nextStep,
         maxSteps,
+        latestNavigation,
       });
       const card = buildApprovalCard({
         subagentId,
@@ -1302,6 +1334,7 @@ export class BrowserSubagentRunner {
         hostFacts: hostFacts.getFacts(),
         contextStats: history.getStats(),
         approvalCard: card,
+        ...(latestNavigation ? { navigation: latestNavigation } : {}),
       };
     };
 
@@ -1359,6 +1392,7 @@ export class BrowserSubagentRunner {
             hostFactsBlock: hostFacts.formatHostFactsBlock(),
             hostFacts: hostFacts.getFacts(),
             contextStats: history.getStats(),
+            ...(latestNavigation ? { navigation: latestNavigation } : {}),
           };
         }
 
@@ -1384,7 +1418,11 @@ export class BrowserSubagentRunner {
             latestObs = snap;
             continue;
           }
-          const res = await tools.navigate(decision.url, 900);
+          const res = await tools.navigate(decision.url, 600, {
+            waitUntil: decision.waitUntil ?? req.waitUntil,
+            timeoutMs: decision.timeoutMs ?? req.timeoutMs,
+          });
+          latestNavigation = res.navigation ?? latestNavigation;
           hostFacts.recordStep(res.observation.screenshotPath);
           history.pushObservation(
             `${res.action} (${decision.reason})`,
@@ -1477,6 +1515,7 @@ export class BrowserSubagentRunner {
         hostFactsBlock: hostFacts.formatHostFactsBlock(),
         hostFacts: hostFacts.getFacts(),
         contextStats: history.getStats(),
+        ...(latestNavigation ? { navigation: latestNavigation } : {}),
       };
     } finally {
       if (!keepSessionAlive) {

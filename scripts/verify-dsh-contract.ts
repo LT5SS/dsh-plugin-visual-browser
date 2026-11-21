@@ -49,8 +49,38 @@ const MIME_MAP: Record<string, string> = {
 
 function startSilentStaticServer(rootDir: string): Promise<{ url: string; close: () => Promise<void> }> {
   return new Promise((resolve) => {
+    const openStreams = new Set<http.ServerResponse>();
     const server = http.createServer((req, res) => {
       const cleanUrl = (req.url || '/').split('?')[0];
+      if (cleanUrl === '/__never-ending-stream') {
+        openStreams.add(res);
+        res.on('close', () => openStreams.delete(res));
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        });
+        res.write(': keepalive\n\n');
+        return;
+      }
+      if (cleanUrl === '/__slow-stream-fixture.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Canvas Stream Fixture</title></head>
+<body style="margin:0;padding:24px;font-family:sans-serif;">
+  <h1>Canvas Stream Fixture</h1>
+  <canvas id="webgl-canvas" width="800" height="500" style="display:block;border:1px solid #333;"></canvas>
+  <p><a id="projects-link" href="#projects">Projects</a></p>
+  <script>
+    const ctx = document.getElementById('webgl-canvas').getContext('2d');
+    if (ctx) { ctx.fillStyle = '#111827'; ctx.fillRect(0, 0, 800, 500); ctx.fillStyle = '#00f0ff'; ctx.fillRect(40, 40, 120, 60); }
+    fetch('/__never-ending-stream').catch(() => {});
+  </script>
+</body>
+</html>`);
+        return;
+      }
       if (cleanUrl === '/__layer-iframe.html') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(`<!doctype html>
@@ -117,7 +147,17 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
       const addr = server.address() as { port: number };
       resolve({
         url: `http://127.0.0.1:${addr.port}/`,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+        close: () =>
+          new Promise<void>((r) => {
+            for (const streamRes of [...openStreams]) {
+              try {
+                streamRes.destroy();
+              } catch {}
+            }
+            openStreams.clear();
+            (server as any).closeAllConnections?.();
+            server.close(() => r());
+          }),
       });
     });
   });
@@ -2550,10 +2590,100 @@ async function main() {
       const midFrameDiskPath = path.join(artifactDir, subDragVal.subagent_id, dragDiagStep.action.mid_frame);
       assert.ok(fs.existsSync(midFrameDiskPath) && fs.statSync(midFrameDiskPath).size > 1000, `Expected non-empty mid-drag screenshot at ${midFrameDiskPath}`);
       assert.equal(dragDiagJson.steps?.totalSteps, 2, `mid_frame must not inflate totalSteps (expected 2, got ${dragDiagJson.steps?.totalSteps})`);
-      console.log('[Strict DSH 0.2 Contract] 5o Verified drag selection cleanup, *_drag_mid.png, preview drag, subagent drag action & scroll pulse!');
+    console.log('[Strict DSH 0.2 Contract] 5o Verified drag selection cleanup, *_drag_mid.png, preview drag, subagent drag action & scroll pulse!');
     } finally {
       await motionVisSession.close();
     }
+
+    // 5p. TASK-v1.3.2: domcontentloaded default + settle, non-fatal goto timeout, wait_until/timeout_ms tools params, navigation diagnostics & WebGL canvas HUD notice
+    const navHost = createCordisStrictCtx({ validateSchemas: true });
+    let navPlannerCalls = 0;
+    apply(navHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      artifactDir,
+      customPlanner: async () => {
+        navPlannerCalls++;
+        return { type: 'complete', report: `NAV_STEP_${navPlannerCalls}_OK` };
+      },
+    });
+    allDisposers.push(...navHost.effectDisposers);
+    const navQuickDef = navHost.registeredTools.get('browser_quick_snapshot')!;
+    const navRunDef = navHost.registeredTools.get('browser_subagent_run')!;
+
+    assert.ok((navQuickDef.parameters as any)?.properties?.wait_until, 'Expected wait_until schema parameter on browser_quick_snapshot');
+    assert.ok((navQuickDef.parameters as any)?.properties?.timeout_ms, 'Expected timeout_ms schema parameter on browser_quick_snapshot');
+    assert.ok((navRunDef.parameters as any)?.properties?.wait_until, 'Expected wait_until schema parameter on browser_subagent_run');
+    assert.ok((navRunDef.parameters as any)?.properties?.timeout_ms, 'Expected timeout_ms schema parameter on browser_subagent_run');
+
+    // 1) Default wait_until ('domcontentloaded') returns fast on persistent-stream WebGL canvas fixture with WebGL canvas notice
+    const slowUrl = `${srv.url}__slow-stream-fixture.html`;
+    const t0Default = Date.now();
+    const fastSnap: any = await navQuickDef.execute({ url: slowUrl }, fakeExec);
+    const fastElapsed = Date.now() - t0Default;
+    assert.ok(fastElapsed < 8000, `Expected default domcontentloaded snapshot < 8000ms on persistent stream, got ${fastElapsed}ms`);
+    assert.equal(fastSnap.navigation?.wait_until, 'domcontentloaded');
+    assert.equal(fastSnap.navigation?.timed_out, false);
+    assert.ok(String(fastSnap.navigation?.final_url ?? '').includes('__slow-stream-fixture.html'));
+    assert.ok(fs.existsSync(fastSnap.screenshot_path) && fs.statSync(fastSnap.screenshot_path).size > 1000);
+    assert.ok(String(fastSnap.hud_summary).includes('**Navigation**: wait_until=domcontentloaded, timed_out=false'));
+    assert.ok(
+      String(fastSnap.hud_summary).includes('tech: WebGL canvas — interactive content may live inside <canvas> and is not addressable by #ref'),
+      `Expected WebGL canvas notice in HUD, got:\n${fastSnap.hud_summary}`
+    );
+
+    // 2) Explicit wait_until='networkidle' + timeout_ms=1500 MUST NOT throw on committed persistent stream; returns screenshot + timed_out=true
+    const timedSnap: any = await navQuickDef.execute(
+      { url: slowUrl, wait_until: 'networkidle', timeout_ms: 1500 },
+      fakeExec
+    );
+    assert.equal(timedSnap.navigation?.wait_until, 'networkidle');
+    assert.equal(timedSnap.navigation?.timed_out, true);
+    assert.ok(fs.existsSync(timedSnap.screenshot_path) && fs.statSync(timedSnap.screenshot_path).size > 1000);
+    assert.ok(String(timedSnap.hud_summary).includes('timed_out=true'));
+
+    // 3) browser_subagent_run with networkidle + 1500ms timeout completes cleanly and persists navigation.timed_out=true in diagnostics.json
+    const slowSubRes: any = await navRunDef.execute(
+      {
+        url: slowUrl,
+        role: 'Stream Surveyor',
+        task_prompt: 'Inspect streaming canvas page',
+        max_steps: 2,
+        wait_until: 'networkidle',
+        timeout_ms: 1500,
+        window_mode: 'headless',
+      },
+      fakeExec
+    );
+    assert.equal(slowSubRes.status, 'COMPLETED');
+    assert.equal(slowSubRes.navigation?.wait_until, 'networkidle');
+    assert.equal(slowSubRes.navigation?.timed_out, true);
+    assert.ok(slowSubRes.diagnostics_path && fs.existsSync(slowSubRes.diagnostics_path));
+    const slowSubDiag = JSON.parse(fs.readFileSync(slowSubRes.diagnostics_path, 'utf8'));
+    assert.equal(slowSubDiag.navigation?.wait_until, 'networkidle');
+    assert.equal(slowSubDiag.navigation?.timed_out, true);
+    assert.ok(Number.isFinite(slowSubDiag.navigation?.elapsed_ms));
+
+    // 4) Non-canvas fixture with default wait_until records timed_out=false and omits WebGL canvas notice
+    const hudSubRes: any = await navRunDef.execute(
+      {
+        url: `${srv.url}__layer-iframe.html`,
+        role: 'HUD Check',
+        task_prompt: 'Verify normal non-canvas navigation diagnostics',
+        max_steps: 2,
+        window_mode: 'headless',
+      },
+      fakeExec
+    );
+    assert.equal(hudSubRes.status, 'COMPLETED');
+    assert.equal(hudSubRes.navigation?.wait_until, 'domcontentloaded');
+    assert.equal(hudSubRes.navigation?.timed_out, false);
+    const hudSubDiag = JSON.parse(fs.readFileSync(hudSubRes.diagnostics_path, 'utf8'));
+    assert.equal(hudSubDiag.navigation?.wait_until, 'domcontentloaded');
+    assert.equal(hudSubDiag.navigation?.timed_out, false);
+    const hudCheckSnap: any = await navQuickDef.execute({ url: `${srv.url}__layer-iframe.html` }, fakeExec);
+    assert.ok(!String(hudCheckSnap.hud_summary).includes('WebGL canvas'), 'Non-canvas page must not emit WebGL canvas notice');
+    console.log('[Strict DSH 0.2 Contract] 5p Verified non-fatal goto timeout, domcontentloaded default + settle, navigation diagnostics & WebGL canvas HUD notice!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

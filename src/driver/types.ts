@@ -1,3 +1,12 @@
+export type NavigateWaitUntil = 'domcontentloaded' | 'load' | 'networkidle';
+
+export interface NavigationDiagnostic {
+  wait_until: NavigateWaitUntil;
+  timed_out: boolean;
+  elapsed_ms: number;
+  final_url: string;
+}
+
 export type BrowserRuntimeMode =
   | 'auto'
   | 'dsh-electron-webview'

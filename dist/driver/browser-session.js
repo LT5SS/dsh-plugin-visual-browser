@@ -260,10 +260,22 @@ export class BrowserSession {
         });
         return this;
     }
-    async navigate(url, waitUntil = 'load') {
+    async navigate(url, waitUntil = 'domcontentloaded', timeoutMs = 30000) {
         this.telemetry.recordOrigin(url);
-        const curDoc = this.stripUrlHash(this.page.url());
+        const rawUrlBeforeGoto = (() => {
+            try {
+                return this.page.url();
+            }
+            catch {
+                return '';
+            }
+        })();
+        const curDoc = this.stripUrlHash(rawUrlBeforeGoto);
         const nextDoc = this.stripUrlHash(url);
+        const effectiveTimeoutMs = Number.isFinite(timeoutMs)
+            ? Math.max(1000, Math.min(120000, Math.round(timeoutMs)))
+            : 30000;
+        const startedAt = Date.now();
         // Pull any synchronous runtime setStyle() changes made directly via window.__dshCursorAPI before leaving the page.
         const dirtyStyle = await safeEvaluate(this.page, () => {
             if (window.__dshStyleDirty && window.__dshCursorAPI) {
@@ -283,15 +295,54 @@ export class BrowserSession {
         if (curDoc !== nextDoc) {
             this.motion.resetPosition(120, 120);
         }
+        let timedOut = false;
         this.navigatingViaSession = true;
         try {
-            await this.page.goto(url, { waitUntil, timeout: 30000 });
+            try {
+                await this.page.goto(url, { waitUntil, timeout: effectiveTimeoutMs });
+            }
+            catch (error) {
+                if (!/Timeout/i.test(String(error?.message ?? error))) {
+                    throw error;
+                }
+                timedOut = true;
+                const currentUrl = (() => {
+                    try {
+                        return this.page.url();
+                    }
+                    catch {
+                        return '';
+                    }
+                })();
+                const targetIsBlank = /^about:blank$/i.test(url.trim());
+                const currentIsBlank = !currentUrl || currentUrl === 'about:blank';
+                const isChromeError = /^chrome-error:\/\//i.test(currentUrl);
+                const stuckOnPreviousDoc = curDoc !== nextDoc &&
+                    curDoc !== 'about:blank' &&
+                    this.stripUrlHash(currentUrl) === curDoc;
+                const readyState = await safeEvaluate(this.page, () => String(document.readyState || ''), '', 0).catch(() => '');
+                if (isChromeError ||
+                    stuckOnPreviousDoc ||
+                    (!targetIsBlank && currentIsBlank && readyState !== 'complete')) {
+                    throw error;
+                }
+            }
+            if (!timedOut || waitUntil === 'domcontentloaded') {
+                await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => { });
+            }
+            await this.page.waitForTimeout(600);
             this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
         }
         finally {
             this.navigatingViaSession = false;
         }
         await this.motion.ensureCursorHUD(true);
+        return {
+            wait_until: waitUntil,
+            timed_out: timedOut,
+            elapsed_ms: Math.max(0, Date.now() - startedAt),
+            final_url: this.page.url(),
+        };
     }
     async screenshot(outputPath, retries = 2) {
         fs.mkdirSync(path.dirname(outputPath), { recursive: true });

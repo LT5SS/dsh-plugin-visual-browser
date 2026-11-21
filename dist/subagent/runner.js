@@ -106,8 +106,15 @@ export function isValidSubagentDecision(value) {
         return false;
     const d = value;
     switch (d.type) {
-        case 'navigate':
-            return typeof d.url === 'string' && d.url.trim().length > 0;
+        case 'navigate': {
+            const waitUntilOk = d.waitUntil === undefined ||
+                d.waitUntil === 'domcontentloaded' ||
+                d.waitUntil === 'load' ||
+                d.waitUntil === 'networkidle';
+            const timeoutOk = d.timeoutMs === undefined ||
+                (typeof d.timeoutMs === 'number' && Number.isFinite(d.timeoutMs) && d.timeoutMs >= 1000);
+            return typeof d.url === 'string' && d.url.trim().length > 0 && waitUntilOk && timeoutOk;
+        }
         case 'move_mouse':
             return ((Array.isArray(d.points) && d.points.length > 0 && d.points.every(isPoint2D)) ||
                 isPoint2D(d.points));
@@ -843,7 +850,10 @@ export class BrowserSubagentRunner {
                     contextStats: history.getStats(),
                 };
             }
-            const initRes = await tools.navigate(req.startUrl, 1200);
+            const initRes = await tools.navigate(req.startUrl, 600, {
+                waitUntil: req.waitUntil,
+                timeoutMs: req.timeoutMs,
+            });
             req.signal?.throwIfAborted();
             hostFacts.recordStep(initRes.observation.screenshotPath);
             history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
@@ -858,6 +868,7 @@ export class BrowserSubagentRunner {
                 nextStep: 1,
                 maxSteps,
                 latestObs: initRes.observation,
+                latestNavigation: initRes.navigation,
                 isSharedSession: isShared,
             });
         }
@@ -940,6 +951,7 @@ export class BrowserSubagentRunner {
                 nextStep,
                 maxSteps,
                 latestObs: postTakeoverObs,
+                latestNavigation: paused.latestNavigation,
                 isSharedSession: false,
             });
         }
@@ -959,6 +971,7 @@ export class BrowserSubagentRunner {
     async executeLoop(state) {
         const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps, isSharedSession } = state;
         let latestObs = state.latestObs;
+        let latestNavigation = state.latestNavigation;
         let keepSessionAlive = false;
         const pauseNow = async (nextStep, reason, url, details) => {
             keepSessionAlive = true;
@@ -976,6 +989,7 @@ export class BrowserSubagentRunner {
                 planner,
                 nextStep,
                 maxSteps,
+                latestNavigation,
             });
             const card = buildApprovalCard({
                 subagentId,
@@ -994,6 +1008,7 @@ export class BrowserSubagentRunner {
                 hostFacts: hostFacts.getFacts(),
                 contextStats: history.getStats(),
                 approvalCard: card,
+                ...(latestNavigation ? { navigation: latestNavigation } : {}),
             };
         };
         try {
@@ -1030,6 +1045,7 @@ export class BrowserSubagentRunner {
                         hostFactsBlock: hostFacts.formatHostFactsBlock(),
                         hostFacts: hostFacts.getFacts(),
                         contextStats: history.getStats(),
+                        ...(latestNavigation ? { navigation: latestNavigation } : {}),
                     };
                 }
                 if (decision.type === 'pause_for_takeover') {
@@ -1044,7 +1060,11 @@ export class BrowserSubagentRunner {
                         latestObs = snap;
                         continue;
                     }
-                    const res = await tools.navigate(decision.url, 900);
+                    const res = await tools.navigate(decision.url, 600, {
+                        waitUntil: decision.waitUntil ?? req.waitUntil,
+                        timeoutMs: decision.timeoutMs ?? req.timeoutMs,
+                    });
+                    latestNavigation = res.navigation ?? latestNavigation;
                     hostFacts.recordStep(res.observation.screenshotPath);
                     history.pushObservation(`${res.action} (${decision.reason})`, res.observation, res.llmSummary);
                     latestObs = res.observation;
@@ -1110,6 +1130,7 @@ export class BrowserSubagentRunner {
                 hostFactsBlock: hostFacts.formatHostFactsBlock(),
                 hostFacts: hostFacts.getFacts(),
                 contextStats: history.getStats(),
+                ...(latestNavigation ? { navigation: latestNavigation } : {}),
             };
         }
         finally {

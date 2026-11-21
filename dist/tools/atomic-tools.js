@@ -20,14 +20,16 @@ export class AtomicBrowserToolset {
         this.session = session;
         this.sampler = new PageSnapshotSampler(session, snapshotDir);
     }
-    async navigate(url, waitMs = 800) {
-        await this.session.navigate(url, 'networkidle');
+    async navigate(url, waitMs = 800, opts) {
+        const navigation = await this.session.navigate(url, opts?.waitUntil ?? 'domcontentloaded', opts?.timeoutMs ?? 30000);
         if (waitMs > 0)
             await this.session.page.waitForTimeout(waitMs);
         const observation = await this.sampler.captureSnapshot('navigate');
+        observation.navigation = navigation;
         return {
             action: `Navigated to ${url}`,
             observation,
+            navigation,
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };
     }

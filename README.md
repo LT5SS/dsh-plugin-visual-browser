@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.3.1 — Clean Drag Selection, Mid-Drag Evidence Frame, Preview Press-and-Drag & Directional Scroll)
+# `dsh-plugin-visual-browser` (v1.3.2 — Non-Fatal Navigate Timeout & `domcontentloaded` Settle, WebGL HUD Hint, Clean Drag & Directional Scroll)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -28,6 +28,7 @@
 4. **独立 Browser Subagent 循环 + 截图滑动窗口（省 80%+ 视觉 Token）**
    - 子循环内部默认只保留最近 3 张高清截图，旧步骤自动压缩为单行文字轨迹，不污染主 Agent 上下文；
    - 宿主代码强制生成不可伪造的 `[BROWSER_HOST_FACTS]` 校验头；
+   - **稳健导航等待与诊断（`domcontentloaded` + settle）**：默认等待条件为 `'domcontentloaded'` 并追加 5s 上限 `load` settle + 600ms 首屏渲染缓冲，支持通过 `browser_subagent_run` / `browser_quick_snapshot` 的可选参数 `wait_until`（`'domcontentloaded' | 'load' | 'networkidle'`）与 `timeout_ms`（`1000..120000`）按需覆写；即使长轮询/WebGL 常驻动画站点触发 `goto` 超时，只要页面已实质加载提交即不中止取证，并将 `navigation: { wait_until, timed_out, elapsed_ms, final_url }` 写入 HUD 与 `diagnostics.json`；当页面存在 `<canvas>` 时，HUD 自动补充 `tech: WebGL canvas` 交互提示；
    - 截图目录优先按 `config.artifactDir` → `DSH_BROWSER_ARTIFACT_DIR` → `DSH_HOME/artifacts/dsh-browser` → `~/.dsh/artifacts/dsh-browser` 解析（桌面 pack 模式下会跟随宿主注入的 `DSH_HOME`），不会落到找不到的外部目录。
 5. **自动门禁检测与原位人工接管（Approval Cards & Resume）**
    - 自动检测登录墙、支付结算页或 CAPTCHA 人机验证（绝不尝试绕过验证码），在原标签页挂起会话并返回 `DSH_BROWSER_TAKEOVER_CARD`，用户完成后可通过 `browser_subagent_resume` 原位继续。
@@ -54,7 +55,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.3.1+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.3.2+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）

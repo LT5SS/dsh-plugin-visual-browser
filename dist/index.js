@@ -652,6 +652,15 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 description: 'Optional window presentation override ("visible-background", "minimized", or "headless")',
                 enum: ['visible-background', 'minimized', 'headless'],
             },
+            wait_until: {
+                type: 'string',
+                description: 'Navigation wait condition ("domcontentloaded" default + settle, "load", or "networkidle")',
+                enum: ['domcontentloaded', 'load', 'networkidle'],
+            },
+            timeout_ms: {
+                type: 'integer',
+                description: 'Navigation goto timeout in ms (1000..120000, default: 30000)',
+            },
         },
         output: {
             schema: {
@@ -712,12 +721,21 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             const keepWindowOpen = getLiveKeepWindowOpen(effectiveWindowMode);
             const showTakeoverControl = getLiveShowTakeoverControl(effectiveWindowMode);
             const takeoverHotkey = getLiveTakeoverHotkey();
+            const waitUntil = args.wait_until === 'load' || args.wait_until === 'networkidle' || args.wait_until === 'domcontentloaded'
+                ? args.wait_until
+                : 'domcontentloaded';
+            const rawTimeout = Number(args.timeout_ms);
+            const timeoutMs = Number.isFinite(rawTimeout)
+                ? Math.max(1000, Math.min(120000, Math.round(rawTimeout)))
+                : 30000;
             try {
                 const res = await runner.runTask({
                     subagentId,
                     role: String(args.role || 'Browser Subagent'),
                     taskPrompt: String(args.task_prompt),
                     startUrl: String(args.url),
+                    waitUntil,
+                    timeoutMs,
                     artifactDir: artifactRoot,
                     maxSteps: Number(args.max_steps ?? config.maxSteps ?? 10),
                     maxRecentImages: config.maxRecentImages ?? 3,
@@ -772,6 +790,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     status: res.status,
                     subagent_id: res.subagentId,
                     window_mode: effectiveWindowMode,
+                    ...(res.navigation ? { navigation: res.navigation } : {}),
                     planner_mode: tracker.effectiveMode,
                     planner_detail: plannerDetail,
                     host_services: hostServicesStatus,
@@ -796,6 +815,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 return toLosslessJson({
                     status: res.status,
                     subagent_id: res.subagentId,
+                    ...(res.navigation ? { navigation: res.navigation } : {}),
                     planner_mode: tracker.effectiveMode,
                     planner_detail: plannerDetail,
                     host_services: hostServicesStatus,
@@ -1023,6 +1043,15 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 required: true,
                 description: 'Target URL to snapshot',
             },
+            wait_until: {
+                type: 'string',
+                description: 'Navigation wait condition ("domcontentloaded" default + settle, "load", or "networkidle")',
+                enum: ['domcontentloaded', 'load', 'networkidle'],
+            },
+            timeout_ms: {
+                type: 'integer',
+                description: 'Navigation goto timeout in ms (1000..120000, default: 30000)',
+            },
         },
         output: {
             schema: {
@@ -1084,11 +1113,19 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             exec?.signal?.addEventListener('abort', onAbort, { once: true });
             try {
                 const tools = new AtomicBrowserToolset(session, path.join(artifactRoot, 'quick-snapshots'));
-                const res = await tools.navigate(String(args.url), 1200);
+                const waitUntil = args.wait_until === 'load' || args.wait_until === 'networkidle' || args.wait_until === 'domcontentloaded'
+                    ? args.wait_until
+                    : 'domcontentloaded';
+                const rawTimeout = Number(args.timeout_ms);
+                const timeoutMs = Number.isFinite(rawTimeout)
+                    ? Math.max(1000, Math.min(120000, Math.round(rawTimeout)))
+                    : 30000;
+                const res = await tools.navigate(String(args.url), 600, { waitUntil, timeoutMs });
                 exec?.signal?.throwIfAborted();
                 const imageAttachment = await tryRegisterImageAttachment(resolvedServices, ctx, res.observation.screenshotPath);
                 return toLosslessJson({
                     screenshot_path: res.observation.screenshotPath.replace(/\\/g, '/'),
+                    ...(res.navigation ? { navigation: res.navigation } : {}),
                     hud_summary: res.llmSummary,
                     dom_stats: res.observation.domStats,
                     health: res.observation.health,

@@ -1,6 +1,11 @@
 import path from 'node:path';
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
+import type {
+  NavigateWaitUntil,
+  NavigationDiagnostic,
+  Point2D,
+  VirtualCursorStyleConfig,
+} from '../driver/types.js';
 import { PageSnapshotSampler, safeEvaluate, type PageObservation } from '../sampler/page-snapshot.js';
 
 export interface DomInspectSample {
@@ -32,6 +37,7 @@ export interface AtomicToolResult {
   hint?: string;
   midFrame?: string;
   midFramePath?: string;
+  navigation?: NavigationDiagnostic;
   extraData?: unknown;
 }
 
@@ -58,13 +64,23 @@ export class AtomicBrowserToolset {
     this.sampler = new PageSnapshotSampler(session, snapshotDir);
   }
 
-  public async navigate(url: string, waitMs = 800): Promise<AtomicToolResult> {
-    await this.session.navigate(url, 'networkidle');
+  public async navigate(
+    url: string,
+    waitMs = 800,
+    opts?: { waitUntil?: NavigateWaitUntil; timeoutMs?: number }
+  ): Promise<AtomicToolResult> {
+    const navigation = await this.session.navigate(
+      url,
+      opts?.waitUntil ?? 'domcontentloaded',
+      opts?.timeoutMs ?? 30000
+    );
     if (waitMs > 0) await this.session.page.waitForTimeout(waitMs);
     const observation = await this.sampler.captureSnapshot('navigate');
+    observation.navigation = navigation;
     return {
       action: `Navigated to ${url}`,
       observation,
+      navigation,
       llmSummary: this.sampler.formatObservationForLLM(observation),
     };
   }

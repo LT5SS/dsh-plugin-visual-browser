@@ -1,5 +1,5 @@
 import { type Browser, type BrowserContext, type Page } from 'playwright-core';
-import type { BrowserRuntimeMode, BrowserSessionOptions, BrowserWindowMode } from './types.js';
+import type { BrowserRuntimeMode, BrowserSessionOptions, BrowserWindowMode, NavigateWaitUntil, NavigationDiagnostic } from './types.js';
 import { HumanMotionController } from './human-motion.js';
 import { TelemetryCollector } from '../sampler/telemetry-collector.js';
 export declare function findLocalBrowserExecutable(): string;
@@ -33,7 +33,7 @@ export declare class BrowserSession {
     checkHumanTakeoverRequested(): Promise<boolean>;
     resetHumanTakeoverRequest(): Promise<void>;
     start(): Promise<this>;
-    navigate(url: string, waitUntil?: 'load' | 'domcontentloaded' | 'networkidle'): Promise<void>;
+    navigate(url: string, waitUntil?: NavigateWaitUntil, timeoutMs?: number): Promise<NavigationDiagnostic>;
     screenshot(outputPath: string, retries?: number): Promise<string>;
     close(): Promise<void>;
 }
