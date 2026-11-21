@@ -39,6 +39,12 @@ export class PageSnapshotSampler {
         this.session = session;
         this.outputDir = outputDir;
     }
+    getOutputDir() {
+        return this.outputDir;
+    }
+    getNextStepNumber() {
+        return this.stepCounter + 1;
+    }
     async captureSnapshot(tag = 'step') {
         this.stepCounter++;
         const page = this.session.page;

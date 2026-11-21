@@ -139,6 +139,7 @@ export interface DragActionResult {
   hit?: string;
   at?: Point2D;
   hint?: string;
+  midFrame?: string;
 }
 
 export interface MotionOptions {
@@ -146,4 +147,5 @@ export interface MotionOptions {
   steps?: number;
   arcCurvature?: number;
   label?: string;
+  keepSelection?: boolean;
 }

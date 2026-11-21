@@ -72,6 +72,9 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
   <h1>Layer Isolation Fixture</h1>
   <div id="shadow-host" style="position:fixed;top:90px;left:40px;width:160px;height:44px;"></div>
   <iframe id="same-origin-frame" src="/__layer-iframe.html" style="position:fixed;top:160px;left:40px;width:240px;height:90px;border:1px solid #999;"></iframe>
+  <p id="selectable-copy" style="position:fixed;top:290px;left:340px;width:440px;margin:0;font-size:18px;line-height:1.5;">Selectable body copy for drag selection clearing verification across multiple words.</p>
+  <a id="drag-link" href="#drag-target" style="position:fixed;top:360px;left:340px;color:#1d4ed8;" onclick="return false;">Draggable Link</a>
+  <button id="post-drag-btn" style="position:fixed;top:400px;left:340px;padding:8px 16px;" onclick="window.__postDragClicks=(window.__postDragClicks||0)+1;">Post Drag Click</button>
   <script>
     const host = document.getElementById('shadow-host');
     const sr = host.attachShadow({ mode: 'open' });
@@ -767,16 +770,108 @@ async function main() {
   assert.ok(!noProviderText.includes('正在读取视觉浏览器配置…'), 'Degraded panel without provider must NEVER render loading text');
   assert.ok(noProviderText.includes('宿主能力探测：'), 'Expected P1 diagnostic line in degraded view');
 
-  const readyFormText = collectTreeText(
-    renderPanelTree({
-      form: {
-        state: { status: 'ready', writable: true, revision: 1, value: { cursorStyle: { preset: 'comet-gold' } } },
-        mutate: async () => true,
-      },
-    })
-  );
+  const readyFormProps = {
+    form: {
+      state: { status: 'ready', writable: true, revision: 1, value: { cursorStyle: { preset: 'comet-gold' } } },
+      mutate: async () => true,
+    },
+  };
+  const readyFormTree = renderPanelTree(readyFormProps);
+  const readyFormText = collectTreeText(readyFormTree);
   assert.ok(!readyFormText.includes('未向本插件提供可视化配置表单'));
   assert.ok(readyFormText.includes('保存设置'));
+  assert.ok(
+    readyFormText.includes('在画布内移动鼠标预览拖尾，单击预览点击波纹，按住拖动预览拖拽动效。'),
+    'Expected updated ZH previewHint copy in LiveCursorPreview'
+  );
+  assert.ok(
+    clientSource.includes('Move to preview trails, click to preview the ripple, press-and-drag to preview drag.'),
+    'Expected updated EN previewHint copy in dist/client.js'
+  );
+
+  const findVNode = (node: any, pred: (n: any) => boolean): any => {
+    if (node == null || typeof node !== 'object') return null;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const hit = findVNode(item, pred);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    if (pred(node)) return node;
+    return findVNode(node.children, pred);
+  };
+  let capturedPointerId: number | null = null;
+  let releasedPointerId: number | null = null;
+  const mockStageTarget = {
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 420, height: 210 }),
+    setPointerCapture: (id: number) => {
+      capturedPointerId = id;
+    },
+    releasePointerCapture: (id: number) => {
+      releasedPointerId = id;
+    },
+  };
+  const stageVNode0 = findVNode(
+    readyFormTree,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  assert.ok(stageVNode0 && typeof stageVNode0.props.onPointerDown === 'function', 'Expected pointer handlers on preview stage');
+  stageVNode0.props.onPointerDown({
+    button: 0,
+    pointerId: 7,
+    clientX: 100,
+    clientY: 80,
+    currentTarget: mockStageTarget,
+  });
+  assert.equal(capturedPointerId, 7, 'Expected setPointerCapture called on pointerdown');
+
+  const treeDown = renderPanelTree(readyFormProps, false);
+  const ptrDown = findVNode(treeDown, (n) => n?.props?.['data-dsh-preview-pointer'] === 'true');
+  const anchorDown = findVNode(treeDown, (n) => n?.props?.['data-dsh-preview-anchor'] === 'true');
+  assert.ok(ptrDown?.props?.style?.transform?.includes('scale(0.86)'), 'Expected scale(0.86) in preview while dragging');
+  assert.ok(anchorDown && anchorDown.props.cx === 100 && anchorDown.props.cy === 80 && anchorDown.props.r === 9);
+  assert.equal(anchorDown.props.strokeDasharray, '3 3');
+
+  const stageVNodeDown = findVNode(
+    treeDown,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  stageVNodeDown.props.onPointerMove({
+    pointerId: 7,
+    clientX: 220,
+    clientY: 140,
+    currentTarget: mockStageTarget,
+  });
+  const treeDragging = renderPanelTree(readyFormProps, false);
+  const dragLine = findVNode(treeDragging, (n) => n?.props?.['data-dsh-preview-drag-line'] === 'true');
+  assert.ok(dragLine && dragLine.props.x1 === 100 && dragLine.props.x2 === 220);
+  assert.ok(Math.abs(Number(dragLine.props.strokeWidth) - 4.5 * 1.8) < 0.01, `Expected thickened preview drag line, got ${dragLine.props.strokeWidth}`);
+
+  const stageVNodeMove = findVNode(
+    treeDragging,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  // Release OUTSIDE canvas bounds (600, 400 -> clamped 412, 202) to verify setPointerCapture recovery
+  stageVNodeMove.props.onPointerUp({
+    pointerId: 7,
+    clientX: 600,
+    clientY: 400,
+    currentTarget: mockStageTarget,
+  });
+  assert.equal(releasedPointerId, 7, 'Expected releasePointerCapture on pointerup');
+  const treeDrop = renderPanelTree(readyFormProps, false);
+  const ptrDrop = findVNode(treeDrop, (n) => n?.props?.['data-dsh-preview-pointer'] === 'true');
+  const dropInner = findVNode(treeDrop, (n) => n?.props?.['data-dsh-preview-drop'] === 'inner');
+  const dropOuter = findVNode(treeDrop, (n) => n?.props?.['data-dsh-preview-drop'] === 'outer');
+  assert.ok(!ptrDrop?.props?.style?.transform?.includes('scale(0.86)'), 'Preview pointer must not stay pressed after pointerup outside stage');
+  assert.ok(dropInner && dropOuter && !dropInner.props.strokeDasharray && !dropOuter.props.strokeDasharray);
+  assert.ok(collectTreeText(treeDrop).includes('DROP (412,202)'), `Expected DROP badge after release, got ${collectTreeText(treeDrop)}`);
+  const dropClearTimer = recordedTimers.find((tm) => tm.ms === 1000);
+  assert.ok(dropClearTimer, 'Expected 1000ms timer to clear preview DROP state');
+  dropClearTimer!.cb();
+  const treeReset = renderPanelTree(readyFormProps, false);
+  assert.ok(collectTreeText(treeReset).includes('PREVIEW'), 'Expected preview badge restored to PREVIEW after 1s');
 
   const useHookText = collectTreeText(
     renderPanelTree({
@@ -2097,14 +2192,60 @@ async function main() {
 
       const dragEvents = await safeEvaluate(
         motionVisSession.page,
-        () => (window as any).__dragEvents,
-        { down: 0, move: 0, up: 0 },
+        () => {
+          const sel = window.getSelection?.();
+          return {
+            events: (window as any).__dragEvents,
+            isCollapsed: sel ? sel.isCollapsed : true,
+            selectedText: sel ? sel.toString() : '',
+            hasNoSelectStyle: Boolean(document.getElementById('__dsh_vc_drag_noselect__')),
+            hasDragStartHandler: typeof document.ondragstart === 'function',
+          };
+        },
+        {
+          events: { down: 0, move: 0, up: 0 },
+          isCollapsed: false,
+          selectedText: 'err',
+          hasNoSelectStyle: true,
+          hasDragStartHandler: true,
+        },
         0
       );
-      assert.ok(dragEvents.down >= 1 && dragEvents.move >= 6 && dragEvents.up >= 1, `Expected real mouse drag events, got ${JSON.stringify(dragEvents)}`);
+      assert.ok(dragEvents.events.down >= 1 && dragEvents.events.move >= 6 && dragEvents.events.up >= 1, `Expected real mouse drag events, got ${JSON.stringify(dragEvents.events)}`);
+      assert.equal(dragEvents.isCollapsed, true, `Expected collapsed selection after default drag, got text=${JSON.stringify(dragEvents.selectedText)}`);
+      assert.equal(dragEvents.selectedText, '', 'Expected empty selection text after default drag');
+      assert.equal(dragEvents.hasNoSelectStyle, false, 'Expected temporary user-select style removed after drag');
+      assert.equal(dragEvents.hasDragStartHandler, false, 'Expected document.ondragstart restored after drag');
+
+      // Ensure click immediately after drag succeeds on first try without getting swallowed
+      const motionTools = new AtomicBrowserToolset(motionVisSession, path.join(artifactDir, 'motion-vis'));
+      const postDragClick = await motionTools.click('#post-drag-btn', 80);
+      assert.equal(postDragClick.ok, true);
+      const postDragClicks = await safeEvaluate(
+        motionVisSession.page,
+        () => Number((window as any).__postDragClicks || 0),
+        0,
+        0
+      );
+      assert.equal(postDragClicks, 1, 'Expected immediate post-drag click to succeed on first attempt');
+
+      // Opt-in keepSelection: true preserves selected text across selectable copy
+      const keepSelDrag = await motionVisSession.motion.drag(
+        { x: 344, y: 298 },
+        { x: 640, y: 315 },
+        { steps: 6, durationMs: 100, keepSelection: true }
+      );
+      assert.equal(keepSelDrag.ok, true);
+      const preservedText = await safeEvaluate(
+        motionVisSession.page,
+        () => window.getSelection?.()?.toString?.() ?? '',
+        '',
+        0
+      );
+      assert.ok(preservedText.trim().length > 0, 'Expected keepSelection: true to preserve selected text');
+      await safeEvaluate(motionVisSession.page, () => window.getSelection?.()?.removeAllRanges?.(), undefined, 0);
 
       // Test scroll directional indicator (.up/.down SVG highlight) & vertical pulse + 400ms auto-restore
-      const motionTools = new AtomicBrowserToolset(motionVisSession, path.join(artifactDir, 'motion-vis'));
       const scrollResDown = await motionTools.scroll(400, 60);
       assert.ok(scrollResDown.action.includes('Scrolled by 400'));
       const duringScrollDown = await safeEvaluate(
@@ -2265,34 +2406,50 @@ async function main() {
       );
       assert.ok(afterNextScroll.downOpacity > 0.9 && afterNextScroll.upOpacity < 0.4, `Expected fresh downward highlight after prior upward scroll, got ${JSON.stringify(afterNextScroll)}`);
 
-      // Subagent runner end-to-end with { type: 'drag' }
-      const subagentDragRunner = new BrowserSubagentRunner();
-      let subStep = 0;
-      const subDragRes = await subagentDragRunner.runTask({
-        startUrl: `${srv.url}__layer-fixture.html`,
-        role: 'Drag Subagent',
-        taskPrompt: 'Execute drag decision then complete',
-        maxSteps: 3,
+      // Subagent runner end-to-end with { type: 'drag' } + A2 mid_frame diagnostics verification
+      const dragMidHost = createCordisStrictCtx({ validateSchemas: false });
+      let dragSubStep = 0;
+      apply(dragMidHost.ctx, {
+        mode: 'auto',
+        windowMode: 'headless',
         artifactDir,
-        sessionOptions: { mode: 'auto', windowMode: 'headless' },
-        planner: async () => {
-          subStep++;
-          if (subStep === 1) {
+        customPlanner: async () => {
+          dragSubStep++;
+          if (dragSubStep === 1) {
             return {
               type: 'drag',
-              from: { x: 360, y: 300 },
-              to: { x: 700, y: 420 },
+              from: { x: 350, y: 300 },
+              to: { x: 700, y: 325 },
               steps: 6,
-              reason: 'Test subagent drag action',
+              reason: 'Test subagent drag action with mid_frame & clean selection',
             };
           }
           return { type: 'complete', report: 'DRAG_SUBAGENT_OK' };
         },
       });
-      assert.equal(subDragRes.status, 'COMPLETED');
-      assert.ok(subDragRes.subagentReport.includes('DRAG_SUBAGENT_OK'));
-      await subagentDragRunner.closeAllSessions();
-      console.log('[Strict DSH 0.2 Contract] 5o Verified drag 3-state visuals, subagent drag action & scroll ↕ pulse!');
+      allDisposers.push(...dragMidHost.effectDisposers);
+      const dragSubRunDef = dragMidHost.registeredTools.get('browser_subagent_run')!;
+      const subDragVal: any = await dragSubRunDef.execute(
+        {
+          url: `${srv.url}__layer-fixture.html`,
+          role: 'Drag Subagent',
+          task_prompt: 'Execute drag decision then complete',
+          max_steps: 3,
+          window_mode: 'headless',
+        },
+        fakeExec
+      );
+      assert.equal(subDragVal.status, 'COMPLETED');
+      assert.ok(String(subDragVal.subagent_report ?? '').includes('DRAG_SUBAGENT_OK'));
+      assert.ok(subDragVal.diagnostics_path && fs.existsSync(subDragVal.diagnostics_path), 'Expected drag diagnostics.json');
+      const dragDiagJson = JSON.parse(fs.readFileSync(subDragVal.diagnostics_path, 'utf8'));
+      const dragDiagStep = (dragDiagJson.planner_detail?.llm_steps ?? []).find((s: any) => s.action?.type === 'drag');
+      assert.ok(dragDiagStep?.action?.mid_frame, `Expected mid_frame in drag step diagnostics, got ${JSON.stringify(dragDiagStep)}`);
+      assert.match(String(dragDiagStep.action.mid_frame), /^step_\d+_drag_mid\.png$/);
+      const midFrameDiskPath = path.join(artifactDir, subDragVal.subagent_id, dragDiagStep.action.mid_frame);
+      assert.ok(fs.existsSync(midFrameDiskPath) && fs.statSync(midFrameDiskPath).size > 1000, `Expected non-empty mid-drag screenshot at ${midFrameDiskPath}`);
+      assert.equal(dragDiagJson.steps?.totalSteps, 2, `mid_frame must not inflate totalSteps (expected 2, got ${dragDiagJson.steps?.totalSteps})`);
+      console.log('[Strict DSH 0.2 Contract] 5o Verified drag selection cleanup, *_drag_mid.png, preview drag, subagent drag action & scroll pulse!');
     } finally {
       await motionVisSession.close();
     }

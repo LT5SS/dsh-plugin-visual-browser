@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { PageSnapshotSampler, safeEvaluate } from '../sampler/page-snapshot.js';
 /**
  * Normalizes a target string:
@@ -138,12 +139,32 @@ export class AtomicBrowserToolset {
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };
     }
-    async drag(from, to, steps = 12, waitMs = 200) {
+    async drag(from, to, steps = 12, waitMs = 200, opts) {
         const fromTarget = typeof from === 'string' ? resolveTargetSelector(from) : from;
         const toTarget = typeof to === 'string' ? resolveTargetSelector(to) : to;
         const fromPt = await this.session.motion.resolvePoint(fromTarget);
         const toPt = await this.session.motion.resolvePoint(toTarget);
-        const dragRes = await this.session.motion.drag(fromPt, toPt, { steps });
+        const midFilename = `step_${String(this.sampler.getNextStepNumber()).padStart(2, '0')}_drag_mid.png`;
+        const midFullPath = path.join(this.sampler.getOutputDir(), midFilename);
+        let capturedMidPath;
+        let capturedMidFile;
+        const dragRes = await this.session.motion.drag(fromPt, toPt, {
+            steps,
+            keepSelection: opts?.keepSelection,
+            signal: opts?.signal,
+            onPhase: async (phase) => {
+                if (phase === 'dragging' && !capturedMidPath) {
+                    try {
+                        capturedMidPath = await this.session.screenshot(midFullPath);
+                        capturedMidFile = midFilename;
+                    }
+                    catch {
+                        // mid-drag evidence frame failure must never abort drag action
+                    }
+                }
+                await opts?.onPhase?.(phase);
+            },
+        });
         if (!dragRes.ok && dragRes.blocked === 'PLUGIN_UI_LAYER') {
             const observation = await this.sampler.captureSnapshot('drag_blocked');
             const refusalJson = JSON.stringify({
@@ -169,6 +190,7 @@ export class AtomicBrowserToolset {
         const observation = await this.sampler.captureSnapshot('drag');
         return {
             ok: true,
+            ...(capturedMidFile ? { midFrame: capturedMidFile, midFramePath: capturedMidPath } : {}),
             action: `Dragged from (${Math.round(fromPt.x)},${Math.round(fromPt.y)}) to (${Math.round(toPt.x)},${Math.round(toPt.y)})`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),

@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.2.9 — Close Guard, SESSION_LOST, Persistent Cursor Settings, Drag/Scroll Directional Visuals & CSS Isolation)
+# `dsh-plugin-visual-browser` (v1.3.0 — Clean Drag Selection, Mid-Drag Evidence Frame, Preview Press-and-Drag & Directional Scroll)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -19,7 +19,7 @@
    - 三次贝塞尔弧线（Cubic Bezier）+ Ease-In-Out 速度曲线步进器，派发连续真实的 `pointermove` / `wheel` 事件；
    - 支持 **5 套内置预设**（`cyber-neon`、`comet-gold`、`laser-dots`、`stealth-minimal`、`clean-none`）+ `custom`，以及 **7 种指针造型**（`arrow`、`crosshair`、`dot`、`star`、`ring`、`custom-svg` 自定义路径、`custom-image` 上传本地图标或图片 URL + 热点偏移）；
    - 通过 `dsh.client` 与 live `.volatile()` Schema 在 DSH **设置 → 视觉浏览器**（以及 **插件 → dsh-plugin-visual-browser** 详情页）提供实时交互预览画布与全部参数调色板；当宿主 `settings.section` 未注入可写 `configForm`（如 DSH `0.2.1-rc.2`）时，自动通过插件自有持久化通道（`$DSH_HOME/artifacts/dsh-browser/settings.json` + `/__dsh_visual_browser/settings` HTTP 端点）写入落盘并在重启 DSH 后继续生效，同时实时热更新所有已打开的窗口与跨导航状态；
-   - **拖动与滚动视觉区分**：子代理新增 `drag` 动作（`mouse.move` → `down` → 贝塞尔插值 → `up`），呈现按下收缩 `scale(0.86)` + 加粗边框、反向渐变加粗拖尾、起点虚线锚点圈与 `DRAG`/`DROP` 徽标；`scroll` 动作在指针旁显示上下分向高亮 `▲`/`▼` 指示器（向下滚高亮 `▼`、向上滚高亮 `▲`）+ 竖直方向短脉冲并在结束后 400ms 自动恢复；
+   - **拖动与滚动视觉区分**：子代理新增 `drag` 动作（`mouse.move` → `down` → 贝塞尔插值 → `up`），呈现按下收缩 `scale(0.86)` + 加粗边框、反向渐变加粗拖尾、起点虚线锚点圈与 `DRAG`/`DROP` 徽标；拖动期间自动抑制原生 `dragstart` 与整页误选并在释放后清理选区（可选 `keepSelection: true` 保留选区），同时在约 50% 进度处自动抓取 `*_drag_mid.png` 过程证据帧写入 `diagnostics.json` (`mid_frame`)；设置预览画布同步支持移动拖尾、点击波纹与按住拖动演示；`scroll` 动作在指针旁显示上下分向高亮 `▲`/`▼` 指示器（向下滚高亮 `▼`、向上滚高亮 `▲`）+ 竖直方向短脉冲并在结束后 400ms 自动恢复；
    - **HUD 徽标防裁切、CSS 隔离与坐标同步**：顶层注入 UI 带作用域 CSS Reset（不受页面全局 `svg`/`div` margin/width 规则干扰），光标光环与箭头精确对齐落点，导航后宿主 `Virtual Cursor` 与页面徽标坐标实时保持一致；
    - 采用 Chromium `popover="manual"` Top-Layer 与 **点击前 `elementsFromPoint` 穿透层级命中测试**（穿透 Shadow DOM 与同源 iframe）：运行期右上角接管提示条默认 `pointer-events: none` 不挡下方 `Menu` 等站点元素；一旦任意点击落点命中处于顶层且可交互的插件 UI，立即拒绝派发真实 `mouse.click` 并返回 `{ ok: false, blocked: 'PLUGIN_UI_LAYER', hit }` 记录入 `diagnostics.json`；默认支持按 `F8`（可在设置自定义热键）随时触发人工接管。
    - **运行/暂停期关窗保护与 `SESSION_LOST` 安全恢复**：任务执行或 `PAUSED_FOR_TAKEOVER` 期间自动启用 `beforeunload` 守卫，回到 `idle` 或插件主动关闭会话前自动卸载；监听 `browser.on('disconnected')` 在窗口被手动关闭后清理挂起会话并向 `diagnostics.json` 追加 `browser_disconnected` 事件，后续调用 `browser_subagent_resume` 返回结构化 `SESSION_LOST` / `SESSION_NOT_FOUND` 状态而不再抛出裸 `Target closed` 异常。
@@ -54,7 +54,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.2.9+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.3.0+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）

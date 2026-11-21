@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { BrowserSession } from '../driver/browser-session.js';
 import type { Point2D, VirtualCursorStyleConfig } from '../driver/types.js';
 import { PageSnapshotSampler, safeEvaluate, type PageObservation } from '../sampler/page-snapshot.js';
@@ -29,6 +30,8 @@ export interface AtomicToolResult {
   hit?: string;
   at?: Point2D;
   hint?: string;
+  midFrame?: string;
+  midFramePath?: string;
   extraData?: unknown;
 }
 
@@ -191,13 +194,39 @@ export class AtomicBrowserToolset {
     from: string | Point2D,
     to: string | Point2D,
     steps = 12,
-    waitMs = 200
+    waitMs = 200,
+    opts?: {
+      keepSelection?: boolean;
+      signal?: AbortSignal;
+      onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
+    }
   ): Promise<AtomicToolResult> {
     const fromTarget = typeof from === 'string' ? resolveTargetSelector(from) : from;
     const toTarget = typeof to === 'string' ? resolveTargetSelector(to) : to;
     const fromPt = await this.session.motion.resolvePoint(fromTarget);
     const toPt = await this.session.motion.resolvePoint(toTarget);
-    const dragRes = await this.session.motion.drag(fromPt, toPt, { steps });
+
+    const midFilename = `step_${String(this.sampler.getNextStepNumber()).padStart(2, '0')}_drag_mid.png`;
+    const midFullPath = path.join(this.sampler.getOutputDir(), midFilename);
+    let capturedMidPath: string | undefined;
+    let capturedMidFile: string | undefined;
+
+    const dragRes = await this.session.motion.drag(fromPt, toPt, {
+      steps,
+      keepSelection: opts?.keepSelection,
+      signal: opts?.signal,
+      onPhase: async (phase) => {
+        if (phase === 'dragging' && !capturedMidPath) {
+          try {
+            capturedMidPath = await this.session.screenshot(midFullPath);
+            capturedMidFile = midFilename;
+          } catch {
+            // mid-drag evidence frame failure must never abort drag action
+          }
+        }
+        await opts?.onPhase?.(phase);
+      },
+    });
 
     if (!dragRes.ok && dragRes.blocked === 'PLUGIN_UI_LAYER') {
       const observation = await this.sampler.captureSnapshot('drag_blocked');
@@ -224,6 +253,7 @@ export class AtomicBrowserToolset {
     const observation = await this.sampler.captureSnapshot('drag');
     return {
       ok: true,
+      ...(capturedMidFile ? { midFrame: capturedMidFile, midFramePath: capturedMidPath } : {}),
       action: `Dragged from (${Math.round(fromPt.x)},${Math.round(fromPt.y)}) to (${Math.round(toPt.x)},${Math.round(toPt.y)})`,
       observation,
       llmSummary: this.sampler.formatObservationForLLM(observation),

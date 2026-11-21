@@ -132,6 +132,14 @@ export class PageSnapshotSampler {
     this.outputDir = outputDir;
   }
 
+  public getOutputDir(): string {
+    return this.outputDir;
+  }
+
+  public getNextStepNumber(): number {
+    return this.stepCounter + 1;
+  }
+
   public async captureSnapshot(tag = 'step'): Promise<PageObservation> {
     this.stepCounter++;
     const page = this.session.page;

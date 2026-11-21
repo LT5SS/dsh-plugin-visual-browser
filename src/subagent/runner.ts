@@ -19,7 +19,14 @@ export type SubagentActionDecision =
   | { type: 'move_mouse'; points: Point2D | Point2D[]; label?: string; reason: string }
   | { type: 'hover'; target: string | Point2D; reason: string }
   | { type: 'click'; target: string | Point2D; reason: string }
-  | { type: 'drag'; from: string | Point2D; to: string | Point2D; steps?: number; reason: string }
+  | {
+      type: 'drag';
+      from: string | Point2D;
+      to: string | Point2D;
+      steps?: number;
+      keepSelection?: boolean;
+      reason: string;
+    }
   | { type: 'type_text'; target: string; text: string; pressEnter?: boolean; reason: string }
   | { type: 'scroll'; deltaY: number; reason: string }
   | { type: 'set_cursor_style'; style: VirtualCursorStyleConfig; reason: string }
@@ -70,6 +77,7 @@ export interface SubagentTaskRequest {
     hit?: string;
     at?: Point2D;
     hint?: string;
+    midFrame?: string;
   }) => void;
   planner?: SubagentPlanner;
 }
@@ -175,6 +183,9 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         from: decision.from,
         to: decision.to,
         ...(typeof decision.steps === 'number' ? { steps: decision.steps } : {}),
+        ...(typeof decision.keepSelection === 'boolean'
+          ? { keepSelection: decision.keepSelection }
+          : {}),
       };
     case 'type_text':
       return {
@@ -248,7 +259,9 @@ export function isValidSubagentDecision(value: unknown): value is SubagentAction
       const stepsOk =
         d.steps === undefined ||
         (typeof d.steps === 'number' && Number.isFinite(d.steps) && d.steps >= 1);
-      return fromOk && toOk && stepsOk;
+      const keepSelectionOk =
+        d.keepSelection === undefined || typeof d.keepSelection === 'boolean';
+      return fromOk && toOk && stepsOk && keepSelectionOk;
     }
     case 'type_text':
       return typeof d.target === 'string' && d.target.length > 0 && typeof d.text === 'string';
@@ -1411,7 +1424,10 @@ export class BrowserSubagentRunner {
         } else if (decision.type === 'click') {
           actionResult = await tools.click(decision.target, 320);
         } else if (decision.type === 'drag') {
-          actionResult = await tools.drag(decision.from, decision.to, decision.steps ?? 12, 200);
+          actionResult = await tools.drag(decision.from, decision.to, decision.steps ?? 12, 200, {
+            keepSelection: decision.keepSelection,
+            signal: req.signal,
+          });
         } else if (decision.type === 'type_text') {
           actionResult = await tools.typeText(
             decision.target,
@@ -1432,6 +1448,7 @@ export class BrowserSubagentRunner {
           hit: actionResult.hit,
           at: actionResult.at,
           hint: actionResult.hint,
+          ...(actionResult.midFrame ? { midFrame: actionResult.midFrame } : {}),
         });
 
         hostFacts.recordStep(actionResult.observation.screenshotPath);

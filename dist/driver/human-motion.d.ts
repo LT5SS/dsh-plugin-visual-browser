@@ -53,6 +53,7 @@ export declare class HumanMotionController {
      * rendering press-shrink, thickened reversed-gradient drag trail, origin anchor ring, and drop state.
      */
     drag(from: Point2D, to: Point2D, opts?: MotionOptions & {
+        signal?: AbortSignal;
         onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
     }): Promise<DragActionResult>;
     smoothScroll(deltaY: number, frames?: number, durationMs?: number): Promise<void>;

@@ -61,6 +61,9 @@ export function summarizeDecisionAction(decision) {
                 from: decision.from,
                 to: decision.to,
                 ...(typeof decision.steps === 'number' ? { steps: decision.steps } : {}),
+                ...(typeof decision.keepSelection === 'boolean'
+                    ? { keepSelection: decision.keepSelection }
+                    : {}),
             };
         case 'type_text':
             return {
@@ -120,7 +123,8 @@ export function isValidSubagentDecision(value) {
                 (typeof d.to === 'string' ? d.to.length > 0 : isPoint2D(d.to));
             const stepsOk = d.steps === undefined ||
                 (typeof d.steps === 'number' && Number.isFinite(d.steps) && d.steps >= 1);
-            return fromOk && toOk && stepsOk;
+            const keepSelectionOk = d.keepSelection === undefined || typeof d.keepSelection === 'boolean';
+            return fromOk && toOk && stepsOk && keepSelectionOk;
         }
         case 'type_text':
             return typeof d.target === 'string' && d.target.length > 0 && typeof d.text === 'string';
@@ -1067,7 +1071,10 @@ export class BrowserSubagentRunner {
                     actionResult = await tools.click(decision.target, 320);
                 }
                 else if (decision.type === 'drag') {
-                    actionResult = await tools.drag(decision.from, decision.to, decision.steps ?? 12, 200);
+                    actionResult = await tools.drag(decision.from, decision.to, decision.steps ?? 12, 200, {
+                        keepSelection: decision.keepSelection,
+                        signal: req.signal,
+                    });
                 }
                 else if (decision.type === 'type_text') {
                     actionResult = await tools.typeText(decision.target, decision.text, decision.pressEnter ?? false);
@@ -1086,6 +1093,7 @@ export class BrowserSubagentRunner {
                     hit: actionResult.hit,
                     at: actionResult.at,
                     hint: actionResult.hint,
+                    ...(actionResult.midFrame ? { midFrame: actionResult.midFrame } : {}),
                 });
                 hostFacts.recordStep(actionResult.observation.screenshotPath);
                 history.pushObservation(`${actionResult.action} — ${decision.reason}`, actionResult.observation, actionResult.llmSummary);

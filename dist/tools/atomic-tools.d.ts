@@ -26,6 +26,8 @@ export interface AtomicToolResult {
     hit?: string;
     at?: Point2D;
     hint?: string;
+    midFrame?: string;
+    midFramePath?: string;
     extraData?: unknown;
 }
 /**
@@ -44,7 +46,11 @@ export declare class AtomicBrowserToolset {
     hover(target: string | Point2D): Promise<AtomicToolResult>;
     click(target: string | Point2D, waitMs?: number): Promise<AtomicToolResult>;
     typeText(target: string, text: string, pressEnter?: boolean): Promise<AtomicToolResult>;
-    drag(from: string | Point2D, to: string | Point2D, steps?: number, waitMs?: number): Promise<AtomicToolResult>;
+    drag(from: string | Point2D, to: string | Point2D, steps?: number, waitMs?: number, opts?: {
+        keepSelection?: boolean;
+        signal?: AbortSignal;
+        onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
+    }): Promise<AtomicToolResult>;
     scroll(directionOrDelta?: 'down' | 'up' | number, waitMs?: number): Promise<AtomicToolResult>;
     /**
      * Read-only DOM & computed style inspection query for the agent.

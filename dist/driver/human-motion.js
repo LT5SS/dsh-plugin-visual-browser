@@ -420,6 +420,7 @@ export class HumanMotionController {
         const steps = Math.max(2, Math.round(opts.steps ?? 12));
         const durationMs = opts.durationMs ?? Math.max(220, steps * 22);
         const curvature = opts.arcCurvature ?? 0.08;
+        const keepSelection = Boolean(opts.keepSelection);
         const p0 = { x: from.x, y: from.y };
         const p3 = { x: to.x, y: to.y };
         const dx = p3.x - p0.x;
@@ -440,6 +441,29 @@ export class HumanMotionController {
         const dragLabel = `DRAG (${Math.round(from.x)},${Math.round(from.y)}) → (${Math.round(to.x)},${Math.round(to.y)})`;
         let mouseIsDown = false;
         try {
+            if (!keepSelection) {
+                await safeEvaluate(this.page, () => {
+                    try {
+                        document.getElementById('__dsh_vc_drag_noselect__')?.remove();
+                        const styleEl = document.createElement('style');
+                        styleEl.id = '__dsh_vc_drag_noselect__';
+                        styleEl.textContent =
+                            'html,body,*{-webkit-user-select:none!important;user-select:none!important}';
+                        (document.head || document.documentElement)?.appendChild(styleEl);
+                    }
+                    catch { }
+                    try {
+                        if (!window.__dshDragStartSaved) {
+                            window.__dshPrevDragStart = document.ondragstart;
+                            window.__dshDragStartSaved = true;
+                        }
+                        document.ondragstart = (e) => {
+                            e.preventDefault();
+                        };
+                    }
+                    catch { }
+                }, undefined, 0).catch(() => { });
+            }
             await this.page.mouse.move(from.x, from.y);
             await this.page.mouse.down();
             mouseIsDown = true;
@@ -448,9 +472,9 @@ export class HumanMotionController {
                 window.__dshCursorAPI?.dragStart?.(px, py, lbl);
             }, undefined, { arg: { px: from.x, py: from.y, lbl: dragLabel }, retries: 0 });
             await opts.onPhase?.('down');
-            const midStep = Math.max(1, Math.ceil(steps / 2));
+            let midPhaseEmitted = false;
             for (let i = 1; i <= steps; i++) {
-                if (this.shouldAbort?.())
+                if (this.shouldAbort?.() || opts.signal?.aborted)
                     break;
                 const progress = easeInOutCubic(i / steps);
                 const pt = cubicBezier(p0, p1, p2, p3, progress);
@@ -459,7 +483,8 @@ export class HumanMotionController {
                 await safeEvaluate(this.page, ({ px, py, tx, ty }) => {
                     window.__dshCursorAPI?.dragMove?.(px, py, tx, ty);
                 }, undefined, { arg: { px: pt.x, py: pt.y, tx: to.x, ty: to.y }, retries: 0 });
-                if (i === midStep) {
+                if (!midPhaseEmitted && progress >= 0.5) {
+                    midPhaseEmitted = true;
                     await opts.onPhase?.('dragging');
                 }
                 await this.page.waitForTimeout(stepDelay);
@@ -483,6 +508,26 @@ export class HumanMotionController {
             if (mouseIsDown) {
                 await this.page.mouse.up().catch(() => { });
             }
+            await safeEvaluate(this.page, (shouldClearSelection) => {
+                try {
+                    document.getElementById('__dsh_vc_drag_noselect__')?.remove();
+                }
+                catch { }
+                try {
+                    if (window.__dshDragStartSaved) {
+                        document.ondragstart = window.__dshPrevDragStart ?? null;
+                        delete window.__dshPrevDragStart;
+                        delete window.__dshDragStartSaved;
+                    }
+                }
+                catch { }
+                if (shouldClearSelection) {
+                    try {
+                        window.getSelection?.()?.removeAllRanges?.();
+                    }
+                    catch { }
+                }
+            }, undefined, { arg: !keepSelection, retries: 0 }).catch(() => { });
         }
     }
     async smoothScroll(deltaY, frames = 16, durationMs = 360) {

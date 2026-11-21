@@ -513,6 +513,7 @@ export class HumanMotionController {
     from: Point2D,
     to: Point2D,
     opts: MotionOptions & {
+      signal?: AbortSignal;
       onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
     } = {}
   ): Promise<DragActionResult> {
@@ -541,6 +542,7 @@ export class HumanMotionController {
     const steps = Math.max(2, Math.round(opts.steps ?? 12));
     const durationMs = opts.durationMs ?? Math.max(220, steps * 22);
     const curvature = opts.arcCurvature ?? 0.08;
+    const keepSelection = Boolean(opts.keepSelection);
 
     const p0: Point2D = { x: from.x, y: from.y };
     const p3: Point2D = { x: to.x, y: to.y };
@@ -564,6 +566,33 @@ export class HumanMotionController {
 
     let mouseIsDown = false;
     try {
+      if (!keepSelection) {
+        await safeEvaluate(
+          this.page,
+          () => {
+            try {
+              document.getElementById('__dsh_vc_drag_noselect__')?.remove();
+              const styleEl = document.createElement('style');
+              styleEl.id = '__dsh_vc_drag_noselect__';
+              styleEl.textContent =
+                'html,body,*{-webkit-user-select:none!important;user-select:none!important}';
+              (document.head || document.documentElement)?.appendChild(styleEl);
+            } catch {}
+            try {
+              if (!(window as any).__dshDragStartSaved) {
+                (window as any).__dshPrevDragStart = document.ondragstart;
+                (window as any).__dshDragStartSaved = true;
+              }
+              document.ondragstart = (e: DragEvent) => {
+                e.preventDefault();
+              };
+            } catch {}
+          },
+          undefined,
+          0
+        ).catch(() => {});
+      }
+
       await this.page.mouse.move(from.x, from.y);
       await this.page.mouse.down();
       mouseIsDown = true;
@@ -579,9 +608,9 @@ export class HumanMotionController {
       );
       await opts.onPhase?.('down');
 
-      const midStep = Math.max(1, Math.ceil(steps / 2));
+      let midPhaseEmitted = false;
       for (let i = 1; i <= steps; i++) {
-        if (this.shouldAbort?.()) break;
+        if (this.shouldAbort?.() || opts.signal?.aborted) break;
         const progress = easeInOutCubic(i / steps);
         const pt = cubicBezier(p0, p1, p2, p3, progress);
         this.pos = pt;
@@ -595,7 +624,8 @@ export class HumanMotionController {
           undefined,
           { arg: { px: pt.x, py: pt.y, tx: to.x, ty: to.y }, retries: 0 }
         );
-        if (i === midStep) {
+        if (!midPhaseEmitted && progress >= 0.5) {
+          midPhaseEmitted = true;
           await opts.onPhase?.('dragging');
         }
         await this.page.waitForTimeout(stepDelay);
@@ -625,6 +655,28 @@ export class HumanMotionController {
       if (mouseIsDown) {
         await this.page.mouse.up().catch(() => {});
       }
+      await safeEvaluate(
+        this.page,
+        (shouldClearSelection: boolean) => {
+          try {
+            document.getElementById('__dsh_vc_drag_noselect__')?.remove();
+          } catch {}
+          try {
+            if ((window as any).__dshDragStartSaved) {
+              document.ondragstart = (window as any).__dshPrevDragStart ?? null;
+              delete (window as any).__dshPrevDragStart;
+              delete (window as any).__dshDragStartSaved;
+            }
+          } catch {}
+          if (shouldClearSelection) {
+            try {
+              window.getSelection?.()?.removeAllRanges?.();
+            } catch {}
+          }
+        },
+        undefined,
+        { arg: !keepSelection, retries: 0 }
+      ).catch(() => {});
     }
   }
 

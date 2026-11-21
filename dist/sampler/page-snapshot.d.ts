@@ -80,6 +80,8 @@ export declare class PageSnapshotSampler {
     private outputDir;
     private stepCounter;
     constructor(session: BrowserSession, outputDir: string);
+    getOutputDir(): string;
+    getNextStepNumber(): number;
     captureSnapshot(tag?: string): Promise<PageObservation>;
     formatObservationForLLM(obs: PageObservation): string;
 }

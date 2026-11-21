@@ -743,12 +743,13 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                             ...(info.blocked ? { blocked: info.blocked } : {}),
                             ...(info.hit ? { hit: info.hit } : {}),
                             ...(info.at ? { at: info.at } : {}),
+                            ...(info.midFrame ? { mid_frame: info.midFrame } : {}),
                         };
                         const existing = tracker.steps.find((s) => s.step === info.stepIndex);
                         if (existing) {
                             existing.action = actionSummary;
                         }
-                        else if (info.blocked) {
+                        else if (info.blocked || info.midFrame) {
                             tracker.steps.push({
                                 step: info.stepIndex,
                                 backend: tracker.initialMode === 'external-vision-api'

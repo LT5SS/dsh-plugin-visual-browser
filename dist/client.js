@@ -164,7 +164,7 @@ window.__ModuleLoader__.load({
       subtitle:
         "Customize preset or custom cursor shapes, trails, colors, and non-focus-stealing window behavior. Saved changes sync live to open shared browser windows.",
       previewTitle: "Interactive Live Preview",
-      previewHint: "Move cursor across the stage to preview trails; click to preview ripple.",
+      previewHint: "Move to preview trails, click to preview the ripple, press-and-drag to preview drag.",
       previewDark: "Dark Stage",
       previewLight: "Light Stage",
       presetsTitle: "Cursor Presets",
@@ -253,7 +253,7 @@ window.__ModuleLoader__.load({
       subtitle:
         "选择预设鼠标或自定义图形/图片指针、拖尾、颜色与后台不抢焦点窗口行为；保存后将实时同步至正在打开的共享浏览器窗口。",
       previewTitle: "实时交互预览画布",
-      previewHint: "在下方画布移动鼠标查看拖尾效果，点击可预览点击波纹。",
+      previewHint: "在画布内移动鼠标预览拖尾，单击预览点击波纹，按住拖动预览拖拽动效。",
       previewDark: "深色背景",
       previewLight: "浅色背景",
       presetsTitle: "快速预设模板",
@@ -348,7 +348,7 @@ window.__ModuleLoader__.load({
 .dshvb_bannerText{margin:0;font-size:12px;color:var(--dsw-alias-label-secondary,#cbd5e1);line-height:1.55}
 .dshvb_diag{margin:0;padding:8px 10px;border-radius:6px;background:rgba(15,23,42,0.45);border:1px dashed var(--dsw-alias-border-l2,rgba(148,163,184,0.22));font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--dsw-alias-label-tertiary,#94a3b8);word-break:break-all}
 .dshvb_cardTitle{margin:0;font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary,#f1f5f9);display:flex;align-items:center;justify-content:space-between;gap:8px}
-.dshvb_stage{position:relative;height:210px;border-radius:8px;overflow:hidden;border:1px solid var(--dsw-alias-border-l4,rgba(148,163,184,0.28));cursor:none;user-select:none}
+.dshvb_stage{position:relative;height:210px;border-radius:8px;overflow:hidden;border:1px solid var(--dsw-alias-border-l4,rgba(148,163,184,0.28));cursor:none;user-select:none;touch-action:none}
 .dshvb_stage.dark{background:radial-gradient(circle at 20% 20%,rgba(0,240,255,0.08),transparent 45%),#0b0f19;background-image:linear-gradient(to right,rgba(148,163,184,0.08) 1px,transparent 1px),linear-gradient(to bottom,rgba(148,163,184,0.08) 1px,transparent 1px);background-size:24px 24px}
 .dshvb_stage.light{background:#f8fafc;background-image:linear-gradient(to right,rgba(15,23,42,0.06) 1px,transparent 1px),linear-gradient(to bottom,rgba(15,23,42,0.06) 1px,transparent 1px);background-size:24px 24px}
 .dshvb_presets{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}
@@ -471,6 +471,10 @@ window.__ModuleLoader__.load({
 
     function LiveCursorPreview({ style, t }) {
       const stageRef = React.useRef(null);
+      const dragRef = React.useRef(null);
+      const suppressClickRef = React.useRef(false);
+      const styleKey = JSON.stringify(style);
+      const prevStyleKeyRef = React.useRef(styleKey);
       const [dark, setDark] = React.useState(true);
       const [pos, setPos] = React.useState({ x: 240, y: 108 });
       const [trail, setTrail] = React.useState([
@@ -481,6 +485,8 @@ window.__ModuleLoader__.load({
         { x: 240, y: 108 },
       ]);
       const [ripple, setRipple] = React.useState(null);
+      const [drag, setDrag] = React.useState(null);
+      const [drop, setDrop] = React.useState(null);
 
       React.useEffect(() => {
         if (!ripple) return;
@@ -488,23 +494,106 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer);
       }, [ripple]);
 
-      const onMouseMove = (ev) => {
-        if (!stageRef.current) return;
-        const rect = stageRef.current.getBoundingClientRect();
-        const x = Math.max(8, Math.min(rect.width - 8, ev.clientX - rect.left));
-        const y = Math.max(8, Math.min(rect.height - 8, ev.clientY - rect.top));
-        setPos({ x, y });
+      React.useEffect(() => {
+        if (!drop) return;
+        const timer = setTimeout(() => setDrop(null), 1000);
+        return () => clearTimeout(timer);
+      }, [drop]);
+
+      React.useEffect(() => {
+        if (prevStyleKeyRef.current !== styleKey) {
+          prevStyleKeyRef.current = styleKey;
+          dragRef.current = null;
+          setDrag(null);
+          setDrop(null);
+        }
+        return () => {
+          dragRef.current = null;
+        };
+      }, [styleKey]);
+
+      const toStagePoint = (ev) => {
+        const el = stageRef.current || ev?.currentTarget;
+        if (!el || typeof el.getBoundingClientRect !== "function") {
+          return { x: pos.x, y: pos.y };
+        }
+        const rect = el.getBoundingClientRect();
+        return {
+          x: Math.max(8, Math.min(rect.width - 8, ev.clientX - rect.left)),
+          y: Math.max(8, Math.min(rect.height - 8, ev.clientY - rect.top)),
+        };
+      };
+
+      const onPointerDown = (ev) => {
+        if (typeof ev.button === "number" && ev.button !== 0) return;
+        const p = toStagePoint(ev);
+        try {
+          if (typeof ev.pointerId === "number") {
+            ev.currentTarget?.setPointerCapture?.(ev.pointerId);
+          } else {
+            ev.currentTarget?.setPointerCapture?.(1);
+          }
+        } catch {}
+        const nextDrag = { from: p, to: p };
+        dragRef.current = nextDrag;
+        suppressClickRef.current = false;
+        setDrop(null);
+        setDrag(nextDrag);
+        setPos(p);
+      };
+
+      const onPointerMove = (ev) => {
+        const el = stageRef.current || ev?.currentTarget;
+        if (!el || typeof el.getBoundingClientRect !== "function") return;
+        const p = toStagePoint(ev);
+        setPos(p);
+        if (dragRef.current) {
+          const updated = { from: dragRef.current.from, to: p };
+          dragRef.current = updated;
+          setDrag(updated);
+        }
         setTrail((prev) => {
           const maxLen = Math.max(2, Math.min(60, Math.round(style.trailLength || 22)));
           const last = prev[prev.length - 1];
-          if (last && Math.hypot(x - last.x, y - last.y) < 3) return prev;
-          const next = [...prev, { x, y }];
+          if (last && Math.hypot(p.x - last.x, p.y - last.y) < 3) return prev;
+          const next = [...prev, p];
           while (next.length > maxLen) next.shift();
           return next;
         });
       };
 
+      const onPointerUp = (ev) => {
+        const active = dragRef.current;
+        if (!active) return;
+        const p = toStagePoint(ev);
+        try {
+          if (typeof ev.pointerId === "number") {
+            ev.currentTarget?.releasePointerCapture?.(ev.pointerId);
+          } else {
+            ev.currentTarget?.releasePointerCapture?.(1);
+          }
+        } catch {}
+        dragRef.current = null;
+        setDrag(null);
+        setPos(p);
+        if (Math.hypot(p.x - active.from.x, p.y - active.from.y) >= 4) {
+          suppressClickRef.current = true;
+          setRipple(null);
+          setDrop({ x: p.x, y: p.y, key: Date.now() });
+        }
+      };
+
+      const clearActiveDrag = () => {
+        if (!dragRef.current) return;
+        dragRef.current = null;
+        setDrag(null);
+      };
+
       const onStageClick = () => {
+        if (suppressClickRef.current) {
+          suppressClickRef.current = false;
+          return;
+        }
         setRipple({ x: pos.x, y: pos.y, key: Date.now() });
       };
 
@@ -522,6 +611,39 @@ window.__ModuleLoader__.load({
       const centerHot = ["crosshair", "dot", "star", "ring"].includes(style.pointerShape);
       const hotX = style.pointerShape === "custom-image" ? style.customPointerHotspotX : centerHot ? 14 : style.customPointerHotspotX;
       const hotY = style.pointerShape === "custom-image" ? style.customPointerHotspotY : centerHot ? 14 : style.customPointerHotspotY;
+      const dragGradX1 = drag ? drag.from.x : 0;
+      const dragGradY1 = drag ? drag.from.y : 0;
+      const dragGradX2 =
+        drag && drag.from.x === drag.to.x && drag.from.y === drag.to.y
+          ? drag.to.x + 1
+          : drag
+            ? drag.to.x
+            : 100;
+      const dragGradY2 = drag ? drag.to.y : 0;
+      const badgeLabel = drag
+        ? (style.badgeTextPrefix || "DSH") +
+          " · DRAG (" +
+          Math.round(drag.from.x) +
+          "," +
+          Math.round(drag.from.y) +
+          ") → (" +
+          Math.round(drag.to.x) +
+          "," +
+          Math.round(drag.to.y) +
+          ")"
+        : drop
+          ? (style.badgeTextPrefix || "DSH") +
+            " · DROP (" +
+            Math.round(drop.x) +
+            "," +
+            Math.round(drop.y) +
+            ")"
+          : (style.badgeTextPrefix || "DSH") +
+            " · (" +
+            Math.round(pos.x) +
+            ", " +
+            Math.round(pos.y) +
+            ") · PREVIEW";
 
       return e(
         "div",
@@ -550,7 +672,11 @@ window.__ModuleLoader__.load({
           {
             ref: stageRef,
             className: "dshvb_stage " + (dark ? "dark" : "light"),
-            onMouseMove,
+            onPointerDown,
+            onPointerMove,
+            onPointerUp,
+            onPointerCancel: clearActiveDrag,
+            onLostPointerCapture: clearActiveDrag,
             onClick: onStageClick,
           },
           e(
@@ -572,6 +698,19 @@ window.__ModuleLoader__.load({
                 { id: "dshvb_preview_grad", x1: "0%", y1: "0%", x2: "100%", y2: "0%" },
                 e("stop", { offset: "0%", stopColor: style.trailColorStart, stopOpacity: 0.25 }),
                 e("stop", { offset: "100%", stopColor: style.trailColorEnd, stopOpacity: 0.95 })
+              ),
+              e(
+                "linearGradient",
+                {
+                  id: "dshvb_preview_drag_grad",
+                  gradientUnits: "userSpaceOnUse",
+                  x1: dragGradX1,
+                  y1: dragGradY1,
+                  x2: dragGradX2,
+                  y2: dragGradY2,
+                },
+                e("stop", { offset: "0%", stopColor: style.trailColorStart, stopOpacity: 0.45 }),
+                e("stop", { offset: "100%", stopColor: style.trailColorEnd, stopOpacity: 0.98 })
               )
             ),
             style.trailVariant !== "none" &&
@@ -613,6 +752,70 @@ window.__ModuleLoader__.load({
                   fillOpacity: 0.2 + ratio * 0.78,
                 });
               }),
+            drag &&
+              e(
+                React.Fragment,
+                null,
+                style.trailVariant !== "none" &&
+                  e(
+                    React.Fragment,
+                    null,
+                    style.trailGlow &&
+                      e("line", {
+                        x1: drag.from.x,
+                        y1: drag.from.y,
+                        x2: drag.to.x,
+                        y2: drag.to.y,
+                        stroke: style.trailColorEnd,
+                        strokeOpacity: 0.3,
+                        strokeWidth: (style.trailWidth || 3) * 3.6,
+                        strokeLinecap: "round",
+                      }),
+                    e("line", {
+                      "data-dsh-preview-drag-line": "true",
+                      x1: drag.from.x,
+                      y1: drag.from.y,
+                      x2: drag.to.x,
+                      y2: drag.to.y,
+                      stroke: "url(#dshvb_preview_drag_grad)",
+                      strokeWidth: (style.trailWidth || 3) * 1.8,
+                      strokeLinecap: "round",
+                    })
+                  ),
+                e("circle", {
+                  "data-dsh-preview-anchor": "true",
+                  cx: drag.from.x,
+                  cy: drag.from.y,
+                  r: 9,
+                  fill: "rgba(0,240,255,0.16)",
+                  stroke: style.rippleColor,
+                  strokeWidth: 2,
+                  strokeDasharray: "3 3",
+                })
+              ),
+            drop &&
+              e(
+                React.Fragment,
+                { key: "drop-" + drop.key },
+                e("circle", {
+                  "data-dsh-preview-drop": "inner",
+                  cx: drop.x,
+                  cy: drop.y,
+                  r: 12,
+                  fill: "rgba(0,240,255,0.16)",
+                  stroke: style.rippleColor,
+                  strokeWidth: 2.2,
+                }),
+                e("circle", {
+                  "data-dsh-preview-drop": "outer",
+                  cx: drop.x,
+                  cy: drop.y,
+                  r: 22,
+                  fill: "none",
+                  stroke: style.pointerColor,
+                  strokeWidth: 1.6,
+                })
+              ),
             ripple &&
               e(
                 React.Fragment,
@@ -639,11 +842,19 @@ window.__ModuleLoader__.load({
           e(
             "div",
             {
+              "data-dsh-preview-pointer": "true",
               style: {
                 position: "absolute",
                 left: 0,
                 top: 0,
-                transform: "translate3d(" + pos.x + "px," + pos.y + "px,0)",
+                transform:
+                  "translate3d(" +
+                  pos.x +
+                  "px," +
+                  pos.y +
+                  "px,0)" +
+                  (drag ? " scale(0.86)" : ""),
+                transformOrigin: "0 0",
                 pointerEvents: "none",
               },
             },
@@ -656,8 +867,10 @@ window.__ModuleLoader__.load({
                 height: "18px",
                 boxSizing: "border-box",
                 borderRadius: "50%",
-                border: "2px solid " + style.rippleColor,
-                boxShadow: style.trailGlow ? "0 0 10px " + style.rippleColor : "none",
+                border: (drag ? "3px solid " : "2px solid ") + style.rippleColor,
+                boxShadow: style.trailGlow
+                  ? "0 0 " + (drag ? "16px " : "10px ") + style.rippleColor
+                  : "none",
               },
             }),
             safeCustomImg
@@ -696,7 +909,13 @@ window.__ModuleLoader__.load({
                       style.pointerShape === "crosshair"
                         ? style.pointerColor
                         : style.pointerBorderColor,
-                    strokeWidth: style.pointerShape === "crosshair" ? 2.4 : 2,
+                    strokeWidth: drag
+                      ? style.pointerShape === "crosshair"
+                        ? 3.6
+                        : 3.4
+                      : style.pointerShape === "crosshair"
+                        ? 2.4
+                        : 2,
                     strokeLinejoin: "round",
                     fillRule: "evenodd",
                   })
@@ -720,12 +939,7 @@ window.__ModuleLoader__.load({
                     fontFamily: "ui-monospace,Consolas,monospace",
                   },
                 },
-                (style.badgeTextPrefix || "DSH") +
-                  " · (" +
-                  Math.round(pos.x) +
-                  ", " +
-                  Math.round(pos.y) +
-                  ") · PREVIEW"
+                badgeLabel
               )
           )
         )

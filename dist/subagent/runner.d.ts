@@ -27,6 +27,7 @@ export type SubagentActionDecision = {
     from: string | Point2D;
     to: string | Point2D;
     steps?: number;
+    keepSelection?: boolean;
     reason: string;
 } | {
     type: 'type_text';
@@ -88,6 +89,7 @@ export interface SubagentTaskRequest {
         hit?: string;
         at?: Point2D;
         hint?: string;
+        midFrame?: string;
     }) => void;
     planner?: SubagentPlanner;
 }

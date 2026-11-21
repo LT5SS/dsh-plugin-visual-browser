@@ -110,10 +110,12 @@ export interface DragActionResult {
     hit?: string;
     at?: Point2D;
     hint?: string;
+    midFrame?: string;
 }
 export interface MotionOptions {
     durationMs?: number;
     steps?: number;
     arcCurvature?: number;
     label?: string;
+    keepSelection?: boolean;
 }
