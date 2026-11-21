@@ -51,6 +51,7 @@ export * from './tools/atomic-tools.js';
 export * from './settings-store.js';
 export * from './subagent/host-facts.js';
 export * from './subagent/sliding-context.js';
+export * from './subagent/findings.js';
 export * from './subagent/runner.js';
 export * from './guardrails/takeover.js';
 
@@ -1038,6 +1039,7 @@ export function createVisualBrowserTools(
           planner_detail: plannerDetail,
           host_services: hostServicesStatus,
           steps: res.contextStats,
+          findings: res.findings ?? [],
           host_facts: res.hostFacts,
         });
 
@@ -1068,6 +1070,7 @@ export function createVisualBrowserTools(
           subagent_report: res.subagentReport,
           approval_card: res.approvalCard ?? null,
           sliding_window_stats: res.contextStats,
+          findings: res.findings ?? [],
           ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
         });
       } catch (error: any) {
@@ -1155,6 +1158,7 @@ export function createVisualBrowserTools(
         subagent_report: res.subagentReport,
         approval_card: res.approvalCard ?? null,
         sliding_window_stats: res.contextStats,
+        findings: res.findings ?? [],
         ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
       });
     },

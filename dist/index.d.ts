@@ -13,6 +13,7 @@ export * from './tools/atomic-tools.js';
 export * from './settings-store.js';
 export * from './subagent/host-facts.js';
 export * from './subagent/sliding-context.js';
+export * from './subagent/findings.js';
 export * from './subagent/runner.js';
 export * from './guardrails/takeover.js';
 export interface DshCordisContext {

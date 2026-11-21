@@ -5,16 +5,18 @@ import { BrowserSession } from '../driver/browser-session.js';
 import { AtomicBrowserToolset } from '../tools/atomic-tools.js';
 import { HostFactsTracker } from './host-facts.js';
 import { SlidingWindowHistory } from './sliding-context.js';
+import { FindingsLedger, MAX_FINDINGS_ENTRIES, MAX_FINDING_NOTE_CHARS, MAX_FINDINGS_TOTAL_CHARS, RECENT_FINDINGS_WINDOW, } from './findings.js';
 import { isNavigationRaceError } from '../sampler/page-snapshot.js';
+export { FindingsLedger, MAX_FINDINGS_ENTRIES, MAX_FINDING_NOTE_CHARS, MAX_FINDINGS_TOTAL_CHARS, RECENT_FINDINGS_WINDOW, };
 import { buildApprovalCard, detectPageGate, } from '../guardrails/takeover.js';
 export const SUBAGENT_SYSTEM_PROMPT = `You are an isolated Visual Browser Subagent inside DeepSeek Harness (DSH).
 You operate a background browser equipped with a physical Bezier virtual cursor.
 At each step you receive:
 1. A compact archive of earlier steps (images evicted to save context);
 2. The latest 1-3 viewport screenshots with the virtual cursor & trail visible;
-3. The 3-in-1 Observation HUD (scroll metrics, DOM/tech stats, console/network errors, and numbered #ref interactive controls).
+3. The 3-in-1 Observation HUD (scroll metrics, DOM/tech stats, console/network errors, numbered #ref interactive controls, and a ## Design block when available), plus ## Findings so far across prior steps.
 
-Respond ONLY with a single valid JSON object matching one of these actions:
+Respond ONLY with a single valid JSON object matching one of these actions (any action may include an optional "note":"..." <=120 chars to record key visual/design/content findings into ## Findings so far):
 - {"type":"move_mouse","points":[{"x":300,"y":400},{"x":800,"y":420}],"label":"SWEEP","reason":"..."}
 - {"type":"hover","target":"#3","reason":"..."}
 - {"type":"click","target":"#8","reason":"..."}
@@ -38,14 +40,18 @@ Respond ONLY with a single valid JSON object matching one of these actions:
 4. 时刻关注剩余步数预算（\`stepIndex / maxSteps\`）：若剩余步数 <= 1，必须在本步直接返回 \`complete\` 收尾。`;
 /** Summarizes a SubagentActionDecision into a compact JSON-safe replay object for diagnostics. */
 export function summarizeDecisionAction(decision) {
+    const noteExtra = typeof decision.note === 'string' && decision.note.trim().length > 0
+        ? { note: decision.note.replace(/\s+/g, ' ').trim().slice(0, MAX_FINDING_NOTE_CHARS) }
+        : {};
     switch (decision.type) {
         case 'navigate':
-            return { type: 'navigate', url: decision.url };
+            return { type: 'navigate', url: decision.url, ...noteExtra };
         case 'move_mouse':
             return {
                 type: 'move_mouse',
                 points_count: Array.isArray(decision.points) ? decision.points.length : 1,
                 ...(decision.label ? { label: decision.label } : {}),
+                ...noteExtra,
             };
         case 'click':
             return {
@@ -55,6 +61,7 @@ export function summarizeDecisionAction(decision) {
                     ? { ref: decision.target }
                     : {}),
                 ...(decision.if_present ? { if_present: true } : {}),
+                ...noteExtra,
             };
         case 'hover':
             return {
@@ -63,6 +70,7 @@ export function summarizeDecisionAction(decision) {
                 ...(typeof decision.target === 'string' && decision.target.startsWith('#')
                     ? { ref: decision.target }
                     : {}),
+                ...noteExtra,
             };
         case 'drag':
             return {
@@ -73,6 +81,7 @@ export function summarizeDecisionAction(decision) {
                 ...(typeof decision.keepSelection === 'boolean'
                     ? { keepSelection: decision.keepSelection }
                     : {}),
+                ...noteExtra,
             };
         case 'type_text':
             return {
@@ -80,19 +89,57 @@ export function summarizeDecisionAction(decision) {
                 target: decision.target,
                 text_length: decision.text.length,
                 ...(decision.pressEnter ? { pressEnter: true } : {}),
+                ...noteExtra,
             };
         case 'scroll':
-            return { type: 'scroll', deltaY: decision.deltaY };
+            return { type: 'scroll', deltaY: decision.deltaY, ...noteExtra };
         case 'set_cursor_style':
             return {
                 type: 'set_cursor_style',
                 ...(decision.style.preset ? { preset: decision.style.preset } : {}),
+                ...noteExtra,
             };
         case 'complete':
-            return { type: 'complete', report_length: decision.report.length };
+            return { type: 'complete', report_length: decision.report.length, ...noteExtra };
         case 'pause_for_takeover':
-            return { type: 'pause_for_takeover', blockReason: decision.blockReason };
+            return { type: 'pause_for_takeover', blockReason: decision.blockReason, ...noteExtra };
     }
+}
+function formatShortActionForFinding(decision, blocked) {
+    let base;
+    switch (decision.type) {
+        case 'navigate':
+            base = 'navigate';
+            break;
+        case 'move_mouse':
+            base = 'move_mouse';
+            break;
+        case 'hover':
+            base = typeof decision.target === 'string' ? `hover ${decision.target}` : 'hover';
+            break;
+        case 'click':
+            base = typeof decision.target === 'string' ? `click ${decision.target}` : 'click';
+            break;
+        case 'drag':
+            base = 'drag';
+            break;
+        case 'type_text':
+            base = `type_text ${decision.target}`;
+            break;
+        case 'scroll':
+            base = `scroll ${decision.deltaY >= 0 ? '+' : ''}${Math.round(decision.deltaY)}`;
+            break;
+        case 'set_cursor_style':
+            base = 'set_cursor_style';
+            break;
+        case 'complete':
+            base = 'complete';
+            break;
+        case 'pause_for_takeover':
+            base = 'pause_for_takeover';
+            break;
+    }
+    return blocked ? `${base}(${blocked})` : base;
 }
 async function runFallbackAndRecord(diag, fallback, ctx, onStepDiagnostic) {
     const fallbackDecision = await fallback(ctx);
@@ -114,6 +161,8 @@ export function isValidSubagentDecision(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value))
         return false;
     const d = value;
+    if (d.note !== undefined && typeof d.note !== 'string')
+        return false;
     switch (d.type) {
         case 'navigate': {
             const waitUntilOk = d.waitUntil === undefined ||
@@ -288,6 +337,9 @@ export function createDshHostLlmPlanner(opts) {
         for (const entry of entries.filter((e) => e.imageBase64 !== null)) {
             promptText += `\n---\n**Action Executed**: ${entry.actionTaken}\n${entry.fullHudText}\n`;
         }
+        if (ctx.findingsBlock) {
+            promptText += `\n${ctx.findingsBlock}\n`;
+        }
         const textBlock = { type: 'text', text: promptText };
         // Attach latest screenshot via ctx.attachments if supported by host
         let imageBlock;
@@ -415,6 +467,14 @@ export function createOpenAIVisionPlanner(opts) {
     const fallback = opts.fallbackPlanner ?? createBuiltinInspectorPlanner();
     return async (ctx) => {
         const messages = ctx.history.buildMultimodalMessages(SUBAGENT_SYSTEM_PROMPT, ctx.taskPrompt);
+        if (ctx.findingsBlock && messages[1]) {
+            if (Array.isArray(messages[1].content)) {
+                messages[1].content.push({ type: 'text', text: `\n${ctx.findingsBlock}\n` });
+            }
+            else {
+                messages[1].content = `${messages[1].content}\n${ctx.findingsBlock}\n`;
+            }
+        }
         const callApi = async (useJsonObjectFormat) => {
             const timeoutSignal = AbortSignal.timeout(timeoutMs);
             const signal = ctx.signal
@@ -680,6 +740,7 @@ export class BrowserSubagentRunner {
                 hostFacts,
                 hostFactsBlock,
                 contextStats,
+                findings: paused.findingsLedger?.getFindings?.() ?? [],
             });
             this.writeSessionLostDiagnostics(paused.req.artifactDir, id, at, reason);
         }
@@ -692,7 +753,7 @@ export class BrowserSubagentRunner {
                 this.lostSessions.delete(oldestKey);
         }
     }
-    buildSessionLostResult(subagentId, role, hostFacts, hostFactsBlock, contextStats) {
+    buildSessionLostResult(subagentId, role, hostFacts, hostFactsBlock, contextStats, findings = []) {
         const hint = '浏览器窗口已关闭，任务无法续跑；请重新发起 browser_subagent_run。已产生的截图与 diagnostics 仍保留。';
         return {
             subagentId,
@@ -704,6 +765,7 @@ export class BrowserSubagentRunner {
             hostFactsBlock,
             hostFacts,
             contextStats,
+            findings,
         };
     }
     isOriginPermitted(targetUrl, allowedOrigins, blockedOrigins) {
@@ -843,6 +905,7 @@ export class BrowserSubagentRunner {
             }
             const hostFacts = new HostFactsTracker(subagentId, req.role, session);
             const history = new SlidingWindowHistory(maxRecentImages);
+            const findingsLedger = new FindingsLedger();
             const tools = new AtomicBrowserToolset(session, snapshotDir);
             const planner = req.planner ||
                 (process.env.DSH_VISION_API_KEY
@@ -863,6 +926,7 @@ export class BrowserSubagentRunner {
                     hostFactsBlock: hostFacts.formatHostFactsBlock(),
                     hostFacts: hostFacts.getFacts(),
                     contextStats: history.getStats(),
+                    findings: findingsLedger.getFindings(),
                 };
             }
             const initRes = await tools.navigate(req.startUrl, 600, {
@@ -872,6 +936,7 @@ export class BrowserSubagentRunner {
             req.signal?.throwIfAborted();
             hostFacts.recordStep(initRes.observation.screenshotPath);
             history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
+            findingsLedger.record(0, initRes.observation, 'navigate');
             return await this.executeLoop({
                 subagentId,
                 req,
@@ -879,6 +944,7 @@ export class BrowserSubagentRunner {
                 tools,
                 hostFacts,
                 history,
+                findingsLedger,
                 planner,
                 nextStep: 1,
                 maxSteps,
@@ -902,7 +968,7 @@ export class BrowserSubagentRunner {
             const lost = this.lostSessions.get(subagentId);
             if (lost) {
                 this.lostSessions.delete(subagentId);
-                return this.buildSessionLostResult(subagentId, lost.role, lost.hostFacts, lost.hostFactsBlock, lost.contextStats);
+                return this.buildSessionLostResult(subagentId, lost.role, lost.hostFacts, lost.hostFactsBlock, lost.contextStats, lost.findings ?? []);
             }
             const { hostFacts, hostFactsBlock } = this.buildFallbackHostFacts(subagentId, 'Browser Subagent');
             const hint = '会话不存在或已结束';
@@ -933,10 +999,11 @@ export class BrowserSubagentRunner {
             const { hostFacts, hostFactsBlock } = this.safeReadHostFacts(paused);
             const contextStats = this.safeReadContextStats(paused);
             this.writeSessionLostDiagnostics(paused.req.artifactDir, subagentId, new Date().toISOString(), 'user_closed_window');
-            return this.buildSessionLostResult(subagentId, paused.req.role, hostFacts, hostFactsBlock, contextStats);
+            return this.buildSessionLostResult(subagentId, paused.req.role, hostFacts, hostFactsBlock, contextStats, paused.findingsLedger?.getFindings?.() ?? []);
         }
         this.pausedSessions.delete(subagentId);
         const { req, session, tools, hostFacts, history, planner, nextStep, maxSteps } = paused;
+        const findingsLedger = paused.findingsLedger ?? new FindingsLedger();
         req.signal = signal;
         if (userFollowupNote) {
             req.taskPrompt = `${req.taskPrompt}\n\n[User Follow-up Note]: ${userFollowupNote}`;
@@ -955,6 +1022,7 @@ export class BrowserSubagentRunner {
             signal?.throwIfAborted();
             hostFacts.recordStep(postTakeoverObs.screenshotPath);
             history.pushObservation(`Resumed after human takeover (${userFollowupNote})`, postTakeoverObs, tools.sampler.formatObservationForLLM(postTakeoverObs));
+            findingsLedger.record(Math.max(0, nextStep - 1), postTakeoverObs, 'resume');
             return await this.executeLoop({
                 subagentId,
                 req,
@@ -962,6 +1030,7 @@ export class BrowserSubagentRunner {
                 tools,
                 hostFacts,
                 history,
+                findingsLedger,
                 planner,
                 nextStep,
                 maxSteps,
@@ -975,7 +1044,7 @@ export class BrowserSubagentRunner {
                 const { hostFacts: safeFacts, hostFactsBlock: safeBlock } = this.safeReadHostFacts(paused);
                 const safeStats = this.safeReadContextStats(paused);
                 this.writeSessionLostDiagnostics(req.artifactDir, subagentId, new Date().toISOString(), 'user_closed_window');
-                return this.buildSessionLostResult(subagentId, req.role, safeFacts, safeBlock, safeStats);
+                return this.buildSessionLostResult(subagentId, req.role, safeFacts, safeBlock, safeStats, paused.findingsLedger?.getFindings?.() ?? []);
             }
             throw err;
         }
@@ -984,7 +1053,7 @@ export class BrowserSubagentRunner {
         }
     }
     async executeLoop(state) {
-        const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps, isSharedSession } = state;
+        const { subagentId, req, session, tools, hostFacts, history, findingsLedger, planner, maxSteps, isSharedSession, } = state;
         let latestObs = state.latestObs;
         let latestNavigation = state.latestNavigation;
         let keepSessionAlive = false;
@@ -1004,6 +1073,7 @@ export class BrowserSubagentRunner {
                 tools,
                 hostFacts,
                 history,
+                findingsLedger,
                 planner,
                 nextStep,
                 maxSteps,
@@ -1025,6 +1095,7 @@ export class BrowserSubagentRunner {
                 hostFactsBlock: hostFacts.formatHostFactsBlock(),
                 hostFacts: hostFacts.getFacts(),
                 contextStats: history.getStats(),
+                findings: findingsLedger.getFindings(),
                 approvalCard: card,
                 ...(latestNavigation ? { navigation: latestNavigation } : {}),
             };
@@ -1041,6 +1112,7 @@ export class BrowserSubagentRunner {
                         return await pauseNow(step, gate.reason, gate.url, gate.details ?? 'Page gate detected. Waiting for human action.');
                     }
                 }
+                const findingsBlock = findingsLedger.formatForPrompt(step);
                 const decision = await planner({
                     stepIndex: step,
                     maxSteps,
@@ -1048,6 +1120,8 @@ export class BrowserSubagentRunner {
                     latestObservation: latestObs,
                     history,
                     hostFacts,
+                    findings: findingsLedger.getFindings(),
+                    ...(findingsBlock ? { findingsBlock } : {}),
                     signal: req.signal,
                 });
                 req.signal?.throwIfAborted();
@@ -1055,6 +1129,9 @@ export class BrowserSubagentRunner {
                     return await pauseNow(step, 'USER_TAKEOVER', session.page.url(), '用户在子代理决策期间点击了「暂停并接管」。子代理已立即暂停。');
                 }
                 if (decision.type === 'complete') {
+                    if (decision.note) {
+                        findingsLedger.record(step, latestObs, 'complete', decision.note);
+                    }
                     return {
                         subagentId,
                         role: req.role,
@@ -1063,10 +1140,14 @@ export class BrowserSubagentRunner {
                         hostFactsBlock: hostFacts.formatHostFactsBlock(),
                         hostFacts: hostFacts.getFacts(),
                         contextStats: history.getStats(),
+                        findings: findingsLedger.getFindings(),
                         ...(latestNavigation ? { navigation: latestNavigation } : {}),
                     };
                 }
                 if (decision.type === 'pause_for_takeover') {
+                    if (decision.note) {
+                        findingsLedger.record(step, latestObs, 'pause_for_takeover', decision.note);
+                    }
                     return await pauseNow(step + 1, decision.blockReason, session.page.url(), decision.message);
                 }
                 if (decision.type === 'navigate') {
@@ -1075,6 +1156,7 @@ export class BrowserSubagentRunner {
                         const snap = await tools.sampler.captureSnapshot('origin_blocked');
                         hostFacts.recordStep(snap.screenshotPath);
                         history.pushObservation(`BLOCKED navigation to ${decision.url} (origin policy)`, snap, tools.sampler.formatObservationForLLM(snap));
+                        findingsLedger.record(step, snap, 'navigate(blocked)', decision.note);
                         latestObs = snap;
                         continue;
                     }
@@ -1085,6 +1167,7 @@ export class BrowserSubagentRunner {
                     latestNavigation = res.navigation ?? latestNavigation;
                     hostFacts.recordStep(res.observation.screenshotPath);
                     history.pushObservation(`${res.action} (${decision.reason})`, res.observation, res.llmSummary);
+                    findingsLedger.record(step, res.observation, 'navigate', decision.note);
                     latestObs = res.observation;
                     if (await session.checkHumanTakeoverRequested()) {
                         return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在导航期间点击了「暂停并接管」。');
@@ -1093,6 +1176,7 @@ export class BrowserSubagentRunner {
                 }
                 if (decision.type === 'set_cursor_style') {
                     await tools.setCursorStyle(decision.style);
+                    findingsLedger.record(step, latestObs, 'set_cursor_style', decision.note);
                     if (await session.checkHumanTakeoverRequested()) {
                         return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在更新光标样式后点击了「暂停并接管」。');
                     }
@@ -1134,7 +1218,7 @@ export class BrowserSubagentRunner {
                     if (!session.isAlive()) {
                         const lostAt = new Date().toISOString();
                         this.writeSessionLostDiagnostics(req.artifactDir, subagentId, lostAt, 'user_closed_window');
-                        return this.buildSessionLostResult(subagentId, req.role, hostFacts.getFacts(), hostFacts.formatHostFactsBlock(), history.getStats());
+                        return this.buildSessionLostResult(subagentId, req.role, hostFacts.getFacts(), hostFacts.formatHostFactsBlock(), history.getStats(), findingsLedger.getFindings());
                     }
                     const errMsg = String(actionErr?.message ?? actionErr).replace(/\s+/g, ' ').trim().slice(0, 240);
                     const blockedCode = /Timeout/i.test(errMsg)
@@ -1198,6 +1282,7 @@ export class BrowserSubagentRunner {
                 });
                 hostFacts.recordStep(actionResult.observation.screenshotPath);
                 history.pushObservation(`${actionResult.action} — ${decision.reason}`, actionResult.observation, actionResult.llmSummary);
+                findingsLedger.record(step, actionResult.observation, formatShortActionForFinding(decision, actionResult.blocked), decision.note);
                 latestObs = actionResult.observation;
                 if (consecutiveFailures >= 3) {
                     return {
@@ -1209,6 +1294,7 @@ export class BrowserSubagentRunner {
                         hostFactsBlock: hostFacts.formatHostFactsBlock(),
                         hostFacts: hostFacts.getFacts(),
                         contextStats: history.getStats(),
+                        findings: findingsLedger.getFindings(),
                         ...(latestNavigation ? { navigation: latestNavigation } : {}),
                     };
                 }
@@ -1224,6 +1310,7 @@ export class BrowserSubagentRunner {
                 hostFactsBlock: hostFacts.formatHostFactsBlock(),
                 hostFacts: hostFacts.getFacts(),
                 contextStats: history.getStats(),
+                findings: findingsLedger.getFindings(),
                 ...(latestNavigation ? { navigation: latestNavigation } : {}),
             };
         }

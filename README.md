@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.3.3 — Fast REF_STALE Recovery, Error Budget, `if_present` Click, HUD Label Dedup, Nav Retry & Scroll Diagnostics)
+# `dsh-plugin-visual-browser` (v1.4.0 — Design-Aware HUD & Cumulative Subagent Findings)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -30,6 +30,7 @@
    - 宿主代码强制生成不可伪造的 `[BROWSER_HOST_FACTS]` 校验头；
    - **稳健导航等待与诊断（`domcontentloaded` + settle）**：默认等待条件为 `'domcontentloaded'` 并追加 5s 上限 `load` settle + 600ms 首屏渲染缓冲，支持通过 `browser_subagent_run` / `browser_quick_snapshot` 的可选参数 `wait_until`（`'domcontentloaded' | 'load' | 'networkidle'`）与 `timeout_ms`（`1000..120000`）按需覆写；对 `ERR_NETWORK_CHANGED` / `ERR_CONNECTION_RESET` / `ERR_CONNECTION_ABORTED` / `ERR_CONNECTION_CLOSED` / `ERR_TIMED_OUT` 等瞬时网络错误自动退避重试 1 次并记录 `retries` / `recovered_from`；即使长轮询/WebGL 常驻动画站点触发 `goto` 超时，只要页面已实质加载提交即不中止取证，并将 `navigation: { wait_until, timed_out, elapsed_ms, final_url }` 写入 HUD 与 `diagnostics.json`；当页面存在 `<canvas>` 时，HUD 自动补充 `tech: WebGL canvas` 交互提示；
    - **自推进站点鲁棒性与结构化失败恢复（v1.3.3）**：点击/悬停 `#ref` 前通过瞬时 `isVisible + boundingBox + computedStyle` 探针校验新鲜度，目标已隐藏/消失时立即返回 `blocked: 'REF_STALE'` 并重采样，不再枯等 8s 抛错中止整轮；支持可选 `{ type: 'click', target, if_present: true }` 条件点击（目标已消退时视为跳过完成）；单步可恢复错误进入统一观察反馈与错误预算（不同目标首次 `REF_STALE` 零消耗，同一目标连续两次 stale 计 1 次，其它可恢复错误连续 3 次优雅止损输出已采集报告）；HUD 提取仅取可见且未被 `overflow: hidden/clip` 裁切的节点文本并对整行重复自动折叠为 `(×N)`；`scroll` 额外返回 `{ attempted, effective_dom_delta, dom_scrollable, visual_changed, at_boundary, locked }` 以区分真实锁死与边界到达或 WebGL 虚拟滚轮；
+   - **设计系统与结构感知 HUD + 跨步累积 `findings` 账本（v1.4.0）**：在既有 10 个 HUD 字段之后追加严格控长（`≤1200` 字符）的 `## Design` 块（`title` / 视口 `headings` / `sections` 边界 / `palette` 主色与强调色 / `fonts` 字体组 / `cssVars` / `layout` / `media` / `motion` / 视口可见 `bodyText` 及 `<canvas>` 主体提示；当 `<canvas>` 覆盖 `≥90%` 视口时，`palette` 自动标注 DOM 背景被覆盖并提示以截图为准，避免误导模型）；同时引入独立于截图滑动窗口的 `FindingsLedger`（每步自动记录 + 支持模型可选 `note` 字段，向提示词注入 `## Findings so far` 与 `第1–3步：` 早期摘要，并将 `findings` 写入 `diagnostics.json`，上限 `≤12` 条 / `≤1200` 字符）；
    - 截图目录优先按 `config.artifactDir` → `DSH_BROWSER_ARTIFACT_DIR` → `DSH_HOME/artifacts/dsh-browser` → `~/.dsh/artifacts/dsh-browser` 解析（桌面 pack 模式下会跟随宿主注入的 `DSH_HOME`），不会落到找不到的外部目录。
 5. **自动门禁检测与原位人工接管（Approval Cards & Resume）**
    - 自动检测登录墙、支付结算页或 CAPTCHA 人机验证（绝不尝试绕过验证码），在原标签页挂起会话并返回 `DSH_BROWSER_TAKEOVER_CARD`，用户完成后可通过 `browser_subagent_resume` 原位继续。
@@ -56,7 +57,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.3.3+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.4.0+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）
@@ -111,7 +112,8 @@ dsh --patch ./cordis.yml --profile web
 
 ---
 
-## 📌 v1.3.4 Roadmap / TODO
+## 📌 v1.4.1 / v1.3.4 Roadmap / TODO
 
-- **Canvas 精密定位工具 `inspect_region(x, y, radius?, zoom?)`（高优）**：为全屏 WebGL / Canvas 站点（无 DOM `#ref`）提供以指定坐标为中心的 2× 局部放大裁剪图与坐标刻度叠加。
-- **Canvas 交互有效性探测**：在点击/悬停坐标前后结合指针样式变化（`cursor: pointer/grab`）、局部像素差异与 URL/DOM 变化，帮助模型判断 `<canvas>` 内部落点是否命中有效热区。
+- **5 + 1 固定只读探针（v1.4.1）**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`、`inspect_motion`（含鼠标移动前后 `transform`/`style`/`getAnimations` 差分）与 `inspect_canvas`（像素差交互探测），配合 `inspect_region(x, y, radius?, zoom?)` 局部 2× 放大与前后帧区域差异文本补偿。
+- **站点解剖结构化输出模式（v1.4.1）**：在 `## Design` 与探针就绪后增加设计复刻导向的结构化调研输出模板。
+- **Win32 窗口置顶自愈（v1.3.4 遗留项）**：启动后与复用前通过 `SetWindowPos(HWND_NOTOPMOST)` 纠正意外置顶状态。

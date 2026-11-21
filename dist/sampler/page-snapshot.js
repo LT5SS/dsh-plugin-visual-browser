@@ -31,6 +31,163 @@ export async function safeEvaluate(page, fn, fallbackValue, retriesOrOptions) {
     }
     return fallbackValue;
 }
+export const MAX_DESIGN_BLOCK_CHARS = 1200;
+export function formatDesignBlock(design) {
+    if (!design)
+        return '';
+    const titleLine = `- title: ${design.title || 'n/a'}`;
+    let headingsDetail = 'n/a';
+    if (!design.headingsError && design.headings.length > 0) {
+        const items = design.headings.map((h) => `${h.tag} "${h.text}"`).join(' | ');
+        headingsDetail = `${items} (共 ${design.headingsTotal} 条，最多 5)`;
+    }
+    let headingsCompact = 'n/a';
+    if (!design.headingsError && design.headings.length > 0) {
+        headingsCompact = design.headings
+            .slice(0, 2)
+            .map((h) => `${h.tag} "${h.text.slice(0, 24)}"`)
+            .join(' | ');
+    }
+    const sectionsDetail = design.sectionsError
+        ? 'n/a'
+        : design.sectionsTotal === 0
+            ? '0'
+            : `${design.sectionsTotal} (y=${design.sections[0] ?? 0}${design.sections
+                .slice(1)
+                .map((y) => ` / ${y}`)
+                .join('')})`;
+    const sectionsCompact = design.sectionsError ? 'n/a' : `${design.sectionsTotal}`;
+    const paletteDetail = !design.palette
+        ? 'n/a'
+        : design.canvasCoversViewport
+            ? `⚠️ DOM 背景为 ${design.palette.bg}，但视口被 <canvas> 覆盖 → 实际视觉配色请以截图为依据`
+            : `bg ${design.palette.bg} · text ${design.palette.text} · accent ${design.palette.accent}`;
+    const paletteCompact = !design.palette
+        ? 'n/a'
+        : design.canvasCoversViewport
+            ? `⚠️ DOM bg ${design.palette.bg} 被<canvas>覆盖，以截图为准`
+            : `${design.palette.bg}/${design.palette.text}/${design.palette.accent}`;
+    const fontsDetail = design.fontsError || design.fonts.length === 0
+        ? 'n/a'
+        : design.fonts
+            .map((f) => `${f.family} ${f.weight} (max ${f.maxPx}px)`)
+            .join(' | ');
+    const fontsCompact = design.fontsError || design.fonts.length === 0
+        ? 'n/a'
+        : `${design.fonts[0].family} (${design.fonts[0].maxPx}px)`;
+    const cssVarsDetail = design.cssVarsError
+        ? 'n/a'
+        : design.cssVarsTotal === 0
+            ? '0 个'
+            : `${design.cssVarsTotal} 个 · ${design.cssVarsSample
+                .map((v) => `${v.name}:${v.value}`)
+                .join('; ')}`;
+    const cssVarsCompact = design.cssVarsError ? 'n/a' : `${design.cssVarsTotal} 个`;
+    const layoutDetail = design.layout
+        ? `grid×${design.layout.grid} · flex×${design.layout.flex} · fixed×${design.layout.fixed} · sticky×${design.layout.sticky}`
+        : 'n/a';
+    const layoutCompact = design.layout
+        ? `g${design.layout.grid}/f${design.layout.flex}/fx${design.layout.fixed}/s${design.layout.sticky}`
+        : 'n/a';
+    let mediaDetail = 'n/a';
+    let mediaCompact = 'n/a';
+    if (design.media) {
+        const base = `img ${design.media.img} · video ${design.media.video} · canvas ${design.media.canvas} · svg ${design.media.svg}`;
+        mediaCompact = base;
+        const extras = [];
+        if (design.media.largest) {
+            const l = design.media.largest;
+            const fit = l.objectFit ? ` (${l.objectFit})` : '';
+            const cDims = l.kind === 'canvas' && l.canvasWidth && l.canvasHeight
+                ? ` [canvas ${l.canvasWidth}×${l.canvasHeight}]`
+                : '';
+            extras.push(`最大 ${l.width}×${l.height}${fit}${cDims}`);
+        }
+        if (design.media.canvas > 0 &&
+            design.media.largestCanvas &&
+            design.media.largest?.kind !== 'canvas') {
+            extras.push(`canvas ${design.media.largestCanvas.width}×${design.media.largestCanvas.height}`);
+        }
+        mediaDetail = extras.length > 0 ? `${base} · ${extras.join(' · ')}` : base;
+    }
+    const motionDetail = design.motion
+        ? `transition ${design.motion.transition} · animation ${design.motion.animation} · will-change ${design.motion.willChange} · reduced-motion ${design.motion.reducedMotion}`
+        : 'n/a';
+    const motionCompact = design.motion
+        ? `t${design.motion.transition}/a${design.motion.animation}/wc${design.motion.willChange}/${design.motion.reducedMotion}`
+        : 'n/a';
+    const formatBody = (txt, limit) => {
+        if (txt === null)
+            return 'n/a';
+        if (txt.length === 0)
+            return '（几乎为空，主体可能在 <canvas> 内）';
+        const clipped = limit !== undefined && txt.length > limit ? txt.slice(0, limit) : txt;
+        if (txt.length < 20 || (Boolean(design.canvasCoversViewport) && txt.length < 40)) {
+            return `"${clipped}" （几乎为空，主体可能在 <canvas> 内）`;
+        }
+        return `"${clipped}"`;
+    };
+    let curHeadings = headingsDetail;
+    let curSections = sectionsDetail;
+    let curPalette = paletteDetail;
+    let curFonts = fontsDetail;
+    let curCssVars = cssVarsDetail;
+    let curLayout = layoutDetail;
+    let curMedia = mediaDetail;
+    let curMotion = motionDetail;
+    let curBody = formatBody(design.bodyText);
+    const buildBlock = () => [
+        '## Design',
+        titleLine,
+        `- headings: ${curHeadings}`,
+        `- sections: ${curSections}`,
+        `- palette: ${curPalette}`,
+        `- fonts: ${curFonts}`,
+        `- cssVars: ${curCssVars}`,
+        `- layout: ${curLayout}`,
+        `- media: ${curMedia}`,
+        `- motion: ${curMotion}`,
+        `- bodyText: ${curBody}`,
+    ].join('\n');
+    let out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    // Truncation priority (TASK-v1.4.0 §3): headings -> palette/fonts/cssVars -> sections -> media/motion/layout -> bodyText LAST
+    curHeadings = headingsCompact;
+    out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    curHeadings = design.headingsTotal > 0 ? `${design.headingsTotal} 条` : 'n/a';
+    out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    curCssVars = cssVarsCompact;
+    out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    curFonts = fontsCompact;
+    curPalette = paletteCompact;
+    out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    curSections = sectionsCompact;
+    out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    curMedia = mediaCompact;
+    curMotion = motionCompact;
+    curLayout = layoutCompact;
+    out = buildBlock();
+    if (out.length <= MAX_DESIGN_BLOCK_CHARS)
+        return out;
+    if (design.bodyText !== null && design.bodyText.length > 0) {
+        const withoutBodyLen = out.length - curBody.length;
+        const avail = Math.max(0, MAX_DESIGN_BLOCK_CHARS - withoutBodyLen - 2);
+        curBody = avail > 24 ? formatBody(design.bodyText, avail - 2) : `"${design.bodyText.slice(0, Math.max(0, avail - 2))}"`;
+        out = buildBlock();
+    }
+    return out.length > MAX_DESIGN_BLOCK_CHARS ? out.slice(0, MAX_DESIGN_BLOCK_CHARS) : out;
+}
 export class PageSnapshotSampler {
     session;
     outputDir;
@@ -98,6 +255,7 @@ export class PageSnapshotSampler {
             },
             interactiveElements: [],
             cursorState: null,
+            design: undefined,
         };
         const extracted = await safeEvaluate(page, ({ gen }) => {
             const vw = window.innerWidth;
@@ -354,6 +512,656 @@ export class PageSnapshotSampler {
             const cursorState = vcState && Number.isFinite(vcState.x) && Number.isFinite(vcState.y)
                 ? { x: Math.round(vcState.x), y: Math.round(vcState.y) }
                 : null;
+            // Design System & Structural HUD Snapshot (TASK-v1.4.0; each collector isolated via try/catch; no named nested functions!)
+            const vcRoot = document.getElementById('__dsh_vc_root__');
+            let dTitle = '';
+            try {
+                dTitle = (document.title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+            }
+            catch {
+                dTitle = '';
+            }
+            const dHeadings = [];
+            let dHeadingsTotal = 0;
+            let dHeadingsError = false;
+            try {
+                const seenHeadings = new Set();
+                const hEls = document.querySelectorAll('h1, h2, h3');
+                const hCap = Math.min(hEls.length, 1500);
+                for (let hi = 0; hi < hCap; hi++) {
+                    const hEl = hEls[hi];
+                    if (vcRoot && vcRoot.contains(hEl))
+                        continue;
+                    const hcs = window.getComputedStyle(hEl);
+                    if (hcs.display === 'none' || hcs.visibility === 'hidden' || Number(hcs.opacity) < 0.05) {
+                        continue;
+                    }
+                    if (hcs.clip === 'rect(0px, 0px, 0px, 0px)' ||
+                        hcs.clip === 'rect(0px 0px 0px 0px)' ||
+                        (hcs.clipPath && hcs.clipPath.includes('inset(50%'))) {
+                        continue;
+                    }
+                    const hr = hEl.getBoundingClientRect();
+                    if (hr.width <= 0 || hr.height <= 0)
+                        continue;
+                    if (hr.width <= 1.5 && hr.height <= 1.5 && (hcs.overflow === 'hidden' || hcs.overflow === 'clip')) {
+                        continue;
+                    }
+                    if (hr.bottom <= 0 || hr.top >= vh || hr.right <= 0 || hr.left >= vw)
+                        continue;
+                    const hText = (hEl.innerText || hEl.textContent || '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    if (!hText)
+                        continue;
+                    const hTag = hEl.tagName.toLowerCase();
+                    const key = `${hTag}|${hText}`;
+                    if (seenHeadings.has(key))
+                        continue;
+                    seenHeadings.add(key);
+                    dHeadingsTotal++;
+                    if (dHeadings.length < 5) {
+                        dHeadings.push({ tag: hTag, text: hText.slice(0, 60) });
+                    }
+                }
+            }
+            catch {
+                dHeadingsError = true;
+            }
+            const dSections = [];
+            let dSectionsTotal = 0;
+            let dSectionsError = false;
+            try {
+                const secEls = document.querySelectorAll('section, main > div[class*="section"], [data-section]');
+                const secCap = Math.min(secEls.length, 1500);
+                for (let si = 0; si < secCap; si++) {
+                    const sEl = secEls[si];
+                    if (vcRoot && vcRoot.contains(sEl))
+                        continue;
+                    const scs = window.getComputedStyle(sEl);
+                    if (scs.display === 'none')
+                        continue;
+                    const sr = sEl.getBoundingClientRect();
+                    dSectionsTotal++;
+                    if (dSections.length < 6) {
+                        dSections.push(Math.round(sr.top + sy));
+                    }
+                }
+            }
+            catch {
+                dSectionsError = true;
+            }
+            let dPalette = null;
+            try {
+                const bodyEl = document.body;
+                const bodyStyle = bodyEl ? window.getComputedStyle(bodyEl) : null;
+                const rootCss = window.getComputedStyle(htmlEl);
+                let bgHex = '#ffffff';
+                let bgFound = false;
+                const bgCandidates = [bodyStyle?.backgroundColor || '', rootCss.backgroundColor || ''];
+                for (let bi = 0; bi < bgCandidates.length; bi++) {
+                    const rawC = bgCandidates[bi];
+                    const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.]+)(%?))?\s*\)/i.exec(rawC);
+                    if (!m)
+                        continue;
+                    const alphaRaw = m[4] !== undefined ? parseFloat(m[4]) : 1;
+                    const alpha = m[5] === '%' ? alphaRaw / 100 : alphaRaw;
+                    if (alpha < 0.05)
+                        continue;
+                    const r = Math.max(0, Math.min(255, Math.round(parseFloat(m[1]))));
+                    const g = Math.max(0, Math.min(255, Math.round(parseFloat(m[2]))));
+                    const b = Math.max(0, Math.min(255, Math.round(parseFloat(m[3]))));
+                    bgHex =
+                        '#' +
+                            r.toString(16).padStart(2, '0') +
+                            g.toString(16).padStart(2, '0') +
+                            b.toString(16).padStart(2, '0');
+                    bgFound = true;
+                    break;
+                }
+                if (!bgFound && bodyStyle?.backgroundColor) {
+                    bgHex = '#ffffff';
+                }
+                let textHex = '#000000';
+                const textCandidates = [bodyStyle?.color || '', rootCss.color || ''];
+                for (let ti = 0; ti < textCandidates.length; ti++) {
+                    const rawC = textCandidates[ti];
+                    const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.]+)(%?))?\s*\)/i.exec(rawC);
+                    if (!m)
+                        continue;
+                    const alphaRaw = m[4] !== undefined ? parseFloat(m[4]) : 1;
+                    const alpha = m[5] === '%' ? alphaRaw / 100 : alphaRaw;
+                    if (alpha < 0.05)
+                        continue;
+                    const r = Math.max(0, Math.min(255, Math.round(parseFloat(m[1]))));
+                    const g = Math.max(0, Math.min(255, Math.round(parseFloat(m[2]))));
+                    const b = Math.max(0, Math.min(255, Math.round(parseFloat(m[3]))));
+                    textHex =
+                        '#' +
+                            r.toString(16).padStart(2, '0') +
+                            g.toString(16).padStart(2, '0') +
+                            b.toString(16).padStart(2, '0');
+                    break;
+                }
+                let chromaticDiffBg = '';
+                let chromaticAny = '';
+                let nonBgNonText = '';
+                let chromaticUaLink = '';
+                const accentEls = document.querySelectorAll('a, button, [class*="accent"], [class*="primary"]');
+                const accentCap = Math.min(accentEls.length, 200);
+                for (let ai = 0; ai < accentCap; ai++) {
+                    const aEl = accentEls[ai];
+                    if (vcRoot && vcRoot.contains(aEl))
+                        continue;
+                    const acs = window.getComputedStyle(aEl);
+                    if (acs.display === 'none' || acs.visibility === 'hidden' || Number(acs.opacity) < 0.05) {
+                        continue;
+                    }
+                    const ar = aEl.getBoundingClientRect();
+                    if (ar.width < 1 || ar.height < 1)
+                        continue;
+                    const colorPairs = [acs.backgroundColor, acs.color];
+                    for (let ci = 0; ci < colorPairs.length; ci++) {
+                        const rawC = colorPairs[ci];
+                        const m = /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.]+)(%?))?\s*\)/i.exec(rawC);
+                        if (!m)
+                            continue;
+                        const alphaRaw = m[4] !== undefined ? parseFloat(m[4]) : 1;
+                        const alpha = m[5] === '%' ? alphaRaw / 100 : alphaRaw;
+                        if (alpha < 0.1)
+                            continue;
+                        const r = Math.max(0, Math.min(255, Math.round(parseFloat(m[1]))));
+                        const g = Math.max(0, Math.min(255, Math.round(parseFloat(m[2]))));
+                        const b = Math.max(0, Math.min(255, Math.round(parseFloat(m[3]))));
+                        const hex = '#' +
+                            r.toString(16).padStart(2, '0') +
+                            g.toString(16).padStart(2, '0') +
+                            b.toString(16).padStart(2, '0');
+                        const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+                        const isUaLinkDefault = aEl.tagName === 'A' && ci === 1 && (hex === '#0000ee' || hex === '#551a8b');
+                        if (isUaLinkDefault) {
+                            if (!chromaticUaLink)
+                                chromaticUaLink = hex;
+                        }
+                        else if (chroma >= 18) {
+                            if (!chromaticDiffBg && hex !== bgHex)
+                                chromaticDiffBg = hex;
+                            if (!chromaticAny)
+                                chromaticAny = hex;
+                        }
+                        else if (!nonBgNonText && hex !== bgHex && hex !== textHex) {
+                            nonBgNonText = hex;
+                        }
+                    }
+                    if (chromaticDiffBg)
+                        break;
+                }
+                const accentHex = chromaticDiffBg || chromaticAny || nonBgNonText || chromaticUaLink || textHex;
+                dPalette = { bg: bgHex, text: textHex, accent: accentHex };
+            }
+            catch {
+                dPalette = null;
+            }
+            const dFonts = [];
+            let dFontsError = false;
+            try {
+                const fontMap = new Map();
+                const fontEls = document.querySelectorAll('h1, h2, h3, p, a, button, span');
+                const fontCap = Math.min(fontEls.length, 1500);
+                for (let fi = 0; fi < fontCap; fi++) {
+                    const fEl = fontEls[fi];
+                    if (vcRoot && vcRoot.contains(fEl))
+                        continue;
+                    if (!(fEl.textContent || '').trim())
+                        continue;
+                    const fcs = window.getComputedStyle(fEl);
+                    if (fcs.display === 'none' || fcs.visibility === 'hidden' || Number(fcs.opacity) < 0.05) {
+                        continue;
+                    }
+                    const fr = fEl.getBoundingClientRect();
+                    if (fr.width < 1 || fr.height < 1)
+                        continue;
+                    if (fr.bottom < 0 || fr.top > vh || fr.right < 0 || fr.left > vw)
+                        continue;
+                    const firstFamily = (fcs.fontFamily.split(',')[0] || 'sans-serif')
+                        .trim()
+                        .replace(/^["']|["']$/g, '');
+                    const weight = String(fcs.fontWeight || '400');
+                    const px = Math.round(parseFloat(fcs.fontSize) || 0);
+                    if (px <= 0)
+                        continue;
+                    const fKey = `${firstFamily}|${weight}`;
+                    const prev = fontMap.get(fKey);
+                    if (!prev || px > prev.maxPx) {
+                        fontMap.set(fKey, { family: firstFamily, weight, maxPx: px });
+                    }
+                }
+                const sortedFonts = Array.from(fontMap.values()).sort((a, b) => b.maxPx - a.maxPx);
+                for (let i = 0; i < Math.min(3, sortedFonts.length); i++) {
+                    dFonts.push(sortedFonts[i]);
+                }
+            }
+            catch {
+                dFontsError = true;
+            }
+            let dCssVarsTotal = 0;
+            const dCssVarsSample = [];
+            let dCssVarsError = false;
+            try {
+                const rootStyle = window.getComputedStyle(htmlEl);
+                const seenVars = new Set();
+                for (let vi = 0; vi < rootStyle.length; vi++) {
+                    const propName = rootStyle[vi];
+                    if (!propName || !propName.startsWith('--'))
+                        continue;
+                    if (seenVars.has(propName))
+                        continue;
+                    const val = rootStyle.getPropertyValue(propName).trim();
+                    if (!val)
+                        continue;
+                    seenVars.add(propName);
+                    dCssVarsTotal++;
+                    if (dCssVarsSample.length < 5) {
+                        dCssVarsSample.push({ name: propName, value: val.slice(0, 40) });
+                    }
+                }
+                if (dCssVarsTotal === 0) {
+                    for (let shi = 0; shi < document.styleSheets.length; shi++) {
+                        try {
+                            const sheet = document.styleSheets[shi];
+                            const rules = sheet.cssRules;
+                            if (!rules)
+                                continue;
+                            for (let ri = 0; ri < rules.length; ri++) {
+                                const rule = rules[ri];
+                                if (rule &&
+                                    rule.style &&
+                                    typeof rule.selectorText === 'string' &&
+                                    /(?:^|,|\s)(?::root|html)(?:\s|,|$)/i.test(rule.selectorText)) {
+                                    for (let ki = 0; ki < rule.style.length; ki++) {
+                                        const pName = rule.style[ki];
+                                        if (!pName || !pName.startsWith('--') || seenVars.has(pName))
+                                            continue;
+                                        const resolvedVal = rootStyle.getPropertyValue(pName).trim() ||
+                                            String(rule.style.getPropertyValue(pName) || '').trim();
+                                        if (!resolvedVal)
+                                            continue;
+                                        seenVars.add(pName);
+                                        dCssVarsTotal++;
+                                        if (dCssVarsSample.length < 5) {
+                                            dCssVarsSample.push({ name: pName, value: resolvedVal.slice(0, 40) });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            // Ignore cross-origin CSSStyleSheet access errors
+                        }
+                    }
+                }
+            }
+            catch {
+                dCssVarsError = true;
+            }
+            let dLayout = null;
+            let dMotion = null;
+            try {
+                let gridC = 0;
+                let flexC = 0;
+                let fixedC = 0;
+                let stickyC = 0;
+                let transC = 0;
+                let animC = 0;
+                let wcC = 0;
+                const allBodyEls = document.querySelectorAll('body *');
+                const bodyCap = Math.min(allBodyEls.length, 1500);
+                for (let bi = 0; bi < bodyCap; bi++) {
+                    const bEl = allBodyEls[bi];
+                    if (vcRoot && vcRoot.contains(bEl))
+                        continue;
+                    const bcs = window.getComputedStyle(bEl);
+                    if (bcs.display === 'none' || bcs.visibility === 'hidden' || Number(bcs.opacity) < 0.05) {
+                        continue;
+                    }
+                    const br = bEl.getBoundingClientRect();
+                    if (br.width < 1 || br.height < 1)
+                        continue;
+                    if (br.bottom < 0 || br.top > vh || br.right < 0 || br.left > vw)
+                        continue;
+                    if (bcs.display === 'grid' || bcs.display === 'inline-grid')
+                        gridC++;
+                    else if (bcs.display === 'flex' || bcs.display === 'inline-flex')
+                        flexC++;
+                    if (bcs.position === 'fixed')
+                        fixedC++;
+                    else if (bcs.position === 'sticky')
+                        stickyC++;
+                    if (bcs.transitionProperty && bcs.transitionProperty !== 'none') {
+                        const durs = (bcs.transitionDuration || '').split(',');
+                        let hasDur = false;
+                        for (let di = 0; di < durs.length; di++) {
+                            if (parseFloat(durs[di]) > 0) {
+                                hasDur = true;
+                                break;
+                            }
+                        }
+                        if (hasDur)
+                            transC++;
+                    }
+                    if (bcs.animationName && bcs.animationName !== 'none')
+                        animC++;
+                    if (bcs.willChange && bcs.willChange !== 'auto')
+                        wcC++;
+                }
+                let reduced = '未检测到';
+                let hadSheetError = false;
+                try {
+                    for (let shi = 0; shi < document.styleSheets.length; shi++) {
+                        try {
+                            const rules = document.styleSheets[shi].cssRules;
+                            if (!rules)
+                                continue;
+                            for (let ri = 0; ri < rules.length; ri++) {
+                                const rule = rules[ri];
+                                if (rule && rule.type === 4) {
+                                    const cond = String(rule.conditionText || rule.media?.mediaText || '');
+                                    if (cond.includes('prefers-reduced-motion')) {
+                                        reduced = '支持';
+                                        break;
+                                    }
+                                }
+                            }
+                            if (reduced === '支持')
+                                break;
+                        }
+                        catch {
+                            hadSheetError = true;
+                        }
+                    }
+                    if (reduced !== '支持' && hadSheetError) {
+                        reduced = '未知';
+                    }
+                }
+                catch {
+                    reduced = '未知';
+                }
+                dLayout = { grid: gridC, flex: flexC, fixed: fixedC, sticky: stickyC };
+                dMotion = { transition: transC, animation: animC, willChange: wcC, reducedMotion: reduced };
+            }
+            catch {
+                dLayout = null;
+                dMotion = null;
+            }
+            let dMedia = null;
+            try {
+                const imgs = document.querySelectorAll('img');
+                const videos = document.querySelectorAll('video');
+                const canvases = document.querySelectorAll('canvas');
+                const svgs = document.querySelectorAll('svg:not(#__dsh_vc_svg__):not(#__dsh_vc_arrow_svg__)');
+                let imgCount = 0;
+                let videoCount = 0;
+                let canvasCount = 0;
+                let svgCount = 0;
+                let largest = null;
+                let largestArea = 0;
+                let largestCanvas = null;
+                let largestCanvasArea = 0;
+                for (let i = 0; i < Math.min(imgs.length, 1500); i++) {
+                    const mEl = imgs[i];
+                    if (vcRoot && vcRoot.contains(mEl))
+                        continue;
+                    imgCount++;
+                    const mr = mEl.getBoundingClientRect();
+                    const rw = Math.round(mr.width);
+                    const rh = Math.round(mr.height);
+                    const area = rw * rh;
+                    if (area > largestArea) {
+                        largestArea = area;
+                        const fit = window.getComputedStyle(mEl).objectFit || 'fill';
+                        largest = { kind: 'img', width: rw, height: rh, objectFit: fit };
+                    }
+                }
+                for (let i = 0; i < Math.min(videos.length, 1500); i++) {
+                    const mEl = videos[i];
+                    if (vcRoot && vcRoot.contains(mEl))
+                        continue;
+                    videoCount++;
+                    const mr = mEl.getBoundingClientRect();
+                    const rw = Math.round(mr.width);
+                    const rh = Math.round(mr.height);
+                    const area = rw * rh;
+                    if (area > largestArea) {
+                        largestArea = area;
+                        const fit = window.getComputedStyle(mEl).objectFit || 'contain';
+                        largest = { kind: 'video', width: rw, height: rh, objectFit: fit };
+                    }
+                }
+                for (let i = 0; i < Math.min(canvases.length, 1500); i++) {
+                    const mEl = canvases[i];
+                    if (vcRoot && vcRoot.contains(mEl))
+                        continue;
+                    canvasCount++;
+                    const mr = mEl.getBoundingClientRect();
+                    const rw = Math.round(mr.width);
+                    const rh = Math.round(mr.height);
+                    const cw = mEl.width || rw;
+                    const ch = mEl.height || rh;
+                    const cArea = Math.max(rw * rh, cw * ch);
+                    if (cArea > largestCanvasArea) {
+                        largestCanvasArea = cArea;
+                        largestCanvas = { width: cw, height: ch };
+                    }
+                    if (cArea > largestArea) {
+                        largestArea = cArea;
+                        largest = {
+                            kind: 'canvas',
+                            width: rw || cw,
+                            height: rh || ch,
+                            canvasWidth: cw,
+                            canvasHeight: ch,
+                        };
+                    }
+                }
+                for (let i = 0; i < Math.min(svgs.length, 1500); i++) {
+                    const mEl = svgs[i];
+                    if (vcRoot && vcRoot.contains(mEl))
+                        continue;
+                    svgCount++;
+                    const mr = mEl.getBoundingClientRect();
+                    const rw = Math.round(mr.width);
+                    const rh = Math.round(mr.height);
+                    const area = rw * rh;
+                    if (area > largestArea) {
+                        largestArea = area;
+                        largest = { kind: 'svg', width: rw, height: rh };
+                    }
+                }
+                dMedia = {
+                    img: imgCount,
+                    video: videoCount,
+                    canvas: canvasCount,
+                    svg: svgCount,
+                    largest,
+                    largestCanvas,
+                };
+            }
+            catch {
+                dMedia = null;
+            }
+            let dBodyText = null;
+            try {
+                if (document.body) {
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    const textParts = [];
+                    let collectedChars = 0;
+                    let scannedNodes = 0;
+                    let prevTop = -9999;
+                    let prevRight = -9999;
+                    let prevContainer = null;
+                    let prevRaw = '';
+                    let tNode = walker.nextNode();
+                    while (tNode && scannedNodes < 1500 && collectedChars < 220) {
+                        scannedNodes++;
+                        const rawVal = tNode.nodeValue || '';
+                        const val = rawVal.trim();
+                        if (val) {
+                            let hidden = false;
+                            let curParent = tNode.parentElement;
+                            const clipBoxes = [];
+                            while (curParent) {
+                                const tagUp = curParent.tagName;
+                                if (curParent.id === '__dsh_vc_root__' ||
+                                    tagUp === 'SCRIPT' ||
+                                    tagUp === 'STYLE' ||
+                                    tagUp === 'NOSCRIPT' ||
+                                    tagUp === 'TEMPLATE' ||
+                                    tagUp === 'SVG' ||
+                                    tagUp === 'CANVAS') {
+                                    hidden = true;
+                                    break;
+                                }
+                                if (curParent.getAttribute('aria-hidden') === 'true') {
+                                    hidden = true;
+                                    break;
+                                }
+                                const pcs = window.getComputedStyle(curParent);
+                                if (pcs.display === 'none' || pcs.visibility === 'hidden' || Number(pcs.opacity) < 0.05) {
+                                    hidden = true;
+                                    break;
+                                }
+                                if (pcs.clip === 'rect(0px, 0px, 0px, 0px)' ||
+                                    pcs.clip === 'rect(0px 0px 0px 0px)' ||
+                                    (pcs.clipPath && pcs.clipPath.includes('inset(50%'))) {
+                                    hidden = true;
+                                    break;
+                                }
+                                const pr = curParent.getBoundingClientRect();
+                                if (pr.width < 1 || pr.height < 1) {
+                                    hidden = true;
+                                    break;
+                                }
+                                if (pr.width <= 1.5 &&
+                                    pr.height <= 1.5 &&
+                                    (pcs.overflow === 'hidden' || pcs.overflow === 'clip')) {
+                                    hidden = true;
+                                    break;
+                                }
+                                if (pcs.overflow === 'hidden' ||
+                                    pcs.overflow === 'clip' ||
+                                    pcs.overflowX === 'hidden' ||
+                                    pcs.overflowX === 'clip' ||
+                                    pcs.overflowY === 'hidden' ||
+                                    pcs.overflowY === 'clip') {
+                                    clipBoxes.push({ left: pr.left, right: pr.right, top: pr.top, bottom: pr.bottom });
+                                }
+                                if (curParent === document.body)
+                                    break;
+                                curParent = curParent.parentElement;
+                            }
+                            let rr = null;
+                            if (!hidden) {
+                                const range = document.createRange();
+                                range.selectNodeContents(tNode);
+                                rr = range.getBoundingClientRect();
+                                if (rr.width < 0.5 ||
+                                    rr.height < 0.5 ||
+                                    rr.bottom <= 0 ||
+                                    rr.top >= vh ||
+                                    rr.right <= 0 ||
+                                    rr.left >= vw) {
+                                    hidden = true;
+                                }
+                                else {
+                                    for (let ci = 0; ci < clipBoxes.length; ci++) {
+                                        const cb = clipBoxes[ci];
+                                        if (rr.right <= cb.left + 0.5 ||
+                                            rr.left >= cb.right - 0.5 ||
+                                            rr.bottom <= cb.top + 0.5 ||
+                                            rr.top >= cb.bottom - 0.5) {
+                                            hidden = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (!hidden && rr) {
+                                const container = tNode.parentElement?.closest('a,button,li,p,h1,h2,h3,h4,h5,h6,section,article,header,footer,nav,main') ?? document.body;
+                                if (textParts.length > 0 &&
+                                    container === prevContainer &&
+                                    Math.abs(rr.top - prevTop) < 6 &&
+                                    rr.left >= prevRight - 2 &&
+                                    rr.left <= prevRight + 2.5 &&
+                                    !/\s$/.test(prevRaw) &&
+                                    !/^\s/.test(rawVal)) {
+                                    textParts[textParts.length - 1] += val;
+                                    collectedChars += val.length;
+                                }
+                                else {
+                                    textParts.push(val);
+                                    collectedChars += val.length + 1;
+                                }
+                                prevTop = rr.top;
+                                prevRight = rr.right;
+                                prevContainer = container;
+                                prevRaw = rawVal;
+                            }
+                        }
+                        tNode = walker.nextNode();
+                    }
+                    dBodyText = textParts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+                }
+                else {
+                    dBodyText = '';
+                }
+            }
+            catch {
+                dBodyText = null;
+            }
+            let dCanvasCoversViewport = false;
+            try {
+                const cvEls = document.querySelectorAll('canvas');
+                const cvCap = Math.min(cvEls.length, 200);
+                for (let ci = 0; ci < cvCap; ci++) {
+                    const cEl = cvEls[ci];
+                    if (vcRoot && vcRoot.contains(cEl))
+                        continue;
+                    const ccs = window.getComputedStyle(cEl);
+                    if (ccs.display === 'none' || ccs.visibility === 'hidden' || Number(ccs.opacity) < 0.05) {
+                        continue;
+                    }
+                    const cr = cEl.getBoundingClientRect();
+                    const visW = Math.max(0, Math.min(cr.right, vw) - Math.max(cr.left, 0));
+                    const visH = Math.max(0, Math.min(cr.bottom, vh) - Math.max(cr.top, 0));
+                    if (visW >= vw * 0.9 && visH >= vh * 0.9) {
+                        dCanvasCoversViewport = true;
+                        break;
+                    }
+                }
+            }
+            catch {
+                dCanvasCoversViewport = false;
+            }
+            const design = {
+                title: dTitle,
+                headings: dHeadings,
+                headingsTotal: dHeadingsTotal,
+                ...(dHeadingsError ? { headingsError: true } : {}),
+                sections: dSections,
+                sectionsTotal: dSectionsTotal,
+                ...(dSectionsError ? { sectionsError: true } : {}),
+                palette: dPalette,
+                ...(dCanvasCoversViewport ? { canvasCoversViewport: true } : {}),
+                fonts: dFonts,
+                ...(dFontsError ? { fontsError: true } : {}),
+                cssVarsTotal: dCssVarsTotal,
+                cssVarsSample: dCssVarsSample,
+                ...(dCssVarsError ? { cssVarsError: true } : {}),
+                layout: dLayout,
+                media: dMedia,
+                motion: dMotion,
+                bodyText: dBodyText,
+            };
             return {
                 scroll: {
                     scrollX: sx,
@@ -384,6 +1192,7 @@ export class PageSnapshotSampler {
                 },
                 interactiveElements: nodes,
                 cursorState,
+                design,
             };
         }, fallbackExtracted, {
             arg: { gen: currentGen },
@@ -418,6 +1227,7 @@ export class PageSnapshotSampler {
             interactiveElements: extracted.interactiveElements,
             health: this.session.telemetry.getHealthReport(),
             ...(degradedReason ? { degradedReason } : {}),
+            ...(extracted.design ? { design: extracted.design } : {}),
         };
     }
     formatObservationForLLM(obs) {
@@ -469,6 +1279,10 @@ export class PageSnapshotSampler {
                 attrs.push(`alt=${JSON.stringify(el.alt)}`);
             const attrSuffix = attrs.length > 0 ? ` ${attrs.join(' ')}` : '';
             lines.push(`  - \`${el.ref}\` [${el.tag}] "${el.label}"${attrSuffix} @ (${el.center.x}, ${el.center.y}) (${el.selectorHint})`);
+        }
+        const designBlock = formatDesignBlock(obs.design);
+        if (designBlock) {
+            lines.push('', designBlock);
         }
         return lines.join('\n');
     }

@@ -69,8 +69,16 @@
 
 ---
 
-## v1.3.4 规划（TODO）
+## v1.4.0 已交付（设计感知 HUD + 跨步累积 `findings`）
 
+- **`## Design` 设计与结构 HUD 块**：在原有 10 个观察字段及 `#ref` 列表之后追加严格受 `≤1200` 字符预算约束的 `## Design` 块（`title`、`headings`、`sections`、`palette`、`fonts`、`cssVars`、`layout`、`media`、`motion`、`bodyText`），每项独立 `try/catch` 降级且不破坏既有 HUD 输出格式；当 `<canvas>` 覆盖 `≥90%` 视口时，`palette` 自动标为被 `<canvas>` 覆盖并提示以截图视觉配色为准。
+- **独立跨步 `findings` 账本**：`FindingsLedger`（`≤12` 条、单条 `≤120` 字符、总长 `≤1200` 字符）独立于 `SlidingWindowHistory`，每步自动记录路径/滚动/控件/Canvas 变化并支持动作 JSON 可选 `note?: string`，注入 `## Findings so far`（含第 1–3 步压缩摘要）并持久化至 `diagnostics.json`。
+
+---
+
+## v1.4.1 / v1.3.4 规划（TODO）
+
+- **5 + 1 固定只读探针（v1.4.1）**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`、`inspect_motion`（前后 `transform`/`style` 差分）与 `inspect_canvas`（前后像素差交互探针），并辅以相邻帧区域差异文本补偿。
 - **`inspect_region(x, y, radius, zoom)` 局部 2× 放大能力**：针对全屏 WebGL / `<canvas>` 站点（`#ref` 为空、只能靠全屏截图盲估坐标）提供按需 2× 局部放大定位视图。
-- **`<canvas>` 交互响应探针**：结合局部微像素差分、指针光标形态（`pointer` / `grab`）及 URL/DOM 变化，自动辅助判断坐标交互是否在 Canvas 内生效。
-- **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性。
+- **Win32 `HWND_NOTOPMOST` 置顶自愈（v1.3.4 遗留）**：启动后及复用窗口前纠正意外 `WS_EX_TOPMOST` 状态。
+- **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性；不做任意 `evaluate_probe` JS 执行。

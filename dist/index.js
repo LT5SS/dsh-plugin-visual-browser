@@ -22,6 +22,7 @@ export * from './tools/atomic-tools.js';
 export * from './settings-store.js';
 export * from './subagent/host-facts.js';
 export * from './subagent/sliding-context.js';
+export * from './subagent/findings.js';
 export * from './subagent/runner.js';
 export * from './guardrails/takeover.js';
 export const name = 'dsh-plugin-visual-browser';
@@ -799,6 +800,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     planner_detail: plannerDetail,
                     host_services: hostServicesStatus,
                     steps: res.contextStats,
+                    findings: res.findings ?? [],
                     host_facts: res.hostFacts,
                 });
                 if (res.status === 'PAUSED_FOR_TAKEOVER') {
@@ -829,6 +831,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     subagent_report: res.subagentReport,
                     approval_card: res.approvalCard ?? null,
                     sliding_window_stats: res.contextStats,
+                    findings: res.findings ?? [],
                     ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
                 });
             }
@@ -905,6 +908,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 subagent_report: res.subagentReport,
                 approval_card: res.approvalCard ?? null,
                 sliding_window_stats: res.contextStats,
+                findings: res.findings ?? [],
                 ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
             });
         },

@@ -14,7 +14,24 @@ import type {
 import { AtomicBrowserToolset } from '../tools/atomic-tools.js';
 import { HostFactsTracker, type HostFactsData } from './host-facts.js';
 import { SlidingWindowHistory, type SlidingContextStats } from './sliding-context.js';
+import {
+  FindingsLedger,
+  MAX_FINDINGS_ENTRIES,
+  MAX_FINDING_NOTE_CHARS,
+  MAX_FINDINGS_TOTAL_CHARS,
+  RECENT_FINDINGS_WINDOW,
+  type SubagentFinding,
+} from './findings.js';
 import { isNavigationRaceError, type PageObservation } from '../sampler/page-snapshot.js';
+
+export {
+  FindingsLedger,
+  MAX_FINDINGS_ENTRIES,
+  MAX_FINDING_NOTE_CHARS,
+  MAX_FINDINGS_TOTAL_CHARS,
+  RECENT_FINDINGS_WINDOW,
+  type SubagentFinding,
+};
 import {
   buildApprovalCard,
   detectPageGate,
@@ -29,10 +46,11 @@ export type SubagentActionDecision =
       waitUntil?: NavigateWaitUntil;
       timeoutMs?: number;
       reason: string;
+      note?: string;
     }
-  | { type: 'move_mouse'; points: Point2D | Point2D[]; label?: string; reason: string }
-  | { type: 'hover'; target: string | Point2D; reason: string }
-  | { type: 'click'; target: string | Point2D; if_present?: boolean; reason: string }
+  | { type: 'move_mouse'; points: Point2D | Point2D[]; label?: string; reason: string; note?: string }
+  | { type: 'hover'; target: string | Point2D; reason: string; note?: string }
+  | { type: 'click'; target: string | Point2D; if_present?: boolean; reason: string; note?: string }
   | {
       type: 'drag';
       from: string | Point2D;
@@ -40,15 +58,17 @@ export type SubagentActionDecision =
       steps?: number;
       keepSelection?: boolean;
       reason: string;
+      note?: string;
     }
-  | { type: 'type_text'; target: string; text: string; pressEnter?: boolean; reason: string }
-  | { type: 'scroll'; deltaY: number; reason: string }
-  | { type: 'set_cursor_style'; style: VirtualCursorStyleConfig; reason: string }
-  | { type: 'complete'; report: string }
+  | { type: 'type_text'; target: string; text: string; pressEnter?: boolean; reason: string; note?: string }
+  | { type: 'scroll'; deltaY: number; reason: string; note?: string }
+  | { type: 'set_cursor_style'; style: VirtualCursorStyleConfig; reason: string; note?: string }
+  | { type: 'complete'; report: string; note?: string }
   | {
       type: 'pause_for_takeover';
       blockReason: GateReason | 'ORIGIN_BLOCKED';
       message: string;
+      note?: string;
     };
 
 export interface SubagentPlannerContext {
@@ -58,6 +78,8 @@ export interface SubagentPlannerContext {
   latestObservation: PageObservation;
   history: SlidingWindowHistory;
   hostFacts: HostFactsTracker;
+  findings?: readonly SubagentFinding[];
+  findingsBlock?: string;
   signal?: AbortSignal;
 }
 
@@ -116,6 +138,7 @@ export interface SubagentRunResult {
   hostFactsBlock: string;
   hostFacts: HostFactsData;
   contextStats: SlidingContextStats;
+  findings?: SubagentFinding[];
   approvalCard?: DshApprovalCardPayload;
   navigation?: NavigationDiagnostic;
 }
@@ -127,6 +150,7 @@ interface PausedSubagentState {
   tools: AtomicBrowserToolset;
   hostFacts: HostFactsTracker;
   history: SlidingWindowHistory;
+  findingsLedger: FindingsLedger;
   planner: SubagentPlanner;
   nextStep: number;
   maxSteps: number;
@@ -138,9 +162,9 @@ You operate a background browser equipped with a physical Bezier virtual cursor.
 At each step you receive:
 1. A compact archive of earlier steps (images evicted to save context);
 2. The latest 1-3 viewport screenshots with the virtual cursor & trail visible;
-3. The 3-in-1 Observation HUD (scroll metrics, DOM/tech stats, console/network errors, and numbered #ref interactive controls).
+3. The 3-in-1 Observation HUD (scroll metrics, DOM/tech stats, console/network errors, numbered #ref interactive controls, and a ## Design block when available), plus ## Findings so far across prior steps.
 
-Respond ONLY with a single valid JSON object matching one of these actions:
+Respond ONLY with a single valid JSON object matching one of these actions (any action may include an optional "note":"..." <=120 chars to record key visual/design/content findings into ## Findings so far):
 - {"type":"move_mouse","points":[{"x":300,"y":400},{"x":800,"y":420}],"label":"SWEEP","reason":"..."}
 - {"type":"hover","target":"#3","reason":"..."}
 - {"type":"click","target":"#8","reason":"..."}
@@ -180,14 +204,19 @@ export interface PlannerStepDiagnostic {
 
 /** Summarizes a SubagentActionDecision into a compact JSON-safe replay object for diagnostics. */
 export function summarizeDecisionAction(decision: SubagentActionDecision): Record<string, unknown> {
+  const noteExtra =
+    typeof decision.note === 'string' && decision.note.trim().length > 0
+      ? { note: decision.note.replace(/\s+/g, ' ').trim().slice(0, MAX_FINDING_NOTE_CHARS) }
+      : {};
   switch (decision.type) {
     case 'navigate':
-      return { type: 'navigate', url: decision.url };
+      return { type: 'navigate', url: decision.url, ...noteExtra };
     case 'move_mouse':
       return {
         type: 'move_mouse',
         points_count: Array.isArray(decision.points) ? decision.points.length : 1,
         ...(decision.label ? { label: decision.label } : {}),
+        ...noteExtra,
       };
     case 'click':
       return {
@@ -197,6 +226,7 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
           ? { ref: decision.target }
           : {}),
         ...(decision.if_present ? { if_present: true } : {}),
+        ...noteExtra,
       };
     case 'hover':
       return {
@@ -205,6 +235,7 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         ...(typeof decision.target === 'string' && decision.target.startsWith('#')
           ? { ref: decision.target }
           : {}),
+        ...noteExtra,
       };
     case 'drag':
       return {
@@ -215,6 +246,7 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         ...(typeof decision.keepSelection === 'boolean'
           ? { keepSelection: decision.keepSelection }
           : {}),
+        ...noteExtra,
       };
     case 'type_text':
       return {
@@ -222,19 +254,58 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         target: decision.target,
         text_length: decision.text.length,
         ...(decision.pressEnter ? { pressEnter: true } : {}),
+        ...noteExtra,
       };
     case 'scroll':
-      return { type: 'scroll', deltaY: decision.deltaY };
+      return { type: 'scroll', deltaY: decision.deltaY, ...noteExtra };
     case 'set_cursor_style':
       return {
         type: 'set_cursor_style',
         ...(decision.style.preset ? { preset: decision.style.preset } : {}),
+        ...noteExtra,
       };
     case 'complete':
-      return { type: 'complete', report_length: decision.report.length };
+      return { type: 'complete', report_length: decision.report.length, ...noteExtra };
     case 'pause_for_takeover':
-      return { type: 'pause_for_takeover', blockReason: decision.blockReason };
+      return { type: 'pause_for_takeover', blockReason: decision.blockReason, ...noteExtra };
   }
+}
+
+function formatShortActionForFinding(decision: SubagentActionDecision, blocked?: ActionBlockedReason): string {
+  let base: string;
+  switch (decision.type) {
+    case 'navigate':
+      base = 'navigate';
+      break;
+    case 'move_mouse':
+      base = 'move_mouse';
+      break;
+    case 'hover':
+      base = typeof decision.target === 'string' ? `hover ${decision.target}` : 'hover';
+      break;
+    case 'click':
+      base = typeof decision.target === 'string' ? `click ${decision.target}` : 'click';
+      break;
+    case 'drag':
+      base = 'drag';
+      break;
+    case 'type_text':
+      base = `type_text ${decision.target}`;
+      break;
+    case 'scroll':
+      base = `scroll ${decision.deltaY >= 0 ? '+' : ''}${Math.round(decision.deltaY)}`;
+      break;
+    case 'set_cursor_style':
+      base = 'set_cursor_style';
+      break;
+    case 'complete':
+      base = 'complete';
+      break;
+    case 'pause_for_takeover':
+      base = 'pause_for_takeover';
+      break;
+  }
+  return blocked ? `${base}(${blocked})` : base;
 }
 
 async function runFallbackAndRecord(
@@ -265,6 +336,7 @@ function isPoint2D(value: unknown): value is Point2D {
 export function isValidSubagentDecision(value: unknown): value is SubagentActionDecision {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const d = value as Record<string, unknown>;
+  if (d.note !== undefined && typeof d.note !== 'string') return false;
   switch (d.type) {
     case 'navigate': {
       const waitUntilOk =
@@ -474,6 +546,9 @@ export function createDshHostLlmPlanner(opts: {
     for (const entry of entries.filter((e) => e.imageBase64 !== null)) {
       promptText += `\n---\n**Action Executed**: ${entry.actionTaken}\n${entry.fullHudText}\n`;
     }
+    if (ctx.findingsBlock) {
+      promptText += `\n${ctx.findingsBlock}\n`;
+    }
     const textBlock = { type: 'text', text: promptText };
 
     // Attach latest screenshot via ctx.attachments if supported by host
@@ -614,6 +689,13 @@ export function createOpenAIVisionPlanner(opts: {
 
   return async (ctx: SubagentPlannerContext): Promise<SubagentActionDecision> => {
     const messages = ctx.history.buildMultimodalMessages(SUBAGENT_SYSTEM_PROMPT, ctx.taskPrompt);
+    if (ctx.findingsBlock && messages[1]) {
+      if (Array.isArray(messages[1].content)) {
+        messages[1].content.push({ type: 'text', text: `\n${ctx.findingsBlock}\n` });
+      } else {
+        messages[1].content = `${messages[1].content}\n${ctx.findingsBlock}\n`;
+      }
+    }
 
     const callApi = async (useJsonObjectFormat: boolean) => {
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -783,6 +865,7 @@ interface LostSubagentRecord {
   hostFacts: HostFactsData;
   hostFactsBlock: string;
   contextStats: SlidingContextStats;
+  findings?: SubagentFinding[];
 }
 
 export class BrowserSubagentRunner {
@@ -927,6 +1010,7 @@ export class BrowserSubagentRunner {
         hostFacts,
         hostFactsBlock,
         contextStats,
+        findings: paused.findingsLedger?.getFindings?.() ?? [],
       });
       this.writeSessionLostDiagnostics(paused.req.artifactDir, id, at, reason);
     }
@@ -945,7 +1029,8 @@ export class BrowserSubagentRunner {
     role: string,
     hostFacts: HostFactsData,
     hostFactsBlock: string,
-    contextStats: SlidingContextStats
+    contextStats: SlidingContextStats,
+    findings: SubagentFinding[] = []
   ): SubagentRunResult {
     const hint =
       '浏览器窗口已关闭，任务无法续跑；请重新发起 browser_subagent_run。已产生的截图与 diagnostics 仍保留。';
@@ -959,6 +1044,7 @@ export class BrowserSubagentRunner {
       hostFactsBlock,
       hostFacts,
       contextStats,
+      findings,
     };
   }
 
@@ -1122,6 +1208,7 @@ export class BrowserSubagentRunner {
 
       const hostFacts = new HostFactsTracker(subagentId, req.role, session);
       const history = new SlidingWindowHistory(maxRecentImages);
+      const findingsLedger = new FindingsLedger();
       const tools = new AtomicBrowserToolset(session, snapshotDir);
 
       const planner: SubagentPlanner =
@@ -1145,6 +1232,7 @@ export class BrowserSubagentRunner {
           hostFactsBlock: hostFacts.formatHostFactsBlock(),
           hostFacts: hostFacts.getFacts(),
           contextStats: history.getStats(),
+          findings: findingsLedger.getFindings(),
         };
       }
 
@@ -1155,6 +1243,7 @@ export class BrowserSubagentRunner {
       req.signal?.throwIfAborted();
       hostFacts.recordStep(initRes.observation.screenshotPath);
       history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
+      findingsLedger.record(0, initRes.observation, 'navigate');
 
       return await this.executeLoop({
         subagentId,
@@ -1163,6 +1252,7 @@ export class BrowserSubagentRunner {
         tools,
         hostFacts,
         history,
+        findingsLedger,
         planner,
         nextStep: 1,
         maxSteps,
@@ -1197,7 +1287,8 @@ export class BrowserSubagentRunner {
           lost.role,
           lost.hostFacts,
           lost.hostFactsBlock,
-          lost.contextStats
+          lost.contextStats,
+          lost.findings ?? []
         );
       }
       const { hostFacts, hostFactsBlock } = this.buildFallbackHostFacts(subagentId, 'Browser Subagent');
@@ -1240,13 +1331,16 @@ export class BrowserSubagentRunner {
         paused.req.role,
         hostFacts,
         hostFactsBlock,
-        contextStats
+        contextStats,
+        paused.findingsLedger?.getFindings?.() ?? []
       );
     }
 
     this.pausedSessions.delete(subagentId);
 
-    const { req, session, tools, hostFacts, history, planner, nextStep, maxSteps } = paused;
+    const { req, session, tools, hostFacts, history, planner, nextStep, maxSteps } =
+      paused;
+    const findingsLedger = paused.findingsLedger ?? new FindingsLedger();
     req.signal = signal;
     if (userFollowupNote) {
       req.taskPrompt = `${req.taskPrompt}\n\n[User Follow-up Note]: ${userFollowupNote}`;
@@ -1272,6 +1366,7 @@ export class BrowserSubagentRunner {
         postTakeoverObs,
         tools.sampler.formatObservationForLLM(postTakeoverObs)
       );
+      findingsLedger.record(Math.max(0, nextStep - 1), postTakeoverObs, 'resume');
 
       return await this.executeLoop({
         subagentId,
@@ -1280,6 +1375,7 @@ export class BrowserSubagentRunner {
         tools,
         hostFacts,
         history,
+        findingsLedger,
         planner,
         nextStep,
         maxSteps,
@@ -1297,7 +1393,14 @@ export class BrowserSubagentRunner {
           new Date().toISOString(),
           'user_closed_window'
         );
-        return this.buildSessionLostResult(subagentId, req.role, safeFacts, safeBlock, safeStats);
+        return this.buildSessionLostResult(
+          subagentId,
+          req.role,
+          safeFacts,
+          safeBlock,
+          safeStats,
+          paused.findingsLedger?.getFindings?.() ?? []
+        );
       }
       throw err;
     } finally {
@@ -1308,8 +1411,18 @@ export class BrowserSubagentRunner {
   private async executeLoop(
     state: PausedSubagentState & { latestObs: PageObservation; isSharedSession: boolean }
   ): Promise<SubagentRunResult> {
-    const { subagentId, req, session, tools, hostFacts, history, planner, maxSteps, isSharedSession } =
-      state;
+    const {
+      subagentId,
+      req,
+      session,
+      tools,
+      hostFacts,
+      history,
+      findingsLedger,
+      planner,
+      maxSteps,
+      isSharedSession,
+    } = state;
     let latestObs = state.latestObs;
     let latestNavigation = state.latestNavigation;
     let keepSessionAlive = false;
@@ -1335,6 +1448,7 @@ export class BrowserSubagentRunner {
         tools,
         hostFacts,
         history,
+        findingsLedger,
         planner,
         nextStep,
         maxSteps,
@@ -1356,6 +1470,7 @@ export class BrowserSubagentRunner {
         hostFactsBlock: hostFacts.formatHostFactsBlock(),
         hostFacts: hostFacts.getFacts(),
         contextStats: history.getStats(),
+        findings: findingsLedger.getFindings(),
         approvalCard: card,
         ...(latestNavigation ? { navigation: latestNavigation } : {}),
       };
@@ -1386,6 +1501,7 @@ export class BrowserSubagentRunner {
           }
         }
 
+        const findingsBlock = findingsLedger.formatForPrompt(step);
         const decision = await planner({
           stepIndex: step,
           maxSteps,
@@ -1393,6 +1509,8 @@ export class BrowserSubagentRunner {
           latestObservation: latestObs,
           history,
           hostFacts,
+          findings: findingsLedger.getFindings(),
+          ...(findingsBlock ? { findingsBlock } : {}),
           signal: req.signal,
         });
         req.signal?.throwIfAborted();
@@ -1407,6 +1525,9 @@ export class BrowserSubagentRunner {
         }
 
         if (decision.type === 'complete') {
+          if (decision.note) {
+            findingsLedger.record(step, latestObs, 'complete', decision.note);
+          }
           return {
             subagentId,
             role: req.role,
@@ -1415,11 +1536,15 @@ export class BrowserSubagentRunner {
             hostFactsBlock: hostFacts.formatHostFactsBlock(),
             hostFacts: hostFacts.getFacts(),
             contextStats: history.getStats(),
+            findings: findingsLedger.getFindings(),
             ...(latestNavigation ? { navigation: latestNavigation } : {}),
           };
         }
 
         if (decision.type === 'pause_for_takeover') {
+          if (decision.note) {
+            findingsLedger.record(step, latestObs, 'pause_for_takeover', decision.note);
+          }
           return await pauseNow(
             step + 1,
             decision.blockReason,
@@ -1438,6 +1563,7 @@ export class BrowserSubagentRunner {
               snap,
               tools.sampler.formatObservationForLLM(snap)
             );
+            findingsLedger.record(step, snap, 'navigate(blocked)', decision.note);
             latestObs = snap;
             continue;
           }
@@ -1452,6 +1578,7 @@ export class BrowserSubagentRunner {
             res.observation,
             res.llmSummary
           );
+          findingsLedger.record(step, res.observation, 'navigate', decision.note);
           latestObs = res.observation;
           if (await session.checkHumanTakeoverRequested()) {
             return await pauseNow(
@@ -1466,6 +1593,7 @@ export class BrowserSubagentRunner {
 
         if (decision.type === 'set_cursor_style') {
           await tools.setCursorStyle(decision.style);
+          findingsLedger.record(step, latestObs, 'set_cursor_style', decision.note);
           if (await session.checkHumanTakeoverRequested()) {
             return await pauseNow(
               step + 1,
@@ -1515,7 +1643,8 @@ export class BrowserSubagentRunner {
               req.role,
               hostFacts.getFacts(),
               hostFacts.formatHostFactsBlock(),
-              history.getStats()
+              history.getStats(),
+              findingsLedger.getFindings()
             );
           }
           const errMsg = String(actionErr?.message ?? actionErr).replace(/\s+/g, ' ').trim().slice(0, 240);
@@ -1585,6 +1714,12 @@ export class BrowserSubagentRunner {
           actionResult.observation,
           actionResult.llmSummary
         );
+        findingsLedger.record(
+          step,
+          actionResult.observation,
+          formatShortActionForFinding(decision, actionResult.blocked),
+          decision.note
+        );
         latestObs = actionResult.observation;
 
         if (consecutiveFailures >= 3) {
@@ -1597,6 +1732,7 @@ export class BrowserSubagentRunner {
             hostFactsBlock: hostFacts.formatHostFactsBlock(),
             hostFacts: hostFacts.getFacts(),
             contextStats: history.getStats(),
+            findings: findingsLedger.getFindings(),
             ...(latestNavigation ? { navigation: latestNavigation } : {}),
           };
         }
@@ -1619,6 +1755,7 @@ export class BrowserSubagentRunner {
         hostFactsBlock: hostFacts.formatHostFactsBlock(),
         hostFacts: hostFacts.getFacts(),
         contextStats: history.getStats(),
+        findings: findingsLedger.getFindings(),
         ...(latestNavigation ? { navigation: latestNavigation } : {}),
       };
     } finally {

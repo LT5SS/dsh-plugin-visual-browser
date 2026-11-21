@@ -64,6 +64,67 @@ export interface DomTechStats {
     };
     detectedTechHints: string[];
 }
+export interface DesignSnapshot {
+    title: string;
+    headings: Array<{
+        tag: string;
+        text: string;
+    }>;
+    headingsTotal: number;
+    headingsError?: boolean;
+    sections: number[];
+    sectionsTotal: number;
+    sectionsError?: boolean;
+    palette: {
+        bg: string;
+        text: string;
+        accent: string;
+    } | null;
+    canvasCoversViewport?: boolean;
+    fonts: Array<{
+        family: string;
+        weight: string;
+        maxPx: number;
+    }>;
+    fontsError?: boolean;
+    cssVarsTotal: number;
+    cssVarsSample: Array<{
+        name: string;
+        value: string;
+    }>;
+    cssVarsError?: boolean;
+    layout: {
+        grid: number;
+        flex: number;
+        fixed: number;
+        sticky: number;
+    } | null;
+    media: {
+        img: number;
+        video: number;
+        canvas: number;
+        svg: number;
+        largest: {
+            kind: string;
+            width: number;
+            height: number;
+            objectFit?: string;
+            canvasWidth?: number;
+            canvasHeight?: number;
+        } | null;
+        largestCanvas?: {
+            width: number;
+            height: number;
+        } | null;
+    } | null;
+    motion: {
+        transition: number;
+        animation: number;
+        willChange: number;
+        reducedMotion: '支持' | '未检测到' | '未知';
+    } | null;
+    bodyText: string | null;
+}
 export interface PageObservation {
     stepIndex: number;
     timestamp: string;
@@ -77,7 +138,10 @@ export interface PageObservation {
     navigation?: NavigationDiagnostic;
     scrollDiagnostic?: ScrollDiagnostic;
     snapshotGen?: number;
+    design?: DesignSnapshot;
 }
+export declare const MAX_DESIGN_BLOCK_CHARS = 1200;
+export declare function formatDesignBlock(design?: DesignSnapshot): string;
 export declare class PageSnapshotSampler {
     private session;
     private outputDir;

@@ -16,6 +16,10 @@ import {
   BrowserSession,
   BrowserSubagentRunner,
   Config,
+  FindingsLedger,
+  MAX_DESIGN_BLOCK_CHARS,
+  MAX_FINDINGS_TOTAL_CHARS,
+  MAX_FINDING_NOTE_CHARS,
   POINTER_SHAPE_SVG_PATHS,
   PageSnapshotSampler,
   SUBAGENT_SYSTEM_PROMPT,
@@ -23,6 +27,7 @@ import {
   computeDefaultBackgroundWindowBounds,
   createSettingsHttpHandler,
   extractHostStreamChunk,
+  formatDesignBlock,
   loadPersistedSettings,
   parseJsonDecision,
   readVolatileValue,
@@ -168,6 +173,45 @@ function startSilentStaticServer(rootDir: string): Promise<{ url: string; close:
   <p><button id="plain-btn">Plain Action</button></p>
 </body>
 </html>`);
+        return;
+      }
+      if (cleanUrl === '/__design-editorial.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Design Editorial Fixture</title>
+  <style>
+    :root { --red: #f00d18; --ink: #0a0a0a; --accent: #ff9f1a; --gap: 16px; --f1: Impact; --f2: Consolas; }
+    @media (prefers-reduced-motion: reduce) { * { transition: none; } }
+    body { margin: 0; background: var(--red); color: var(--ink); font-family: Georgia, serif; }
+    h1 { font-family: Impact, sans-serif; font-size: 96px; font-weight: 400; margin: 24px 0; transition: transform 0.25s ease; }
+    h2 { font-family: Consolas, monospace; font-size: 24px; font-weight: 400; }
+    section { min-height: 700px; padding: 20px; }
+    .accent { display: inline-block; background: #ff9f1a; color: #0a0a0a; padding: 8px 14px; }
+  </style>
+</head>
+<body>
+  <section><h1>CREATIVE</h1><a href="https://example.org/work" class="accent">Work</a><p>Visible design body copy for snapshot verification.</p><canvas width="400" height="200"></canvas></section>
+  <section><h2>Projects</h2><p>Second section.</p></section>
+  <section><h2>Contact</h2><p>Third section.</p></section>
+</body>
+</html>`);
+        return;
+      }
+      if (cleanUrl === '/__design-canvas.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Canvas Only</title><style>html,body{margin:0;overflow:hidden;height:100vh;}</style></head>
+<body><canvas width="1440" height="900" style="width:100vw;height:100vh;display:block;"></canvas><div style="display:none">Hidden</div></body>
+</html>`);
+        return;
+      }
+      if (cleanUrl === '/__design-blank.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><html><head><meta charset="utf-8"><title></title></head><body></body></html>');
         return;
       }
       const relPath = cleanUrl === '/' ? 'index.html' : cleanUrl.replace(/^\/+/, '');
@@ -2912,6 +2956,136 @@ async function main() {
       await v133Session.close();
     }
     console.log('[Strict DSH 0.2 Contract] 5q Verified REF_STALE fail-fast, error budget, if_present, HUD dedup, transient nav retry & scroll diagnostics!');
+
+    // 5r. TASK-v1.4.0: ## Design HUD block (<=1200 chars, priority truncation, canvas/blank handling, non-breaking format) + cumulative findings ledger
+    const v140Session = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+    }).start();
+    try {
+      const v140Tools = new AtomicBrowserToolset(v140Session, path.join(artifactDir, 'v140-design'));
+      const edNav = await v140Tools.navigate(`${srv.url}__design-editorial.html`, 150);
+      assert.ok(edNav.llmSummary.includes('## Design'), 'Expected ## Design block in HUD');
+      assert.ok(
+        edNav.llmSummary.indexOf('## Design') > edNav.llmSummary.indexOf('#### Visible Interactive Controls'),
+        '## Design must appear after existing HUD lines'
+      );
+      assert.ok(edNav.llmSummary.includes('href=`https://example.org/work`'), 'Existing #ref href line must remain untouched');
+      const edDesignBlock = edNav.llmSummary.slice(edNav.llmSummary.indexOf('## Design'));
+      assert.ok(edDesignBlock.length <= MAX_DESIGN_BLOCK_CHARS);
+      assert.ok((edNav.observation.design?.sectionsTotal ?? 0) >= 3);
+      assert.ok((edNav.observation.design?.fonts.length ?? 0) >= 2);
+      assert.equal(edNav.observation.design?.palette?.bg, '#f00d18');
+      assert.ok(!edNav.observation.design?.canvasCoversViewport);
+      assert.equal(edNav.observation.design?.media?.canvas, edNav.observation.domStats.counts.canvas);
+
+      const canvasNav = await v140Tools.navigate(`${srv.url}__design-canvas.html`, 100);
+      assert.ok((canvasNav.observation.design?.media?.canvas ?? 0) >= 1);
+      assert.equal(canvasNav.observation.design?.canvasCoversViewport, true);
+      assert.ok(canvasNav.llmSummary.includes('被 <canvas> 覆盖 → 实际视觉配色请以截图为依据'));
+      assert.ok((canvasNav.observation.design?.bodyText ?? '').length < 40);
+      assert.ok(canvasNav.llmSummary.includes('主体可能在 <canvas> 内'));
+
+      const blankNav = await v140Tools.navigate(`${srv.url}__design-blank.html`, 100);
+      assert.ok(blankNav.llmSummary.includes('- headings: n/a'));
+      assert.ok(blankNav.llmSummary.includes('（几乎为空，主体可能在 <canvas> 内）'));
+
+      // Decision note validation
+      const parsedWithNote = parseJsonDecision('{"type":"scroll","deltaY":400,"reason":"Scroll","note":"主色红"}');
+      assert.equal(parsedWithNote?.note, '主色红');
+      assert.equal(parseJsonDecision('{"type":"scroll","deltaY":400,"reason":"Bad","note":123}'), null);
+
+      // Truncation priority check
+      const truncatedBlock = formatDesignBlock({
+        title: 'Long '.repeat(12),
+        headings: Array.from({ length: 5 }, (_, i) => ({ tag: 'h2', text: `H${i} ` + 'X'.repeat(55) })),
+        headingsTotal: 9,
+        sections: [0, 800, 1600, 2400, 3200, 4000],
+        sectionsTotal: 9,
+        palette: { bg: '#f00d18', text: '#0a0a0a', accent: '#ff9f1a' },
+        fonts: [
+          { family: 'LongDisplayFontFamilyOne', weight: '700', maxPx: 180 },
+          { family: 'LongSerifFontFamilyTwo', weight: '400', maxPx: 28 },
+          { family: 'LongMonoFontFamilyThree', weight: '400', maxPx: 12 },
+        ],
+        cssVarsTotal: 25,
+        cssVarsSample: Array.from({ length: 5 }, (_, i) => ({ name: `--long-css-var-${i}`, value: 'rgba(255,159,26,0.95)'.padEnd(36, ' ') })),
+        layout: { grid: 4, flex: 8, fixed: 2, sticky: 1 },
+        media: { img: 4, video: 2, canvas: 1, svg: 9, largest: { kind: 'img', width: 1200, height: 800, objectFit: 'cover' }, largestCanvas: { width: 1440, height: 900 } },
+        motion: { transition: 12, animation: 4, willChange: 3, reducedMotion: '支持' },
+        bodyText: 'PRESERVED_BODY_TAIL_' + '文'.repeat(120),
+      });
+      assert.ok(truncatedBlock.length <= MAX_DESIGN_BLOCK_CHARS);
+      assert.ok(truncatedBlock.includes('PRESERVED_BODY_TAIL_'));
+    } finally {
+      await v140Session.close();
+    }
+
+    // End-to-end apply() + browser_subagent_run with 6 steps -> diagnostics.json findings & step-5 retention
+    const findingsCapturedPrompts: string[] = [];
+    let findingsStep = 0;
+    const findingsHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async stream(params: any) {
+            findingsStep++;
+            const msg = params.messages?.[0];
+            const text = Array.isArray(msg?.content)
+              ? msg.content.filter((b: any) => b?.type === 'text').map((b: any) => b.text).join('\n')
+              : String(msg?.content ?? '');
+            findingsCapturedPrompts.push(text);
+            const action =
+              findingsStep === 1
+                ? { type: 'scroll', deltaY: 400, reason: 'Step 1', note: '主色是红、字体是压缩无衬线' }
+                : findingsStep < 6
+                  ? { type: 'scroll', deltaY: 300, reason: `Step ${findingsStep}` }
+                  : { type: 'complete', report: 'V140_FINDINGS_OK' };
+            return (async function* () {
+              yield { type: 'text-delta', delta: JSON.stringify(action) };
+              yield { type: 'finish', reason: { kind: 'stop' } };
+            })();
+          },
+        },
+      },
+    });
+    const findingsPlugin = apply(findingsHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...findingsHost.effectDisposers);
+    const findingsRunDef = findingsHost.registeredTools.get('browser_subagent_run')!;
+    const findingsRes: any = await findingsRunDef.execute(
+      {
+        url: `${srv.url}__design-editorial.html`,
+        role: 'v1.4.0 Findings Verifier',
+        task_prompt: 'Inspect editorial design and retain findings',
+        max_steps: 7,
+        window_mode: 'headless',
+      },
+      fakeExec
+    );
+    assert.equal(findingsRes.status, 'COMPLETED');
+    assert.equal(findingsRes.planner_mode, 'host-ctx-llm');
+    assert.ok(findingsRes.diagnostics_path && fs.existsSync(findingsRes.diagnostics_path));
+    const findingsDiag = JSON.parse(fs.readFileSync(findingsRes.diagnostics_path, 'utf8'));
+    assert.ok(Array.isArray(findingsDiag.findings) && findingsDiag.findings.length >= 4);
+    assert.ok(
+      findingsDiag.findings.reduce((acc: number, x: any) => acc + String(x.note ?? '').length, 0) <= MAX_FINDINGS_TOTAL_CHARS
+    );
+    const step5PromptText = findingsCapturedPrompts[4] ?? '';
+    assert.ok(step5PromptText.includes('## Findings so far'));
+    assert.ok(step5PromptText.includes('第1–3步：'));
+    assert.ok(step5PromptText.includes('主色是红、字体是压缩无衬线'));
+    const ledgerCheck = new FindingsLedger();
+    assert.ok(ledgerCheck.getTotalChars() === 0 && MAX_FINDING_NOTE_CHARS === 120);
+    await findingsPlugin.runner.closeAllSessions();
+    console.log('[Strict DSH 0.2 Contract] 5r Verified ## Design HUD block, truncation priority & cumulative findings!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {
