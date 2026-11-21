@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.3.0 — Clean Drag Selection, Mid-Drag Evidence Frame, Preview Press-and-Drag & Directional Scroll)
+# `dsh-plugin-visual-browser` (v1.3.1 — Clean Drag Selection, Mid-Drag Evidence Frame, Preview Press-and-Drag & Directional Scroll)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -54,7 +54,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.3.0+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.3.1+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）

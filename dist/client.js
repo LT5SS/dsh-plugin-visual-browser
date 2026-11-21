@@ -620,6 +620,15 @@ window.__ModuleLoader__.load({
             ? drag.to.x
             : 100;
       const dragGradY2 = drag ? drag.to.y : 0;
+      const dragTrailStart =
+        style.trailColorStart && style.trailColorStart !== "transparent"
+          ? style.trailColorStart
+          : style.pointerColor;
+      const dragTrailEnd =
+        style.trailColorEnd && style.trailColorEnd !== "transparent"
+          ? style.trailColorEnd
+          : style.rippleColor;
+      const dragLineWidth = Math.max(2.4, (style.trailWidth || 2.8) * 1.8);
       const badgeLabel = drag
         ? (style.badgeTextPrefix || "DSH") +
           " · DRAG (" +
@@ -709,8 +718,8 @@ window.__ModuleLoader__.load({
                   x2: dragGradX2,
                   y2: dragGradY2,
                 },
-                e("stop", { offset: "0%", stopColor: style.trailColorStart, stopOpacity: 0.45 }),
-                e("stop", { offset: "100%", stopColor: style.trailColorEnd, stopOpacity: 0.98 })
+                e("stop", { offset: "0%", stopColor: dragTrailStart, stopOpacity: 0.45 }),
+                e("stop", { offset: "100%", stopColor: dragTrailEnd, stopOpacity: 0.98 })
               )
             ),
             style.trailVariant !== "none" &&
@@ -729,6 +738,7 @@ window.__ModuleLoader__.load({
                     strokeLinecap: "round",
                   }),
                 e("path", {
+                  "data-dsh-preview-trail": "true",
                   d,
                   fill: "none",
                   stroke: "url(#dshvb_preview_grad)",
@@ -756,38 +766,38 @@ window.__ModuleLoader__.load({
               e(
                 React.Fragment,
                 null,
-                style.trailVariant !== "none" &&
-                  e(
-                    React.Fragment,
-                    null,
-                    style.trailGlow &&
-                      e("line", {
-                        x1: drag.from.x,
-                        y1: drag.from.y,
-                        x2: drag.to.x,
-                        y2: drag.to.y,
-                        stroke: style.trailColorEnd,
-                        strokeOpacity: 0.3,
-                        strokeWidth: (style.trailWidth || 3) * 3.6,
-                        strokeLinecap: "round",
-                      }),
+                e(
+                  React.Fragment,
+                  null,
+                  style.trailGlow &&
                     e("line", {
-                      "data-dsh-preview-drag-line": "true",
                       x1: drag.from.x,
                       y1: drag.from.y,
                       x2: drag.to.x,
                       y2: drag.to.y,
-                      stroke: "url(#dshvb_preview_drag_grad)",
-                      strokeWidth: (style.trailWidth || 3) * 1.8,
+                      stroke: dragTrailEnd,
+                      strokeOpacity: 0.3,
+                      strokeWidth: dragLineWidth * 2.2,
                       strokeLinecap: "round",
-                    })
-                  ),
+                    }),
+                  e("line", {
+                    "data-dsh-preview-drag-line": "true",
+                    x1: drag.from.x,
+                    y1: drag.from.y,
+                    x2: drag.to.x,
+                    y2: drag.to.y,
+                    stroke: "url(#dshvb_preview_drag_grad)",
+                    strokeWidth: dragLineWidth,
+                    strokeLinecap: "round",
+                  })
+                ),
                 e("circle", {
                   "data-dsh-preview-anchor": "true",
                   cx: drag.from.x,
                   cy: drag.from.y,
                   r: 9,
-                  fill: "rgba(0,240,255,0.16)",
+                  fill: style.rippleColor,
+                  fillOpacity: 0.16,
                   stroke: style.rippleColor,
                   strokeWidth: 2,
                   strokeDasharray: "3 3",
@@ -802,7 +812,8 @@ window.__ModuleLoader__.load({
                   cx: drop.x,
                   cy: drop.y,
                   r: 12,
-                  fill: "rgba(0,240,255,0.16)",
+                  fill: style.rippleColor,
+                  fillOpacity: 0.16,
                   stroke: style.rippleColor,
                   strokeWidth: 2.2,
                 }),

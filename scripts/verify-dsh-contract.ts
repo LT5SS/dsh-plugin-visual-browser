@@ -846,7 +846,7 @@ async function main() {
   const treeDragging = renderPanelTree(readyFormProps, false);
   const dragLine = findVNode(treeDragging, (n) => n?.props?.['data-dsh-preview-drag-line'] === 'true');
   assert.ok(dragLine && dragLine.props.x1 === 100 && dragLine.props.x2 === 220);
-  assert.ok(Math.abs(Number(dragLine.props.strokeWidth) - 4.5 * 1.8) < 0.01, `Expected thickened preview drag line, got ${dragLine.props.strokeWidth}`);
+  assert.ok(Math.abs(Number(dragLine.props.strokeWidth) - Math.max(2.4, 4.5 * 1.8)) < 0.01, `Expected thickened preview drag line, got ${dragLine.props.strokeWidth}`);
 
   const stageVNodeMove = findVNode(
     treeDragging,
@@ -872,6 +872,107 @@ async function main() {
   dropClearTimer!.cb();
   const treeReset = renderPanelTree(readyFormProps, false);
   assert.ok(collectTreeText(treeReset).includes('PREVIEW'), 'Expected preview badge restored to PREVIEW after 1s');
+
+  // v1.3.1: clean-none (trailVariant === 'none') MUST still render preview drag line & anchor, while normal trail stays hidden
+  const cleanNoneProps = {
+    form: {
+      state: { status: 'ready', writable: true, revision: 1, value: { cursorStyle: { preset: 'clean-none' } } },
+      mutate: async () => true,
+    },
+  };
+  const cleanNoneTree = renderPanelTree(cleanNoneProps, true);
+  assert.equal(
+    findVNode(cleanNoneTree, (n) => n?.props?.['data-dsh-preview-trail'] === 'true'),
+    null,
+    'Normal preview trail must stay hidden when trailVariant === none'
+  );
+  const cleanStage0 = findVNode(
+    cleanNoneTree,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  cleanStage0.props.onPointerDown({
+    button: 0,
+    pointerId: 8,
+    clientX: 100,
+    clientY: 80,
+    currentTarget: mockStageTarget,
+  });
+  const cleanTreeDown = renderPanelTree(cleanNoneProps, false);
+  const cleanStageDown = findVNode(
+    cleanTreeDown,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  cleanStageDown.props.onPointerMove({
+    pointerId: 8,
+    clientX: 220,
+    clientY: 140,
+    currentTarget: mockStageTarget,
+  });
+  const cleanTreeDrag = renderPanelTree(cleanNoneProps, false);
+  const cleanDragLine = findVNode(cleanTreeDrag, (n) => n?.props?.['data-dsh-preview-drag-line'] === 'true');
+  const cleanAnchor = findVNode(cleanTreeDrag, (n) => n?.props?.['data-dsh-preview-anchor'] === 'true');
+  assert.ok(cleanDragLine, 'Expected [data-dsh-preview-drag-line] even when trailVariant === none');
+  assert.equal(cleanDragLine.props.x1, 100);
+  assert.equal(cleanDragLine.props.y1, 80);
+  assert.equal(cleanDragLine.props.x2, 220);
+  assert.equal(cleanDragLine.props.y2, 140);
+  assert.ok(Math.abs(Number(cleanDragLine.props.strokeWidth) - Math.max(2.4, 2.8 * 1.8)) < 0.01);
+  assert.equal(
+    findVNode(cleanTreeDrag, (n) => n?.props?.['data-dsh-preview-trail'] === 'true'),
+    null,
+    'Normal preview trail must stay empty/absent during clean-none drag'
+  );
+  assert.ok(cleanAnchor && cleanAnchor.props.fill === '#ff3b28' && cleanAnchor.props.fillOpacity === 0.16);
+  const cleanStageDrag = findVNode(
+    cleanTreeDrag,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  cleanStageDrag.props.onPointerUp({
+    pointerId: 8,
+    clientX: 260,
+    clientY: 160,
+    currentTarget: mockStageTarget,
+  });
+  const cleanTreeDrop = renderPanelTree(cleanNoneProps, false);
+  const cleanPtrDrop = findVNode(cleanTreeDrop, (n) => n?.props?.['data-dsh-preview-pointer'] === 'true');
+  assert.ok(!cleanPtrDrop?.props?.style?.transform?.includes('scale(0.86)'));
+  assert.ok(collectTreeText(cleanTreeDrop).includes('DROP (260,160)'));
+
+  // v1.3.1: laser-dots (trailVariant === 'dots') MUST also render [data-dsh-preview-drag-line] while dragging
+  const dotsProps = {
+    form: {
+      state: { status: 'ready', writable: true, revision: 1, value: { cursorStyle: { preset: 'laser-dots' } } },
+      mutate: async () => true,
+    },
+  };
+  const dotsTree = renderPanelTree(dotsProps, true);
+  const dotsStage0 = findVNode(
+    dotsTree,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  dotsStage0.props.onPointerDown({
+    button: 0,
+    pointerId: 9,
+    clientX: 90,
+    clientY: 70,
+    currentTarget: mockStageTarget,
+  });
+  const dotsTreeDown = renderPanelTree(dotsProps, false);
+  const dotsStageDown = findVNode(
+    dotsTreeDown,
+    (n) => typeof n?.props?.className === 'string' && n.props.className.includes('dshvb_stage')
+  );
+  dotsStageDown.props.onPointerMove({
+    pointerId: 9,
+    clientX: 210,
+    clientY: 130,
+    currentTarget: mockStageTarget,
+  });
+  const dotsTreeDrag = renderPanelTree(dotsProps, false);
+  const dotsDragLine = findVNode(dotsTreeDrag, (n) => n?.props?.['data-dsh-preview-drag-line'] === 'true');
+  assert.ok(dotsDragLine && dotsDragLine.props.x1 === 90 && dotsDragLine.props.x2 === 210);
+  assert.ok(Math.abs(Number(dotsDragLine.props.strokeWidth) - Math.max(2.4, 3.6 * 1.8)) < 0.01);
+  assert.equal(findVNode(dotsTreeDrag, (n) => n?.props?.['data-dsh-preview-trail'] === 'true'), null);
 
   const useHookText = collectTreeText(
     renderPanelTree({
