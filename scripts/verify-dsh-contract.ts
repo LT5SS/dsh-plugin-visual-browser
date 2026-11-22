@@ -24,9 +24,13 @@ import {
   PageSnapshotSampler,
   SUBAGENT_SYSTEM_PROMPT,
   apply,
+  classifyJsonDecision,
   computeDefaultBackgroundWindowBounds,
+  computePatchMeanPixelDiff,
   createSettingsHttpHandler,
+  decodePngRgba,
   extractHostStreamChunk,
+  extractVisualPaletteFromPng,
   formatDesignBlock,
   loadPersistedSettings,
   normSplit,
@@ -3240,6 +3244,209 @@ async function main() {
     assert.ok(String(jsonFailDiag.planner_detail?.fallback_reason ?? '').includes('RAW_PROSE_SNIPPET_NOT_JSON_12345'));
     await jsonFailPlugin.runner.closeAllSessions();
     console.log('[Strict DSH 0.2 Contract] 5s Verified normSplit, geometric headings, headings n/a reasons, 0-controls hint, scroll driver, inspect_motion & JSON retry!');
+
+    // 5t. TASK-v1.4.2: coordinate inspect_motion + 32x32 pixel diff, Controls filtered stats, visualPalette & TRUNCATED_JSON per-step diagnostics
+    const truncInsideString = classifyJsonDecision(
+      '{"type":"complete","report":"css .hero { color: #f40c3f; } ' + 'A'.repeat(120)
+    );
+    assert.equal(truncInsideString.decision, null);
+    assert.equal(truncInsideString.reason, 'TRUNCATED_JSON');
+
+    const truncFenced = classifyJsonDecision('```json\n{"type":"complete","report":"partial');
+    assert.equal(truncFenced.decision, null);
+    assert.equal(truncFenced.reason, 'TRUNCATED_JSON');
+
+    assert.equal(classifyJsonDecision('Plain prose response').reason, 'NOT_JSON');
+    assert.equal(classifyJsonDecision('{"type":"click"}').reason, 'SCHEMA_MISMATCH');
+    assert.equal(classifyJsonDecision('{"type":"complete","report":"ok"}').decision?.type, 'complete');
+    const flatInspect = classifyJsonDecision('{"type":"inspect_motion","x":640,"y":380,"reason":"Canvas hover"}');
+    assert.equal(flatInspect.decision?.type, 'inspect_motion');
+    assert.deepEqual((flatInspect.decision as any)?.target, { x: 640, y: 380 });
+
+    const v142Session = await new BrowserSession({ mode: 'auto', windowMode: 'headless' }).start();
+    try {
+      await v142Session.page.setViewportSize({ width: 1280, height: 800 });
+      const v142Tools = new AtomicBrowserToolset(v142Session, path.join(artifactDir, 'v142-checks'));
+
+      // Canvas hover pixel diff + visualPalette + Controls filtered stats
+      await v142Session.page.setContent(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  html, body { margin: 0; height: 2200px; background: #ffffff; font-family: sans-serif; }
+  canvas#gl { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; z-index: 1; }
+  .row { position: relative; z-index: 2; width: 240px; height: 48px; margin: 16px; background: #0a0a0a; color: #f7f2ec; transition: background-color 0.05s linear; }
+  .row:hover { background: #e8352f; color: #ffffff; }
+  .sr-clip { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0px, 0px, 0px, 0px); }
+</style></head>
+<body>
+  <canvas id="gl" width="1280" height="800"></canvas>
+  <button class="row" id="hover-row">Work Row</button>
+  <button style="display:none">HiddenBtn</button>
+  <button style="width:0;height:0;padding:0;border:0;">ZeroBtn</button>
+  <a href="#clip" class="sr-clip">ClippedLink</a>
+  <a href="#far" style="position:absolute;top:1800px;left:20px;">OffscreenLink</a>
+  <script>
+    const cv = document.getElementById('gl');
+    const ctx2 = cv.getContext('2d');
+    function drawScene(mx, my) {
+      ctx2.fillStyle = '#f7f2ec';
+      ctx2.fillRect(0, 0, cv.width, cv.height);
+      ctx2.fillStyle = '#e8352f';
+      ctx2.fillRect(100, 120, 420, 320);
+      if (mx >= 0 && my >= 0) {
+        ctx2.fillStyle = '#00f0ff';
+        ctx2.fillRect(mx - 60, my - 60, 120, 120);
+      }
+    }
+    drawScene(-1, -1);
+    cv.addEventListener('mousemove', (e) => drawScene(e.clientX, e.clientY));
+  </script>
+</body></html>`);
+
+      const canvasSnap = await v142Tools.sampler.captureSnapshot('v142_canvas');
+      const canvasHud = v142Tools.sampler.formatObservationForLLM(canvasSnap);
+      assert.equal(canvasSnap.design?.canvasCoversViewport, true);
+      assert.ok((canvasSnap.design?.visualPalette?.length ?? 0) >= 2, 'Expected visualPalette Top colors');
+      assert.ok(canvasHud.includes('- visualPalette: #'), 'Expected visualPalette line in HUD');
+      assert.ok(canvasHud.includes('来自截图 32×32 采样'));
+      const decodedSnap = decodePngRgba(fs.readFileSync(canvasSnap.screenshotPath));
+      assert.ok(decodedSnap && decodedSnap.width === 1280 && decodedSnap.height === 800);
+      assert.ok(canvasHud.includes('Controls filtered: hidden=1 · zero-size=1 · clipped=1 · offscreen=1'));
+      const designSlice = canvasHud.slice(canvasHud.indexOf('## Design'));
+      assert.ok(designSlice.length <= MAX_DESIGN_BLOCK_CHARS);
+
+      const canvasMotion = await v142Tools.inspectMotion({ x: 640, y: 380 });
+      assert.ok(canvasMotion.motion?.ok);
+      assert.equal(canvasMotion.motion?.topElement, 'CANVAS#gl');
+      assert.equal(canvasMotion.motion?.pixelChanged, true);
+      assert.ok((canvasMotion.motion?.pixelDiffMean ?? 0) > 10);
+      assert.deepEqual(canvasMotion.motion?.cssChanged, []);
+      assert.ok(canvasMotion.llmSummary.includes('pixelChanged=true'));
+
+      const rowBox = await v142Session.page.locator('#hover-row').boundingBox();
+      assert.ok(rowBox);
+      const rowMotion = await v142Tools.inspectMotion({
+        x: Math.round(rowBox!.x + rowBox!.width / 2),
+        y: Math.round(rowBox!.y + rowBox!.height / 2),
+      });
+      assert.ok(rowMotion.motion?.ok);
+      assert.ok(rowMotion.motion?.cssChanged?.includes('backgroundColor'));
+      assert.ok(rowMotion.motion?.cssChanged?.includes('color'));
+
+      // Normal page without filtered controls or canvas overlay omits both visualPalette & Controls filtered lines, and blank area pixelChanged=false
+      await v142Session.page.setContent(
+        '<!doctype html><html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><a href="https://iana.org">More information</a></body></html>'
+      );
+      const cleanObs = await v142Tools.sampler.captureSnapshot('v142_clean');
+      const cleanHud = v142Tools.sampler.formatObservationForLLM(cleanObs);
+      assert.ok(!cleanHud.includes('visualPalette:'));
+      assert.ok(!cleanHud.includes('Controls filtered:'));
+
+      const blankMotion = await v142Tools.inspectMotion({ x: 1180, y: 740 });
+      assert.ok(blankMotion.motion?.ok);
+      assert.equal(blankMotion.motion?.pixelChanged, false);
+    } finally {
+      await v142Session.close();
+    }
+
+    // Subagent E2E: >2000-char TRUNCATED_JSON recovers on retry with temperature=0 and records max_tokens/usage/decision_parse
+    let truncRetryCalls = 0;
+    let truncRetryPromptSawLimit = false;
+    const truncRetryHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream(params: any) {
+            truncRetryCalls++;
+            if (truncRetryCalls === 1) {
+              yield {
+                type: 'text-delta',
+                delta: '{"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\n' + 'L'.repeat(2100),
+              };
+              yield { type: 'usage', input_tokens: 120, output_tokens: 512, total_tokens: 632 };
+              yield { type: 'finish', reason: { kind: 'length' } };
+              return;
+            }
+            const userTexts = (params?.messages?.[0]?.content ?? [])
+              .filter((b: any) => b?.type === 'text')
+              .map((b: any) => b.text)
+              .join('\n');
+            if (params?.temperature === 0 && userTexts.includes('TRUNCATED_JSON') && userTexts.includes('<= 600')) {
+              truncRetryPromptSawLimit = true;
+            }
+            yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'SHORT_RETRY_OK' }) };
+            yield { type: 'usage', input_tokens: 140, output_tokens: 45, total_tokens: 185 };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const truncRetryPlugin = apply(truncRetryHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...truncRetryHost.effectDisposers);
+    const truncRetryDef = truncRetryHost.registeredTools.get('browser_subagent_run')!;
+    const truncRetryVal: any = await truncRetryDef.execute(
+      { url: `${srv.url}__design-editorial.html`, role: 'Trunc Retry QA', task_prompt: 'Verify truncated retry', max_steps: 2, window_mode: 'headless' },
+      {
+        ...fakeExec,
+        agent: { model: { current: () => ({ provider: 'opencode-go', model: 'deepseek-v4.1-flash', maxTokens: 512 }) } },
+      } as any
+    );
+    assert.equal(truncRetryVal.status, 'COMPLETED');
+    assert.equal(truncRetryVal.planner_detail?.fallback_count, 0);
+    assert.equal(truncRetryPromptSawLimit, true);
+    assert.deepEqual(truncRetryVal.planner_detail?.llm_steps?.[0]?.decision_parse, {
+      ok: true,
+      retried: true,
+      initial_reason: 'TRUNCATED_JSON',
+    });
+    assert.equal(truncRetryVal.planner_detail?.llm_steps?.[0]?.max_tokens, 512);
+    assert.equal(truncRetryVal.planner_detail?.llm_steps?.[0]?.usage?.output_tokens, 45);
+    assert.ok(!truncRetryVal.subagent_report.includes('本轮有'));
+    await truncRetryPlugin.runner.closeAllSessions();
+
+    // Persistent TRUNCATED_JSON fallback adds explicit report notice + decision_parse.reason='TRUNCATED_JSON'
+    const truncPersistHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        llm: {
+          async *stream() {
+            yield { type: 'text-delta', delta: '{"type":"complete","report":"' + 'B'.repeat(2100) };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const truncPersistPlugin = apply(truncPersistHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...truncPersistHost.effectDisposers);
+    const truncPersistDef = truncPersistHost.registeredTools.get('browser_subagent_run')!;
+    const truncPersistVal: any = await truncPersistDef.execute(
+      { url: `${srv.url}__design-editorial.html`, role: 'Trunc Fallback QA', task_prompt: 'Verify persistent truncation notice', max_steps: 1, window_mode: 'headless' },
+      fakeExec
+    );
+    assert.equal(truncPersistVal.planner_mode, 'host-ctx-llm-fallback');
+    assert.equal(truncPersistVal.planner_detail?.fallback_count, 1);
+    assert.equal(truncPersistVal.planner_detail?.last_fallback_reason, 'TRUNCATED_JSON');
+    assert.equal(truncPersistVal.planner_detail?.llm_steps?.[0]?.decision_parse?.ok, false);
+    assert.equal(truncPersistVal.planner_detail?.llm_steps?.[0]?.decision_parse?.reason, 'TRUNCATED_JSON');
+    assert.ok((truncPersistVal.planner_detail?.llm_steps?.[0]?.usage?.output_tokens_est ?? 0) > 400);
+    assert.ok(String(truncPersistVal.subagent_report).includes('本轮有 1 步决策走了 fallback'));
+    await truncPersistPlugin.runner.closeAllSessions();
+    console.log('[Strict DSH 0.2 Contract] 5t Verified coordinate inspect_motion, Controls filtered, visualPalette & TRUNCATED_JSON diagnostics!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

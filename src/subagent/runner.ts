@@ -175,7 +175,7 @@ Respond ONLY with a single valid JSON object matching one of these actions (any 
 - {"type":"drag","from":"#2","to":{"x":640,"y":380},"steps":12,"reason":"..."}
 - {"type":"type_text","target":"#5","text":"hello","pressEnter":true,"reason":"..."}
 - {"type":"scroll","deltaY":800,"reason":"..."}
-- {"type":"inspect_motion","target":"#3","reason":"..."} (read-only pointer-driven hover/transform/animation probe without clicking)
+- {"type":"inspect_motion","target":"#3","reason":"..."} or {"type":"inspect_motion","target":{"x":640,"y":380},"reason":"..."} (read-only pointer-driven hover/transform/canvas-pixel probe without clicking; use {x,y} on <canvas> areas)
 - {"type":"navigate","url":"https://...","reason":"..."}
 - {"type":"pause_for_takeover","blockReason":"LOGIN_REQUIRED","message":"..."}
 - {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}
@@ -195,6 +195,27 @@ JSON 输出格式红线（反例警示）：
 3. 若动作返回 \`[ACTION_REFUSED] {"ok":false,"blocked":"PLUGIN_UI_LAYER",...}\`，说明目标坐标被工具自身顶层 UI 遮挡（真实点击未发送），请先 \`scroll\` 调整位置或改用未被遮挡的 \`#ref\`，禁止反复点击同一被遮挡坐标。
 4. 时刻关注剩余步数预算（\`stepIndex / maxSteps\`）：若剩余步数 <= 1，必须在本步直接返回 \`complete\` 收尾。`;
 
+export type DecisionParseFailureReason = 'TRUNCATED_JSON' | 'NOT_JSON' | 'SCHEMA_MISMATCH';
+
+export interface DecisionParseResult {
+  decision: SubagentActionDecision | null;
+  reason?: DecisionParseFailureReason;
+}
+
+export interface DecisionParseDiagnostic {
+  ok: boolean;
+  retried: boolean;
+  reason?: DecisionParseFailureReason;
+  initial_reason?: DecisionParseFailureReason;
+}
+
+export interface StreamUsageStats {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  output_tokens_est?: number;
+}
+
 export interface PlannerStepDiagnostic {
   step: number;
   backend: 'host-ctx-llm' | 'external-vision-api';
@@ -205,6 +226,10 @@ export interface PlannerStepDiagnostic {
   text_preview?: string;
   retried_text_only?: boolean;
   retried_json_schema?: boolean;
+  decision_parse?: DecisionParseDiagnostic;
+  max_tokens?: number | null;
+  usage?: StreamUsageStats;
+  finish_reason?: string;
   stream_error?: string;
   fallback_reason?: string;
   decision_source?: 'llm' | 'inspector';
@@ -314,7 +339,11 @@ function formatShortActionForFinding(decision: SubagentActionDecision, blocked?:
       base = `scroll ${decision.deltaY >= 0 ? '+' : ''}${Math.round(decision.deltaY)}`;
       break;
     case 'inspect_motion':
-      base = typeof decision.target === 'string' ? `inspect_motion ${decision.target}` : 'inspect_motion';
+      base = isPoint2D(decision.target)
+        ? `inspect_motion (${Math.round(decision.target.x)},${Math.round(decision.target.y)})`
+        : typeof decision.target === 'string'
+          ? `inspect_motion ${decision.target}`
+          : 'inspect_motion';
       break;
     case 'set_cursor_style':
       base = 'set_cursor_style';
@@ -423,27 +452,96 @@ export function isValidSubagentDecision(value: unknown): value is SubagentAction
 }
 
 /**
+ * String-aware JSON classification for subagent decisions:
+ * distinguishes `TRUNCATED_JSON`, `NOT_JSON`, and `SCHEMA_MISMATCH`,
+ * and normalizes flat `{ type: 'inspect_motion', x, y }` coordinates.
+ */
+export function classifyJsonDecision(rawText: string): DecisionParseResult {
+  const trimmed = String(rawText ?? '').trim();
+  if (!trimmed) return { decision: null, reason: 'NOT_JSON' };
+
+  const closedFence = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
+  let candidate = closedFence ? closedFence[1].trim() : trimmed;
+  if (!closedFence) {
+    candidate = candidate.replace(/^```(?:json)?\s*/i, '').trim();
+  }
+
+  const firstBrace = candidate.indexOf('{');
+  if (firstBrace < 0) {
+    return { decision: null, reason: 'NOT_JSON' };
+  }
+
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let matchingClose = -1;
+
+  for (let i = firstBrace; i < candidate.length; i++) {
+    const ch = candidate[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        matchingClose = i;
+        break;
+      }
+    }
+  }
+
+  if (matchingClose < 0 || depth > 0 || inString) {
+    const afterBrace = candidate.slice(firstBrace);
+    if (firstBrace === 0 || /^\{\s*"/.test(afterBrace)) {
+      return { decision: null, reason: 'TRUNCATED_JSON' };
+    }
+    return { decision: null, reason: 'NOT_JSON' };
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(candidate.slice(firstBrace, matchingClose + 1));
+  } catch {
+    return { decision: null, reason: 'NOT_JSON' };
+  }
+
+  if (
+    parsed &&
+    typeof parsed === 'object' &&
+    !Array.isArray(parsed) &&
+    parsed.type === 'inspect_motion' &&
+    parsed.target === undefined &&
+    typeof parsed.x === 'number' &&
+    Number.isFinite(parsed.x) &&
+    typeof parsed.y === 'number' &&
+    Number.isFinite(parsed.y)
+  ) {
+    parsed = { ...parsed, target: { x: parsed.x, y: parsed.y } };
+  }
+
+  if (isValidSubagentDecision(parsed)) {
+    return { decision: parsed };
+  }
+  return { decision: null, reason: 'SCHEMA_MISMATCH' };
+}
+
+/**
  * Extracts and structurally validates the first JSON decision object from a model text response.
  * Returns `null` (never throws) on empty strings, prose, malformed JSON, or invalid action shapes.
  */
 export function parseJsonDecision(rawText: string): SubagentActionDecision | null {
-  const trimmed = String(rawText ?? '').trim();
-  if (!trimmed) return null;
-
-  const fenceMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
-  const candidate = fenceMatch ? fenceMatch[1].trim() : trimmed;
-  const firstBrace = candidate.indexOf('{');
-  const lastBrace = candidate.lastIndexOf('}');
-  if (firstBrace < 0 || lastBrace <= firstBrace) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
-    return isValidSubagentDecision(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
+  return classifyJsonDecision(rawText).decision;
 }
 
 const TEXT_DELTA_CHUNK_TYPES = new Set([
@@ -481,13 +579,40 @@ function firstStringField(obj: Record<string, any>, keys: string[]): string | un
   return undefined;
 }
 
+function firstNumberField(obj: Record<string, any>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    if (typeof obj[key] === 'number' && Number.isFinite(obj[key]) && obj[key] >= 0) {
+      return obj[key];
+    }
+  }
+  return undefined;
+}
+
+function extractUsageStats(raw: unknown): StreamUsageStats | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, any>;
+  const input_tokens = firstNumberField(obj, ['inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens']);
+  const output_tokens = firstNumberField(obj, ['outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens']);
+  const total_tokens = firstNumberField(obj, ['totalTokens', 'total_tokens']);
+  if (input_tokens === undefined && output_tokens === undefined && total_tokens === undefined) {
+    return undefined;
+  }
+  return {
+    ...(input_tokens !== undefined ? { input_tokens } : {}),
+    ...(output_tokens !== undefined ? { output_tokens } : {}),
+    ...(total_tokens !== undefined ? { total_tokens } : {}),
+  };
+}
+
 /**
- * Normalizes diverse host `ctx.llm.stream()` chunk shapes and records unknown schemas for diagnostics.
+ * Normalizes diverse host `ctx.llm.stream()` chunk shapes and records unknown schemas & token usage for diagnostics.
  */
 export function extractHostStreamChunk(chunk: unknown): {
   kind: string;
   text: string;
   error?: string;
+  usage?: StreamUsageStats;
+  finishReason?: string;
   unrecognizedKeys?: string[];
 } {
   if (typeof chunk === 'string') {
@@ -499,28 +624,52 @@ export function extractHostStreamChunk(chunk: unknown): {
 
   const obj = chunk as Record<string, any>;
   const kind = typeof obj.type === 'string' ? obj.type : 'unknown';
+  const usage =
+    extractUsageStats(obj.usage) ??
+    extractUsageStats(obj.tokenUsage) ??
+    extractUsageStats(obj.response?.usage) ??
+    (kind === 'usage' ? extractUsageStats(obj) : undefined);
 
   if (TEXT_DELTA_CHUNK_TYPES.has(kind)) {
     const text = firstStringField(obj, ['delta', 'text', 'textDelta', 'content']);
-    if (text !== undefined) return { kind, text };
+    if (text !== undefined) return { kind, text, ...(usage ? { usage } : {}) };
     return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
   }
 
   if (FULL_TEXT_CHUNK_TYPES.has(kind)) {
     const text = firstStringField(obj, ['text', 'delta', 'content']);
-    if (text !== undefined) return { kind, text };
+    if (text !== undefined) return { kind, text, ...(usage ? { usage } : {}) };
     return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
   }
 
   if (kind === 'finish') {
     const reason = obj.reason;
+    const finishReason =
+      typeof reason === 'string'
+        ? reason
+        : typeof reason?.kind === 'string'
+          ? reason.kind
+          : typeof obj.finishReason === 'string'
+            ? obj.finishReason
+            : undefined;
     if (reason?.kind === 'error') {
       const failure = reason.failure ?? {};
       const message = String(failure.message ?? reason.message ?? 'unknown finish error').slice(0, 260);
       const code = String(failure.code ?? 'UNKNOWN');
-      return { kind, text: '', error: `${code}: ${message}` };
+      return {
+        kind,
+        text: '',
+        error: `${code}: ${message}`,
+        ...(usage ? { usage } : {}),
+        ...(finishReason ? { finishReason } : {}),
+      };
     }
-    return { kind, text: '' };
+    return {
+      kind,
+      text: '',
+      ...(usage ? { usage } : {}),
+      ...(finishReason ? { finishReason } : {}),
+    };
   }
 
   if (kind === 'error') {
@@ -528,21 +677,38 @@ export function extractHostStreamChunk(chunk: unknown): {
       obj.error?.message ??
       obj.message ??
       (typeof obj.error === 'string' ? obj.error : JSON.stringify(obj.error ?? 'Unknown stream error'));
-    return { kind, text: '', error: String(rawErr).slice(0, 300) };
+    return { kind, text: '', error: String(rawErr).slice(0, 300), ...(usage ? { usage } : {}) };
   }
 
   if (RECOGNIZED_NON_TEXT_CHUNK_TYPES.has(kind)) {
-    return { kind, text: '' };
+    const finishReason =
+      typeof obj.finishReason === 'string'
+        ? obj.finishReason
+        : typeof obj.reason === 'string'
+          ? obj.reason
+          : typeof obj.reason?.kind === 'string'
+            ? obj.reason.kind
+            : undefined;
+    return {
+      kind,
+      text: '',
+      ...(usage ? { usage } : {}),
+      ...(finishReason ? { finishReason } : {}),
+    };
   }
 
-  return { kind, text: '', unrecognizedKeys: Object.keys(obj).slice(0, 12) };
+  return {
+    kind,
+    text: '',
+    ...(usage ? { usage } : {}),
+    unrecognizedKeys: Object.keys(obj).slice(0, 12),
+  };
 }
 
 /**
  * Creates a planner backed by DSH 0.2's native `ctx.llm` runtime service when available.
- * Automatically retries text-only when an image attachment causes failure, records chunk
- * diagnostics, and degrades cleanly to `fallbackPlanner` (default: `createBuiltinInspectorPlanner()`)
- * instead of throwing on empty streams or non-JSON responses.
+ * Automatically retries text-only when an image attachment causes failure, retries strict JSON once
+ * when parsing fails (including `TRUNCATED_JSON`), records per-step diagnostics, and degrades cleanly.
  */
 export function createDshHostLlmPlanner(opts: {
   llm: any;
@@ -550,6 +716,7 @@ export function createDshHostLlmPlanner(opts: {
   provider: string;
   model: string;
   sessionId?: string;
+  maxTokens?: number;
   fallbackPlanner?: SubagentPlanner;
   onStepDiagnostic?: (diag: PlannerStepDiagnostic) => void;
 }): SubagentPlanner {
@@ -600,6 +767,8 @@ export function createDshHostLlmPlanner(opts: {
       const chunkTypes: Record<string, number> = {};
       let sampleUnrecognizedKeys: string[] | undefined;
       let streamError: string | undefined;
+      let usage: StreamUsageStats | undefined;
+      let finishReason: string | undefined;
       let threw = false;
 
       try {
@@ -635,6 +804,12 @@ export function createDshHostLlmPlanner(opts: {
             if (!streamError && parsedChunk.error) {
               streamError = parsedChunk.error;
             }
+            if (parsedChunk.usage) {
+              usage = { ...(usage ?? {}), ...parsedChunk.usage };
+            }
+            if (parsedChunk.finishReason) {
+              finishReason = parsedChunk.finishReason;
+            }
           }
         }
       } catch (err: any) {
@@ -643,13 +818,24 @@ export function createDshHostLlmPlanner(opts: {
         threw = true;
       }
 
-      return { fullText, chunkCount, chunkTypes, sampleUnrecognizedKeys, streamError, threw };
+      return {
+        fullText,
+        chunkCount,
+        chunkTypes,
+        sampleUnrecognizedKeys,
+        streamError,
+        usage,
+        finishReason,
+        threw,
+      };
     };
 
     const initialBlocks = imageBlock ? [textBlock, imageBlock] : [textBlock];
     const firstAttempt = await runStreamAttempt(initialBlocks);
     let attempt = firstAttempt;
-    let decision = parseJsonDecision(attempt.fullText);
+    const firstParsed = classifyJsonDecision(attempt.fullText);
+    let decision = firstParsed.decision;
+    let retryParsed: DecisionParseResult = firstParsed;
     let retriedTextOnly = false;
     let retriedJsonSchema = false;
     const isImageRejection = /image|vision|multimodal|attachment/i.test(attempt.streamError ?? '');
@@ -667,15 +853,25 @@ export function createDshHostLlmPlanner(opts: {
       !ctx.signal?.aborted
     ) {
       retriedJsonSchema = true;
+      const retryInstruction =
+        firstParsed.reason === 'TRUNCATED_JSON'
+          ? '\n[FORMAT_CORRECTION: TRUNCATED_JSON] Your previous JSON reply was truncated before closing "}". ' +
+            'Output ONLY one complete, valid raw JSON object (no ```json fences, no extra prose). ' +
+            'If returning {"type":"complete","report":"..."}, keep "report" concise (<= 600 chars) so the JSON closes cleanly.'
+          : firstParsed.reason === 'SCHEMA_MISMATCH'
+            ? '\n[FORMAT_CORRECTION: SCHEMA_MISMATCH] Your previous JSON did not match the action schema. ' +
+              'Output ONLY one raw JSON object matching an allowed action (for example {"type":"scroll","deltaY":600,"reason":"..."} or {"type":"complete","report":"..."}). ' +
+              'Do NOT wrap it in ```json fences and do NOT add any prose.'
+            : '\n[FORMAT_CORRECTION] Your previous reply was NOT valid JSON for the action schema. ' +
+              'Output ONLY one raw JSON object (for example {"type":"scroll","deltaY":600,"reason":"..."} or {"type":"complete","report":"..."}). ' +
+              'Do NOT wrap it in ```json fences and do NOT add any prose before or after.';
       const correctionBlock = {
         type: 'text',
-        text:
-          '\n[FORMAT_CORRECTION] Your previous reply was NOT valid JSON for the action schema. ' +
-          'Output ONLY one raw JSON object (for example {"type":"scroll","deltaY":600,"reason":"..."} or {"type":"complete","report":"..."}). ' +
-          'Do NOT wrap it in ```json fences and do NOT add any prose before or after.',
+        text: retryInstruction,
       };
       const retryBlocks = imageBlock ? [textBlock, correctionBlock, imageBlock] : [textBlock, correctionBlock];
       const retryAttempt = await runStreamAttempt(retryBlocks, { temperature: 0 });
+      retryParsed = classifyJsonDecision(retryAttempt.fullText);
       attempt = {
         ...retryAttempt,
         chunkTypes:
@@ -684,9 +880,11 @@ export function createDshHostLlmPlanner(opts: {
             : firstAttempt.chunkTypes,
         sampleUnrecognizedKeys:
           retryAttempt.sampleUnrecognizedKeys ?? firstAttempt.sampleUnrecognizedKeys,
+        usage: retryAttempt.usage ?? firstAttempt.usage,
+        finishReason: retryAttempt.finishReason ?? firstAttempt.finishReason,
         fullText: retryAttempt.fullText.trim().length > 0 ? retryAttempt.fullText : firstAttempt.fullText,
       };
-      decision = parseJsonDecision(retryAttempt.fullText);
+      decision = retryParsed.decision;
     } else if (
       !decision &&
       imageBlock &&
@@ -695,8 +893,15 @@ export function createDshHostLlmPlanner(opts: {
     ) {
       retriedTextOnly = true;
       attempt = await runStreamAttempt([textBlock]);
-      decision = parseJsonDecision(attempt.fullText);
+      retryParsed = classifyJsonDecision(attempt.fullText);
+      decision = retryParsed.decision;
     }
+
+    const effectiveUsage = attempt.usage ?? firstAttempt.usage;
+    const effectiveFinishReason = attempt.finishReason ?? firstAttempt.finishReason;
+    const sawTruncation =
+      firstParsed.reason === 'TRUNCATED_JSON' ||
+      (!decision && retriedJsonSchema && retryParsed.reason === 'TRUNCATED_JSON');
 
     const diag: PlannerStepDiagnostic = {
       step: ctx.stepIndex,
@@ -707,16 +912,33 @@ export function createDshHostLlmPlanner(opts: {
       text_length: attempt.fullText.length,
       ...(retriedTextOnly ? { retried_text_only: true } : {}),
       ...(retriedJsonSchema ? { retried_json_schema: true } : {}),
+      ...(effectiveFinishReason ? { finish_reason: effectiveFinishReason } : {}),
+      ...(effectiveUsage
+        ? { usage: effectiveUsage }
+        : sawTruncation
+          ? { usage: { output_tokens_est: Math.ceil(firstAttempt.fullText.length / 4) } }
+          : {}),
+      ...(opts.maxTokens !== undefined
+        ? { max_tokens: opts.maxTokens }
+        : sawTruncation
+          ? { max_tokens: null }
+          : {}),
       ...(attempt.streamError ? { stream_error: attempt.streamError } : {}),
     };
 
     if (decision) {
       diag.decision_source = 'llm';
+      diag.decision_parse = {
+        ok: true,
+        retried: retriedJsonSchema || retriedTextOnly,
+        ...(retriedJsonSchema && firstParsed.reason ? { initial_reason: firstParsed.reason } : {}),
+      };
       diag.action = summarizeDecisionAction(decision);
       opts.onStepDiagnostic?.(diag);
       return decision;
     }
 
+    const finalParseReason = retriedJsonSchema || retriedTextOnly ? retryParsed.reason : firstParsed.reason;
     let fallbackReason: string;
     if (attempt.threw) {
       fallbackReason = 'HOST_LLM_STREAM_ERROR';
@@ -727,8 +949,16 @@ export function createDshHostLlmPlanner(opts: {
     } else if (attempt.fullText.trim().length === 0) {
       fallbackReason = 'EMPTY_TEXT_OUTPUT';
     } else {
-      fallbackReason = 'INVALID_JSON_DECISION';
+      fallbackReason = finalParseReason === 'TRUNCATED_JSON' ? 'TRUNCATED_JSON' : 'INVALID_JSON_DECISION';
       diag.text_preview = attempt.fullText.trim().slice(0, 200);
+      diag.decision_parse = {
+        ok: false,
+        retried: retriedJsonSchema || retriedTextOnly,
+        ...(finalParseReason ? { reason: finalParseReason } : {}),
+        ...(retriedJsonSchema && firstParsed.reason && firstParsed.reason !== finalParseReason
+          ? { initial_reason: firstParsed.reason }
+          : {}),
+      };
     }
     diag.fallback_reason = fallbackReason;
     return runFallbackAndRecord(diag, fallback, ctx, opts.onStepDiagnostic);
@@ -815,7 +1045,9 @@ export function createOpenAIVisionPlanner(opts: {
 
       const data = (await res.json()) as any;
       const rawContent = String(data?.choices?.[0]?.message?.content ?? '');
-      const decision = parseJsonDecision(rawContent);
+      const parsed = classifyJsonDecision(rawContent);
+      const decision = parsed.decision;
+      const usage = extractUsageStats(data?.usage);
       if (decision) {
         opts.onStepDiagnostic?.({
           step: ctx.stepIndex,
@@ -823,6 +1055,8 @@ export function createOpenAIVisionPlanner(opts: {
           chunk_count: 1,
           chunk_types: { completion: 1 },
           text_length: rawContent.length,
+          decision_parse: { ok: true, retried: false },
+          ...(usage ? { usage } : {}),
           decision_source: 'llm',
           action: summarizeDecisionAction(decision),
         });
@@ -830,6 +1064,7 @@ export function createOpenAIVisionPlanner(opts: {
       }
 
       const empty = rawContent.trim().length === 0;
+      const reason = parsed.reason ?? 'NOT_JSON';
       return runFallbackAndRecord(
         {
           step: ctx.stepIndex,
@@ -837,8 +1072,18 @@ export function createOpenAIVisionPlanner(opts: {
           chunk_count: 1,
           chunk_types: { completion: 1 },
           text_length: rawContent.length,
-          ...(!empty ? { text_preview: rawContent.trim().slice(0, 200) } : {}),
-          fallback_reason: empty ? 'EMPTY_TEXT_OUTPUT' : 'INVALID_JSON_DECISION',
+          ...(!empty
+            ? {
+                text_preview: rawContent.trim().slice(0, 200),
+                decision_parse: { ok: false, retried: false, reason },
+              }
+            : {}),
+          ...(usage ? { usage } : {}),
+          fallback_reason: empty
+            ? 'EMPTY_TEXT_OUTPUT'
+            : reason === 'TRUNCATED_JSON'
+              ? 'TRUNCATED_JSON'
+              : 'INVALID_JSON_DECISION',
         },
         fallback,
         ctx,

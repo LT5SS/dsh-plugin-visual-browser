@@ -9,6 +9,7 @@ export * from './driver/human-motion.js';
 export * from './injected/virtual-cursor.js';
 export * from './sampler/telemetry-collector.js';
 export * from './sampler/page-snapshot.js';
+export * from './sampler/png-pixels.js';
 export * from './tools/atomic-tools.js';
 export * from './settings-store.js';
 export * from './subagent/host-facts.js';

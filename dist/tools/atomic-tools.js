@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { PageSnapshotSampler, safeEvaluate } from '../sampler/page-snapshot.js';
+import { computePatchMeanPixelDiff } from '../sampler/png-pixels.js';
 /**
  * Normalizes a target string:
  * - "#4" (when matching a sampled ref ID) -> '[data-dsh-ref="4"]'
@@ -409,8 +410,8 @@ export class AtomicBrowserToolset {
     }
     /**
      * Read-only pointer-driven motion probe (`inspect_motion`):
-     * records target computed styles & rect before moving mouse to center, moves without clicking,
-     * waits settleMs (default 120ms), re-reads state, and reports property deltas & active animations.
+     * accepts either a CSS/#ref selector or viewport `{ x, y }` coordinate (including `<canvas>` regions).
+     * Records DOM/computed-style deltas plus a cursor-hidden 32x32 PNG patch diff before & after hovering.
      */
     async inspectMotion(target, settleMs = 120) {
         const targetLabel = typeof target === 'string'
@@ -427,6 +428,8 @@ export class AtomicBrowserToolset {
                     target: targetLabel,
                     ok: false,
                     blocked: probe.blocked,
+                    pixelChanged: false,
+                    cssChanged: [],
                     changed: [],
                     delta: {},
                     animations: 0,
@@ -457,36 +460,183 @@ export class AtomicBrowserToolset {
         else {
             pt = { x: Math.round(target.x), y: Math.round(target.y) };
         }
-        // Ensure baseline is captured outside target hover area if cursor already rests inside it
-        const curPos = this.session.motion.getPosition();
-        const preRect = await safeEvaluate(this.session.page, (arg) => {
-            const el = arg.sel ? document.querySelector(arg.sel) : document.elementFromPoint(arg.x, arg.y);
-            if (!el)
-                return null;
+        // Clamp coordinate targets to viewport & inspect target bounds/topElement without bare page.evaluate
+        const preInfo = await safeEvaluate(this.session.page, (arg) => {
+            const vw = Math.max(1, window.innerWidth || 1280);
+            const vh = Math.max(1, window.innerHeight || 720);
+            const cx = Math.max(0, Math.min(vw - 1, Math.round(arg.x)));
+            const cy = Math.max(0, Math.min(vh - 1, Math.round(arg.y)));
+            let el = null;
+            if (arg.sel) {
+                el = document.querySelector(arg.sel);
+            }
+            else {
+                const stack = typeof document.elementsFromPoint === 'function'
+                    ? document.elementsFromPoint(cx, cy)
+                    : [];
+                for (let si = 0; si < stack.length; si++) {
+                    if (!stack[si].closest('#__dsh_vc_root__')) {
+                        el = stack[si];
+                        break;
+                    }
+                }
+                if (!el) {
+                    const single = document.elementFromPoint(cx, cy);
+                    if (single && !single.closest('#__dsh_vc_root__'))
+                        el = single;
+                }
+            }
+            let topElement;
+            if (el) {
+                const tag = el.tagName.toUpperCase();
+                if (el.id) {
+                    topElement = `${tag}#${el.id}`;
+                }
+                else if (el.className && typeof el.className === 'string') {
+                    const firstCls = el.className.trim().split(/\s+/).find((c) => c && !c.startsWith('is-'));
+                    topElement = firstCls ? `${tag}.${firstCls}` : tag;
+                }
+                else {
+                    topElement = tag;
+                }
+            }
+            if (!el) {
+                return {
+                    vw,
+                    vh,
+                    clampedX: cx,
+                    clampedY: cy,
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                    hasRect: false,
+                    isLargeTarget: false,
+                    ...(topElement ? { topElement } : {}),
+                };
+            }
             const r = el.getBoundingClientRect();
+            const isLargeTarget = r.width >= vw * 0.7 && r.height >= vh * 0.7;
             return {
+                vw,
+                vh,
+                clampedX: cx,
+                clampedY: cy,
                 left: r.left,
                 top: r.top,
                 right: r.right,
                 bottom: r.bottom,
-                vw: window.innerWidth || 1280,
-                vh: window.innerHeight || 720,
+                hasRect: true,
+                isLargeTarget,
+                ...(topElement ? { topElement } : {}),
             };
-        }, null, { arg: { sel: selector, x: pt.x, y: pt.y }, retries: 0 });
-        if (preRect &&
-            curPos.x >= preRect.left - 2 &&
-            curPos.x <= preRect.right + 2 &&
-            curPos.y >= preRect.top - 2 &&
-            curPos.y <= preRect.bottom + 2) {
-            const outX = preRect.left >= 24 ? Math.max(4, Math.round(preRect.left - 16)) : Math.min(preRect.vw - 4, Math.round(preRect.right + 16));
-            const outY = preRect.top >= 24 ? Math.max(4, Math.round(preRect.top - 16)) : Math.min(preRect.vh - 4, Math.round(preRect.bottom + 16));
+        }, {
+            vw: 1280,
+            vh: 720,
+            clampedX: Math.max(0, pt.x),
+            clampedY: Math.max(0, pt.y),
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+            hasRect: false,
+            isLargeTarget: false,
+        }, { arg: { sel: selector, x: pt.x, y: pt.y }, retries: 0 });
+        if (selector === null) {
+            pt = { x: preInfo.clampedX, y: preInfo.clampedY };
+        }
+        // Ensure baseline is captured outside target hover area when cursor already rests near/inside it
+        const curPos = this.session.motion.getPosition();
+        if (preInfo.isLargeTarget) {
+            if (Math.hypot(curPos.x - pt.x, curPos.y - pt.y) <= 48) {
+                const outX = pt.x > preInfo.vw * 0.5
+                    ? Math.max(12, Math.round(preInfo.vw * 0.15))
+                    : Math.min(preInfo.vw - 12, Math.round(preInfo.vw * 0.85));
+                const outY = pt.y > preInfo.vh * 0.5
+                    ? Math.max(12, Math.round(preInfo.vh * 0.15))
+                    : Math.min(preInfo.vh - 12, Math.round(preInfo.vh * 0.85));
+                await this.session.motion.moveTo(outX, outY, { steps: 6, durationMs: 80, label: 'BASELINE' });
+                await this.session.page.waitForTimeout(80);
+            }
+        }
+        else if (preInfo.hasRect &&
+            curPos.x >= preInfo.left - 2 &&
+            curPos.x <= preInfo.right + 2 &&
+            curPos.y >= preInfo.top - 2 &&
+            curPos.y <= preInfo.bottom + 2) {
+            const outX = preInfo.left >= 24
+                ? Math.max(4, Math.round(preInfo.left - 16))
+                : Math.min(preInfo.vw - 4, Math.round(preInfo.right + 16));
+            const outY = preInfo.top >= 24
+                ? Math.max(4, Math.round(preInfo.top - 16))
+                : Math.min(preInfo.vh - 4, Math.round(preInfo.bottom + 16));
             await this.session.motion.moveTo(outX, outY, { steps: 6, durationMs: 80, label: 'BASELINE' });
             await this.session.page.waitForTimeout(80);
         }
+        const clipW = Math.min(32, Math.max(1, preInfo.vw));
+        const clipH = Math.min(32, Math.max(1, preInfo.vh));
+        const clipX = Math.max(0, Math.min(preInfo.vw - clipW, Math.round(pt.x - clipW / 2)));
+        const clipY = Math.max(0, Math.min(preInfo.vh - clipH, Math.round(pt.y - clipH / 2)));
+        const captureCleanPatch = async () => {
+            const prevVis = await safeEvaluate(this.session.page, () => {
+                const root = document.getElementById('__dsh_vc_root__');
+                if (!root)
+                    return null;
+                const prev = root.style.visibility;
+                root.style.visibility = 'hidden';
+                return prev;
+            }, null, 0);
+            try {
+                return await this.session.page
+                    .screenshot({
+                    clip: { x: clipX, y: clipY, width: clipW, height: clipH },
+                    type: 'png',
+                })
+                    .catch(() => null);
+            }
+            finally {
+                if (prevVis !== null) {
+                    await safeEvaluate(this.session.page, (v) => {
+                        const root = document.getElementById('__dsh_vc_root__');
+                        if (root)
+                            root.style.visibility = v;
+                    }, undefined, { arg: prevVis, retries: 0 }).catch(() => { });
+                }
+            }
+        };
         const sampleProbe = async () => safeEvaluate(this.session.page, (arg) => {
-            const el = arg.sel ? document.querySelector(arg.sel) : document.elementFromPoint(arg.x, arg.y);
+            let el = null;
+            if (arg.sel) {
+                el = document.querySelector(arg.sel);
+            }
+            else {
+                const stack = typeof document.elementsFromPoint === 'function'
+                    ? document.elementsFromPoint(arg.x, arg.y)
+                    : [];
+                for (let si = 0; si < stack.length; si++) {
+                    if (!stack[si].closest('#__dsh_vc_root__')) {
+                        el = stack[si];
+                        break;
+                    }
+                }
+                if (!el) {
+                    const single = document.elementFromPoint(arg.x, arg.y);
+                    if (single && !single.closest('#__dsh_vc_root__'))
+                        el = single;
+                }
+            }
             if (!el)
-                return null;
+                return { state: null };
+            const tag = el.tagName.toUpperCase();
+            let topElement = tag;
+            if (el.id) {
+                topElement = `${tag}#${el.id}`;
+            }
+            else if (el.className && typeof el.className === 'string') {
+                const firstCls = el.className.trim().split(/\s+/).find((c) => c && !c.startsWith('is-'));
+                if (firstCls)
+                    topElement = `${tag}.${firstCls}`;
+            }
             const cs = window.getComputedStyle(el);
             const r = el.getBoundingClientRect();
             const se = document.scrollingElement || document.documentElement || document.body;
@@ -500,28 +650,32 @@ export class AtomicBrowserToolset {
                 ? el.getAnimations({ subtree: true }).length
                 : 0;
             return {
-                transform: cs.transform || 'none',
-                opacity: cs.opacity || '1',
-                filter: cs.filter || 'none',
-                color: cs.color || '',
-                backgroundColor: cs.backgroundColor || '',
-                borderColor: cs.borderColor || '',
-                boxShadow: cs.boxShadow || 'none',
-                scrollTop: Math.round(se ? se.scrollTop : window.scrollY || 0),
-                rect: {
-                    x: Math.round(r.x * 10) / 10,
-                    y: Math.round(r.y * 10) / 10,
-                    width: Math.round(r.width * 10) / 10,
-                    height: Math.round(r.height * 10) / 10,
+                topElement,
+                state: {
+                    transform: cs.transform || 'none',
+                    opacity: cs.opacity || '1',
+                    filter: cs.filter || 'none',
+                    color: cs.color || '',
+                    backgroundColor: cs.backgroundColor || '',
+                    borderColor: cs.borderColor || '',
+                    boxShadow: cs.boxShadow || 'none',
+                    scrollTop: Math.round(se ? se.scrollTop : window.scrollY || 0),
+                    rect: {
+                        x: Math.round(r.x * 10) / 10,
+                        y: Math.round(r.y * 10) / 10,
+                        width: Math.round(r.width * 10) / 10,
+                        height: Math.round(r.height * 10) / 10,
+                    },
+                    animations: anims,
+                    subtreeAnimations: subAnims,
+                    transitionDuration: cs.transitionDuration || '0s',
+                    animationName: cs.animationName || 'none',
+                    ...(childTransform !== undefined ? { childTransform } : {}),
                 },
-                animations: anims,
-                subtreeAnimations: subAnims,
-                transitionDuration: cs.transitionDuration || '0s',
-                animationName: cs.animationName || 'none',
-                ...(childTransform !== undefined ? { childTransform } : {}),
             };
-        }, null, { arg: { sel: selector, x: pt.x, y: pt.y }, retries: 0 });
-        const before = await sampleProbe();
+        }, { state: null }, { arg: { sel: selector, x: pt.x, y: pt.y }, retries: 0 });
+        const beforeProbe = await sampleProbe();
+        const beforePatch = await captureCleanPatch();
         await this.session.motion.moveTo(pt.x, pt.y, {
             steps: 10,
             durationMs: 140,
@@ -529,7 +683,11 @@ export class AtomicBrowserToolset {
         });
         if (settleMs > 0)
             await this.session.page.waitForTimeout(settleMs);
-        const after = await sampleProbe();
+        const afterProbe = await sampleProbe();
+        const afterPatch = await captureCleanPatch();
+        const before = beforeProbe.state;
+        const after = afterProbe.state;
+        const topElement = afterProbe.topElement ?? beforeProbe.topElement ?? preInfo.topElement;
         const changed = [];
         const delta = {};
         if (before && after) {
@@ -567,6 +725,12 @@ export class AtomicBrowserToolset {
                 }
             }
         }
+        const cssChanged = [...changed];
+        const pixelDiffMean = beforePatch && afterPatch ? computePatchMeanPixelDiff(beforePatch, afterPatch) : null;
+        const pixelChanged = pixelDiffMean !== null ? pixelDiffMean >= 0.5 : false;
+        if (pixelChanged && pixelDiffMean !== null) {
+            delta.pixel_diff_mean = { before: 0, after: pixelDiffMean };
+        }
         const animCount = after ? Math.max(after.animations, after.subtreeAnimations) : 0;
         const triggers = [];
         if (after) {
@@ -593,10 +757,17 @@ export class AtomicBrowserToolset {
                 triggers.push('hover-style-change');
             }
         }
+        if (pixelChanged && changed.length === 0) {
+            triggers.push('pointer-pixel-change');
+        }
         const motionResult = {
             target: targetLabel,
             ok: true,
             at: pt,
+            ...(topElement ? { topElement } : {}),
+            pixelChanged,
+            ...(pixelDiffMean !== null ? { pixelDiffMean } : {}),
+            cssChanged,
             changed,
             delta,
             animations: animCount,
@@ -610,7 +781,7 @@ export class AtomicBrowserToolset {
             ok: true,
             at: pt,
             motion: motionResult,
-            action: `Inspected motion on ${targetLabel}: changed=[${changed.join(', ')}], animations=${animCount}`,
+            action: `Inspected motion on ${targetLabel}: topElement=${topElement ?? 'none'}, pixelChanged=${pixelChanged}, cssChanged=[${cssChanged.join(', ')}], animations=${animCount}`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };

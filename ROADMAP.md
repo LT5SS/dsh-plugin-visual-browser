@@ -85,9 +85,17 @@
 
 ---
 
-## v1.4.2+ / v2.0.0 规划（TODO）
+## v1.4.2 已交付（坐标级 `inspect_motion` 像素差 + 控件过滤归因 + 截图 `visualPalette` + `TRUNCATED_JSON` 按步归因）
 
-- **其余 4 + 1 固定只读探针**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_canvas`（前后像素差交互探针），并辅以相邻帧区域差异文本补偿。
-- **`inspect_region(x, y, radius, zoom)` 局部 2× 放大能力**：针对全屏 WebGL / `<canvas>` 站点（`#ref` 为空、只能靠全屏截图盲估坐标）提供按需 2× 局部放大定位视图。
+- **坐标级 `inspect_motion({ x, y })` 与 32×32 前后帧像素差**：不依赖 `#ref` 或 DOM 节点即可对 `<canvas>` 区域探测悬停反应；探针隐藏 `#__dsh_vc_root__` 后抓取 32×32 PNG 切片并用纯 Node `node:zlib` 解码器计算 `pixelDiffMean` / `pixelChanged` 与 `topElement`，保留既有 `cssChanged` 行为。
+- **HUD 控件过滤统计（只加可观测性，不改判定）**：在 `Visible Interactive Controls` 区块存在被过滤控件或 0 控件时追加 `- Controls filtered: hidden=... · zero-size=... · clipped=... · offscreen=... · plugin-ui=...`。
+- **`## Design` 视觉主色 `visualPalette`**：仅当 `canvasCoversViewport === true` 时，从已有整页截图执行 32×32 网格量化采样提取 Top3 `#rrggbb` 视觉主色（不新增额外截图），受既有 `≤1200` 字符预算管线裁剪保护。
+- **按步 `decision_parse` 与 `TRUNCATED_JSON` 诊断**：引号感知大括号扫描识别未闭合截断 JSON，自动携带 `report <= 600` 约束与 `temperature=0` 重试 1 次；记录 `decision_parse`、`usage`、`max_tokens` 与 `finish_reason`；若仍 fallback 则在 `subagent_report` 末尾追加显式降级提示。
+
+---
+
+## v2.0.0 规划（TODO）
+
+- **其余 4 + 1 固定只读探针与架构升级**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_region(x, y, radius, zoom)` 局部 2× 放大能力，并辅以相邻帧区域差异文本补偿。
 - **Win32 `HWND_NOTOPMOST` 置顶自愈（v1.3.4 遗留）**：启动后及复用窗口前纠正意外 `WS_EX_TOPMOST` 状态。
-- **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性；不做任意 `evaluate_probe` JS 执行。
+- **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性；不做任意 `evaluate_probe` JS 执行；不在 HUD 中对“虚拟滚动”下绝对判断；不从 WebGL canvas 帧缓冲读取像素/对象内容。

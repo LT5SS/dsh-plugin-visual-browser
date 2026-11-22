@@ -18,6 +18,7 @@ export * from './driver/human-motion.js';
 export * from './injected/virtual-cursor.js';
 export * from './sampler/telemetry-collector.js';
 export * from './sampler/page-snapshot.js';
+export * from './sampler/png-pixels.js';
 export * from './tools/atomic-tools.js';
 export * from './settings-store.js';
 export * from './subagent/host-facts.js';
@@ -386,6 +387,11 @@ function resolveSubagentPlanner(hostServices, ctx, config, exec) {
         const agentAny = exec?.agent;
         const rawSessionId = safeRead(() => agentAny?.sessionId) ?? safeRead(() => agentAny?.session?.id);
         const sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined;
+        const rawMaxTokens = safeRead(() => agentAny?.model?.current?.()?.maxTokens) ??
+            safeRead(() => agentAny?.model?.current?.()?.maxOutputTokens);
+        const maxTokens = typeof rawMaxTokens === 'number' && Number.isFinite(rawMaxTokens) && rawMaxTokens > 0
+            ? rawMaxTokens
+            : undefined;
         return {
             planner: createDshHostLlmPlanner({
                 llm: effectiveServices.llm,
@@ -393,6 +399,7 @@ function resolveSubagentPlanner(hostServices, ctx, config, exec) {
                 provider: route.provider,
                 model: route.model,
                 ...(sessionId ? { sessionId } : {}),
+                ...(maxTokens !== undefined ? { maxTokens } : {}),
                 onStepDiagnostic,
             }),
             tracker,
@@ -832,6 +839,9 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                         // optional host notification failure must never block tool result
                     }
                 }
+                const fallbackNotice = tracker.fallbackCount > 0
+                    ? `\n\n> ⚠️ 降级提示：本轮有 ${tracker.fallbackCount} 步决策走了 fallback（${tracker.lastFallbackReason ?? 'unknown'}），报告质量可能下降，详见 diagnostics.json。`
+                    : '';
                 return toLosslessJson({
                     status: res.status,
                     subagent_id: res.subagentId,
@@ -842,7 +852,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     host_services: hostServicesStatus,
                     ...(diagnosticsPath ? { diagnostics_path: diagnosticsPath } : {}),
                     host_facts_block: res.hostFactsBlock,
-                    subagent_report: res.subagentReport,
+                    subagent_report: `${res.subagentReport}${fallbackNotice}`,
                     approval_card: res.approvalCard ?? null,
                     sliding_window_stats: res.contextStats,
                     findings: res.findings ?? [],

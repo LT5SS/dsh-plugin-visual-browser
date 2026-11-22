@@ -81,6 +81,7 @@ export interface DesignSnapshot {
         text: string;
         accent: string;
     } | null;
+    visualPalette?: string[];
     canvasCoversViewport?: boolean;
     fonts: Array<{
         family: string;
@@ -126,6 +127,13 @@ export interface DesignSnapshot {
     } | null;
     bodyText: string | null;
 }
+export interface ControlsFilterStats {
+    hidden: number;
+    zeroSize: number;
+    clipped: number;
+    offscreen: number;
+    pluginUi: number;
+}
 export interface PageObservation {
     stepIndex: number;
     timestamp: string;
@@ -134,6 +142,7 @@ export interface PageObservation {
     scroll: ScrollMetrics;
     domStats: DomTechStats;
     interactiveElements: InteractiveElementNode[];
+    controlsFilterStats?: ControlsFilterStats;
     health: TelemetryHealthReport;
     degradedReason?: string;
     navigation?: NavigationDiagnostic;

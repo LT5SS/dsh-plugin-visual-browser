@@ -48,6 +48,10 @@ export interface MotionInspectResult {
   ok: boolean;
   blocked?: ActionBlockedReason;
   at?: Point2D;
+  topElement?: string;
+  pixelChanged?: boolean;
+  pixelDiffMean?: number;
+  cssChanged?: string[];
   changed: string[];
   delta: Record<string, { before: string | number; after: string | number }>;
   animations: number;

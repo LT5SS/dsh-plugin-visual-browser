@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
@@ -7,6 +8,7 @@ import type {
   Point2D,
   ScrollDiagnostic,
 } from '../driver/types.js';
+import { extractVisualPaletteFromPng } from './png-pixels.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
 
 const NAVIGATION_RACE_PATTERN =
@@ -125,6 +127,7 @@ export interface DesignSnapshot {
   sectionsTotal: number;
   sectionsError?: boolean;
   palette: { bg: string; text: string; accent: string } | null;
+  visualPalette?: string[];
   canvasCoversViewport?: boolean;
   fonts: Array<{ family: string; weight: string; maxPx: number }>;
   fontsError?: boolean;
@@ -156,6 +159,14 @@ export interface DesignSnapshot {
   bodyText: string | null;
 }
 
+export interface ControlsFilterStats {
+  hidden: number;
+  zeroSize: number;
+  clipped: number;
+  offscreen: number;
+  pluginUi: number;
+}
+
 export interface PageObservation {
   stepIndex: number;
   timestamp: string;
@@ -164,6 +175,7 @@ export interface PageObservation {
   scroll: ScrollMetrics;
   domStats: DomTechStats;
   interactiveElements: InteractiveElementNode[];
+  controlsFilterStats?: ControlsFilterStats;
   health: TelemetryHealthReport;
   degradedReason?: string;
   navigation?: NavigationDiagnostic;
@@ -273,6 +285,16 @@ export function formatDesignBlock(design?: DesignSnapshot): string {
       ? `⚠️ DOM bg ${design.palette.bg} 被<canvas>覆盖，以截图为准`
       : `${design.palette.bg}/${design.palette.text}/${design.palette.accent}`;
 
+  const hasVisualPalette = Boolean(
+    design.canvasCoversViewport && Array.isArray(design.visualPalette) && design.visualPalette.length > 0
+  );
+  const visualPaletteDetail = hasVisualPalette
+    ? `${design.visualPalette!.join(' · ')}（来自截图 32×32 采样）`
+    : '';
+  const visualPaletteCompact = hasVisualPalette
+    ? `${design.visualPalette!.join(' · ')}（截图）`
+    : '';
+
   const fontsDetail =
     design.fontsError || design.fonts.length === 0
       ? 'n/a'
@@ -347,6 +369,7 @@ export function formatDesignBlock(design?: DesignSnapshot): string {
   let curHeadings = headingsDetail;
   let curSections = sectionsDetail;
   let curPalette = paletteDetail;
+  let curVisualPalette = visualPaletteDetail;
   let curFonts = fontsDetail;
   let curCssVars = cssVarsDetail;
   let curLayout = layoutDetail;
@@ -361,6 +384,7 @@ export function formatDesignBlock(design?: DesignSnapshot): string {
       `- headings: ${curHeadings}`,
       `- sections: ${curSections}`,
       `- palette: ${curPalette}`,
+      ...(hasVisualPalette ? [`- visualPalette: ${curVisualPalette}`] : []),
       `- fonts: ${curFonts}`,
       `- cssVars: ${curCssVars}`,
       `- layout: ${curLayout}`,
@@ -387,6 +411,7 @@ export function formatDesignBlock(design?: DesignSnapshot): string {
 
   curFonts = fontsCompact;
   curPalette = paletteCompact;
+  if (hasVisualPalette) curVisualPalette = visualPaletteCompact;
   out = buildBlock();
   if (out.length <= MAX_DESIGN_BLOCK_CHARS) return out;
 
@@ -481,6 +506,13 @@ export class PageSnapshotSampler {
         detectedTechHints: [] as string[],
       },
       interactiveElements: [] as InteractiveElementNode[],
+      controlsFilterStats: {
+        hidden: 0,
+        zeroSize: 0,
+        clipped: 0,
+        offscreen: 0,
+        pluginUi: 0,
+      } as ControlsFilterStats,
       cursorState: null as Point2D | null,
       design: undefined as DesignSnapshot | undefined,
     };
@@ -533,19 +565,84 @@ export class PageSnapshotSampler {
         ariaLabel?: string;
         alt?: string;
       }> = [];
+      const controlsFilterStats = {
+        hidden: 0,
+        zeroSize: 0,
+        clipped: 0,
+        offscreen: 0,
+        pluginUi: 0,
+      };
 
       let refIdx = 0;
       for (const el of candidates) {
         if (nodes.length >= 35) break;
-        if (el.closest('#__dsh_vc_root__')) continue;
+        if (el.closest('#__dsh_vc_root__')) {
+          controlsFilterStats.pluginUi++;
+          continue;
+        }
         const style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.05) {
+          controlsFilterStats.hidden++;
           continue;
         }
         const r = el.getBoundingClientRect();
-        if (r.width < 6 || r.height < 6) continue;
+        if (r.width < 6 || r.height < 6) {
+          const isSelfClipped =
+            style.clip === 'rect(0px, 0px, 0px, 0px)' ||
+            style.clip === 'rect(0px 0px 0px 0px)' ||
+            Boolean(style.clipPath && style.clipPath.includes('inset(50%')) ||
+            (r.width <= 1.5 && r.height <= 1.5 && (style.overflow === 'hidden' || style.overflow === 'clip'));
+          if (isSelfClipped) {
+            controlsFilterStats.clipped++;
+          } else {
+            let ancestorHidden = false;
+            let pUp = el.parentElement;
+            while (pUp && pUp !== document.documentElement) {
+              const pcs = window.getComputedStyle(pUp);
+              if (pcs.display === 'none' || pcs.visibility === 'hidden' || Number(pcs.opacity) < 0.05) {
+                ancestorHidden = true;
+                break;
+              }
+              pUp = pUp.parentElement;
+            }
+            if (ancestorHidden) controlsFilterStats.hidden++;
+            else controlsFilterStats.zeroSize++;
+          }
+          continue;
+        }
         // Must be at least partially within the current viewport
-        if (r.bottom < 4 || r.top > vh - 4 || r.right < 4 || r.left > vw - 4) continue;
+        if (r.bottom < 4 || r.top > vh - 4 || r.right < 4 || r.left > vw - 4) {
+          let ancestorClipped = false;
+          let pUp = el.parentElement;
+          while (pUp && pUp !== document.body && pUp !== document.documentElement) {
+            const pcs = window.getComputedStyle(pUp);
+            if (
+              pcs.overflow === 'hidden' ||
+              pcs.overflow === 'clip' ||
+              pcs.overflowX === 'hidden' ||
+              pcs.overflowX === 'clip' ||
+              pcs.overflowY === 'hidden' ||
+              pcs.overflowY === 'clip'
+            ) {
+              const pr = pUp.getBoundingClientRect();
+              const ancestorVisibleInViewport =
+                pr.right > 0 && pr.left < vw && pr.bottom > 0 && pr.top < vh;
+              const clippedOutsideAncestor =
+                r.right <= pr.left + 0.5 ||
+                r.left >= pr.right - 0.5 ||
+                r.bottom <= pr.top + 0.5 ||
+                r.top >= pr.bottom - 0.5;
+              if (ancestorVisibleInViewport && clippedOutsideAncestor) {
+                ancestorClipped = true;
+                break;
+              }
+            }
+            pUp = pUp.parentElement;
+          }
+          if (ancestorClipped) controlsFilterStats.clipped++;
+          else controlsFilterStats.offscreen++;
+          continue;
+        }
 
         refIdx++;
         const refId = `#${refIdx}`;
@@ -1555,6 +1652,7 @@ export class PageSnapshotSampler {
           detectedTechHints: techHints,
         },
         interactiveElements: nodes,
+        controlsFilterStats,
         cursorState,
         design,
       };
@@ -1586,6 +1684,17 @@ export class PageSnapshotSampler {
     // 2. Capture viewport screenshot with the Virtual Cursor HUD & Custom Trail
     try {
       await this.session.screenshot(screenshotPath);
+      if (extracted.design?.canvasCoversViewport === true && fs.existsSync(screenshotPath)) {
+        try {
+          const pngBuf = fs.readFileSync(screenshotPath);
+          const vp = extractVisualPaletteFromPng(pngBuf, 3);
+          if (vp.length > 0) {
+            extracted.design.visualPalette = vp;
+          }
+        } catch {
+          // non-fatal visualPalette sampling error
+        }
+      }
     } catch (err) {
       if (!isNavigationRaceError(err)) throw err;
       degradedReason = 'sampler degraded: navigation race';
@@ -1605,6 +1714,7 @@ export class PageSnapshotSampler {
       scroll: extracted.scroll,
       domStats: extracted.domStats,
       interactiveElements: extracted.interactiveElements,
+      controlsFilterStats: extracted.controlsFilterStats,
       health: this.session.telemetry.getHealthReport(),
       ...(degradedReason ? { degradedReason } : {}),
       ...(extracted.design ? { design: extracted.design } : {}),
@@ -1617,6 +1727,7 @@ export class PageSnapshotSampler {
       domStats,
       health,
       interactiveElements,
+      controlsFilterStats,
       cursorPosition,
       navigation,
       scrollDiagnostic,
@@ -1651,7 +1762,15 @@ export class PageSnapshotSampler {
         : []),
       ...(motionInspect
         ? [
-            `- **Motion Probe**: target=${motionInspect.target}, changed=[${motionInspect.changed.join(', ')}], animations=${motionInspect.animations}, triggers=[${motionInspect.triggers.join(', ')}]` +
+            `- **Motion Probe**: target=${motionInspect.target}` +
+              (motionInspect.topElement ? `, topElement=${motionInspect.topElement}` : '') +
+              (motionInspect.pixelChanged !== undefined
+                ? `, pixelChanged=${motionInspect.pixelChanged}` +
+                  (motionInspect.pixelDiffMean !== undefined
+                    ? ` (diff=${motionInspect.pixelDiffMean})`
+                    : '')
+                : '') +
+              `, cssChanged=[${(motionInspect.cssChanged ?? motionInspect.changed).join(', ')}], animations=${motionInspect.animations}, triggers=[${motionInspect.triggers.join(', ')}]` +
               (Object.keys(motionInspect.delta).length > 0
                 ? ` | delta=${JSON.stringify(motionInspect.delta).slice(0, 260)}`
                 : ''),
@@ -1672,6 +1791,20 @@ export class PageSnapshotSampler {
       lines.push(
         `- Visible Interactive Controls: 0 个（滚动后站点可能隐藏了固定导航；不代表页面没有控件）`
       );
+    }
+
+    if (controlsFilterStats) {
+      const pageFiltered =
+        controlsFilterStats.hidden +
+        controlsFilterStats.zeroSize +
+        controlsFilterStats.clipped +
+        controlsFilterStats.offscreen;
+      const totalFiltered = pageFiltered + controlsFilterStats.pluginUi;
+      if (pageFiltered > 0 || (interactiveElements.length === 0 && totalFiltered > 0)) {
+        lines.push(
+          `- Controls filtered: hidden=${controlsFilterStats.hidden} · zero-size=${controlsFilterStats.zeroSize} · clipped=${controlsFilterStats.clipped} · offscreen=${controlsFilterStats.offscreen} · plugin-ui=${controlsFilterStats.pluginUi}`
+        );
+      }
     }
 
     for (const el of interactiveElements.slice(0, 20)) {

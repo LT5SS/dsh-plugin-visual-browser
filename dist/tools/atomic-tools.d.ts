@@ -67,8 +67,8 @@ export declare class AtomicBrowserToolset {
     }): Promise<AtomicToolResult>;
     /**
      * Read-only pointer-driven motion probe (`inspect_motion`):
-     * records target computed styles & rect before moving mouse to center, moves without clicking,
-     * waits settleMs (default 120ms), re-reads state, and reports property deltas & active animations.
+     * accepts either a CSS/#ref selector or viewport `{ x, y }` coordinate (including `<canvas>` regions).
+     * Records DOM/computed-style deltas plus a cursor-hidden 32x32 PNG patch diff before & after hovering.
      */
     inspectMotion(target: string | Point2D, settleMs?: number): Promise<AtomicToolResult>;
     /**
