@@ -142,6 +142,8 @@ export interface BrowserSessionOptions {
     cursorStyle?: VirtualCursorStyleConfig;
     /** Enable page beforeunload confirmation guard while tasks are active (default: false) */
     unloadGuard?: boolean;
+    /** Whether an active subagent task is running when the session starts (default: false -> takeover pill starts in 'idle') */
+    activeSession?: boolean;
 }
 export interface Point2D {
     x: number;

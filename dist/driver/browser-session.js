@@ -206,6 +206,7 @@ export class BrowserSession {
             showTakeoverControl: showTakeover,
             takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
             unloadGuard: this.options.unloadGuard,
+            activeSession: Boolean(this.options.activeSession),
         });
         await this.context.addInitScript(initScript);
         if (!this.takeoverBindingInstalled) {
@@ -236,8 +237,12 @@ export class BrowserSession {
             showTakeoverControl: showTakeover,
             takeoverHotkey: this.options.takeoverHotkey ?? 'F8',
             unloadGuard: this.options.unloadGuard,
+            activeSession: Boolean(this.options.activeSession),
             shouldAbort: () => this.humanTakeoverRequested,
         });
+        if (this.isAttachedCDP) {
+            await this.motion.ensureCursorHUD(true).catch(() => { });
+        }
         this.telemetry = new TelemetryCollector(this.page);
         this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
         this.page.on('framenavigated', (frame) => {
@@ -384,6 +389,9 @@ export class BrowserSession {
         this.closingIntentionally = true;
         if (this.isAlive()) {
             await this.motion?.setUnloadGuard(false).catch(() => { });
+            if (this.motion && this.motion.getTakeoverMode() !== 'hidden') {
+                await this.motion.setTakeoverState('idle').catch(() => { });
+            }
         }
         if (this.launchedPid) {
             try {

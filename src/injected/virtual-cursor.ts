@@ -209,6 +209,8 @@ export function buildVirtualCursorInitScript(
     roleLabel?: string;
     takeoverHotkey?: string;
     unloadGuard?: boolean;
+    activeSession?: boolean;
+    takeoverMode?: 'running' | 'paused' | 'idle' | 'hidden';
   } = {}
 ): string {
   const resolved = resolveCursorStyle(initialStyle);
@@ -220,6 +222,8 @@ export function buildVirtualCursorInitScript(
     roleLabel: opts.roleLabel || '',
     takeoverHotkey: typeof opts.takeoverHotkey === 'string' ? opts.takeoverHotkey : 'F8',
     unloadGuard: Boolean(opts.unloadGuard),
+    activeSession: Boolean(opts.activeSession),
+    takeoverMode: opts.takeoverMode ?? '',
   });
 
   return `
@@ -243,8 +247,15 @@ export function buildVirtualCursorInitScript(
     if (window.__dshCursorAPI && window.__dshCursorAPI.setTakeoverHotkey) {
       window.__dshCursorAPI.setTakeoverHotkey(INITIAL_OPTS.takeoverHotkey);
     }
-    if (window.__dshCursorAPI && INITIAL_OPTS.showTakeoverControl && window.__dshCursorAPI.setTakeoverState) {
-      window.__dshCursorAPI.setTakeoverState('running', INITIAL_OPTS.roleLabel);
+    if (window.__dshCursorAPI && window.__dshCursorAPI.setTakeoverState) {
+      if (INITIAL_OPTS.takeoverMode) {
+        window.__dshCursorAPI.setTakeoverState(INITIAL_OPTS.takeoverMode, INITIAL_OPTS.roleLabel);
+      } else if (INITIAL_OPTS.showTakeoverControl) {
+        window.__dshCursorAPI.setTakeoverState(
+          INITIAL_OPTS.activeSession ? 'running' : 'idle',
+          INITIAL_OPTS.roleLabel
+        );
+      }
     }
     if (window.__dshCursorAPI && window.__dshCursorAPI.setUnloadGuard) {
       window.__dshCursorAPI.setUnloadGuard(Boolean(INITIAL_OPTS.unloadGuard));
@@ -270,13 +281,18 @@ export function buildVirtualCursorInitScript(
     return unloadGuardOn;
   }
 
+  const initialTakeoverMode = INITIAL_OPTS.takeoverMode
+    || (INITIAL_OPTS.showTakeoverControl
+      ? (INITIAL_OPTS.activeSession ? 'running' : 'idle')
+      : 'hidden');
+
   const state = {
     x: 120,
     y: 120,
     action: 'READY',
     trail: [{ x: 120, y: 120 }],
     style: { ...INITIAL_STYLE },
-    takeoverMode: INITIAL_OPTS.showTakeoverControl ? 'running' : 'hidden',
+    takeoverMode: initialTakeoverMode,
     takeoverLabel: INITIAL_OPTS.roleLabel || '',
     takeoverHotkey: INITIAL_OPTS.takeoverHotkey || 'F8',
     takeoverPending: Boolean(window.__dshTakeoverRequested),
@@ -359,7 +375,7 @@ export function buildVirtualCursorInitScript(
       'keydown',
       (e) => {
         const targetHotkey = (state.takeoverHotkey || '').trim();
-        if (!targetHotkey || state.takeoverMode === 'paused') return;
+        if (!targetHotkey || state.takeoverMode !== 'running') return;
         if (typeof e.key === 'string' && e.key.toLowerCase() === targetHotkey.toLowerCase()) {
           e.preventDefault();
           e.stopPropagation();
@@ -459,10 +475,10 @@ export function buildVirtualCursorInitScript(
         <g id="__dsh_vc_scroll_pulse__" style="pointer-events:none"></g>
         <g id="__dsh_vc_ripples__" style="pointer-events:none"></g>
       </svg>
-      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;width:auto;height:auto;max-width:calc(100vw - 16px);margin:0;box-sizing:border-box;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #00f0ff;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);opacity:1;pointer-events:none;backdrop-filter:blur(8px);user-select:none">
-        <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;margin:0;padding:0;border:0;border-radius:50%;background:#00f0ff;box-shadow:0 0 8px #00f0ff;flex-shrink:0;opacity:1;pointer-events:none"></span>
-        <span id="__dsh_vc_status_text__" style="min-width:0;width:auto;height:auto;margin:0;padding:0;border:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:1;pointer-events:none">DSH Agent 运行中</span>
-        <button id="__dsh_vc_takeover_btn__" type="button" style="width:auto;height:auto;margin:0;border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;opacity:1;pointer-events:none;white-space:nowrap;flex-shrink:0">按 F8 接管</button>
+      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;width:auto;height:auto;max-width:calc(100vw - 16px);margin:0;box-sizing:border-box;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #10b981;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);opacity:1;pointer-events:none;backdrop-filter:blur(8px);user-select:none">
+        <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;margin:0;padding:0;border:0;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;flex-shrink:0;opacity:1;pointer-events:none"></span>
+        <span id="__dsh_vc_status_text__" style="min-width:0;width:auto;height:auto;margin:0;padding:0;border:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:1;pointer-events:none">DSH 待命 · 窗口保持打开（无任务）</span>
+        <button id="__dsh_vc_takeover_btn__" type="button" style="display:none;width:auto;height:auto;margin:0;border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;opacity:1;pointer-events:none;white-space:nowrap;flex-shrink:0"></button>
       </div>
       <div id="__dsh_vc_pointer__" style="position:absolute;left:0;top:0;width:0;height:0;margin:0;padding:0;border:0;background:transparent;opacity:1;overflow:visible;box-sizing:border-box;transform:translate3d(120px,120px,0);transform-origin:0 0;will-change:transform;pointer-events:none">
         <div id="__dsh_vc_ring__" style="position:absolute;left:-9px;top:-9px;width:18px;height:18px;margin:0;padding:0;box-sizing:border-box;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8);opacity:1;pointer-events:none"></div>
@@ -483,7 +499,9 @@ export function buildVirtualCursorInitScript(
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         e.preventDefault();
-        triggerHumanTakeover();
+        if (state.takeoverMode === 'running') {
+          triggerHumanTakeover();
+        }
       });
     }
     try { if (root.showPopover) root.showPopover(); } catch {}
@@ -589,10 +607,10 @@ export function buildVirtualCursorInitScript(
       panel.style.borderColor = '#f59e0b';
       dot.style.background = '#f59e0b';
       dot.style.boxShadow = '0 0 8px #f59e0b';
-      txt.textContent = '已暂停 · 人工接管中（可在 DSH 中恢复）';
+      txt.textContent = '已暂停 · 等待人工接管';
       btn.style.display = 'inline-block';
       btn.disabled = false;
-      btn.textContent = '人工接管中';
+      btn.textContent = '继续执行';
       btn.style.background = '#d97706';
       btn.style.cursor = 'pointer';
       btn.style.pointerEvents = 'auto';
@@ -603,13 +621,12 @@ export function buildVirtualCursorInitScript(
       panel.style.borderColor = '#10b981';
       dot.style.background = '#10b981';
       dot.style.boxShadow = '0 0 8px #10b981';
-      txt.textContent = '已完成 · 窗口保持打开待命' + roleSuffix;
-      btn.style.display = 'inline-block';
-      btn.disabled = false;
-      btn.textContent = '待命中';
-      btn.style.background = '#059669';
-      btn.style.cursor = 'pointer';
-      btn.style.pointerEvents = 'auto';
+      txt.textContent = 'DSH 待命 · 窗口保持打开（无任务）';
+      btn.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = '';
+      btn.style.cursor = 'default';
+      btn.style.pointerEvents = 'none';
       return;
     }
 
@@ -1042,9 +1059,13 @@ export function buildVirtualCursorInitScript(
       state.trail = [{ x: state.x, y: state.y }];
       render();
     },
-    setTakeoverState(mode = 'running', label = '') {
+    setTakeoverState(mode = 'idle', label = '') {
       state.takeoverMode = mode;
-      if (typeof label === 'string') state.takeoverLabel = label;
+      if (mode === 'idle' || mode === 'hidden') {
+        state.takeoverLabel = '';
+      } else if (typeof label === 'string') {
+        state.takeoverLabel = label;
+      }
       if (mode !== 'running') state.takeoverPending = false;
       render();
     },

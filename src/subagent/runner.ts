@@ -1182,6 +1182,7 @@ export class BrowserSubagentRunner {
   private pausedSessions = new Map<string, PausedSubagentState>();
   private lostSessions = new Map<string, LostSubagentRecord>();
   private watchedSessions = new WeakSet<BrowserSession>();
+  private activeSessions = new Set<BrowserSession>();
   private sharedSession: BrowserSession | null = null;
   private sharedSessionBusy = false;
 
@@ -1301,6 +1302,7 @@ export class BrowserSubagentRunner {
   public handleSessionDisconnected(session: BrowserSession): void {
     const at = new Date().toISOString();
     const reason = 'user_closed_window';
+    this.activeSessions.delete(session);
     if (this.sharedSession === session) {
       this.sharedSession = null;
       this.sharedSessionBusy = false;
@@ -1405,6 +1407,16 @@ export class BrowserSubagentRunner {
         out.push(paused.session);
       }
     }
+    for (const active of [...this.activeSessions]) {
+      if (!active.isAlive()) {
+        this.activeSessions.delete(active);
+        continue;
+      }
+      if (!seen.has(active)) {
+        seen.add(active);
+        out.push(active);
+      }
+    }
     return out;
   }
 
@@ -1419,6 +1431,7 @@ export class BrowserSubagentRunner {
     const existing = allowReuse ? this.getSharedSession() : null;
     if (allowReuse && existing && !this.sharedSessionBusy) {
       this.sharedSessionBusy = true;
+      this.activeSessions.add(existing);
       this.watchSessionDisconnect(existing);
       if (opts.cursorStyle) {
         await existing.motion.setCursorStyle(opts.cursorStyle).catch(() => {});
@@ -1427,6 +1440,7 @@ export class BrowserSubagentRunner {
     }
 
     const session = await new BrowserSession(opts).start();
+    this.activeSessions.add(session);
     this.watchSessionDisconnect(session);
     if (allowReuse && !this.getSharedSession()) {
       this.sharedSession = session;
@@ -1443,16 +1457,20 @@ export class BrowserSubagentRunner {
     if (session === this.sharedSession) {
       if (keepAlive && session.isAlive()) {
         this.sharedSessionBusy = false;
-        await session.motion.setTakeoverState('idle').catch(() => {});
+        if (session.motion && session.motion.getTakeoverMode() !== 'hidden') {
+          await session.motion.setTakeoverState('idle').catch(() => {});
+        }
         return;
       }
       this.sharedSession = null;
       this.sharedSessionBusy = false;
+      this.activeSessions.delete(session);
       await session.close().catch(() => {});
       return;
     }
 
     if (!keepAlive) {
+      this.activeSessions.delete(session);
       await session.close().catch(() => {});
     }
   }
@@ -1465,23 +1483,32 @@ export class BrowserSubagentRunner {
   }
 
   public async closeAllSessions(): Promise<void> {
-    const sessions = [...this.pausedSessions.values()];
-    this.pausedSessions.clear();
-    for (const state of sessions) {
-      try {
-        await state.session.close();
-      } catch {
-        // ignore cleanup error on already-closed browser
-      }
+    const sessionsToClose = new Set<BrowserSession>();
+    for (const state of this.pausedSessions.values()) {
+      if (state.session) sessionsToClose.add(state.session);
     }
+    this.pausedSessions.clear();
     if (this.sharedSession) {
-      const shared = this.sharedSession;
+      sessionsToClose.add(this.sharedSession);
       this.sharedSession = null;
       this.sharedSessionBusy = false;
+    }
+    for (const active of this.activeSessions) {
+      sessionsToClose.add(active);
+    }
+    this.activeSessions.clear();
+
+    for (const sess of sessionsToClose) {
       try {
-        await shared.close();
+        if (sess.isAlive()) {
+          await sess.motion?.setUnloadGuard?.(false).catch(() => {});
+          if (sess.motion && sess.motion.getTakeoverMode() !== 'hidden') {
+            await sess.motion.setTakeoverState('idle').catch(() => {});
+          }
+        }
+        await sess.close();
       } catch {
-        // ignore cleanup error on already-closed shared browser
+        // ignore cleanup error on already-closed browser
       }
     }
   }

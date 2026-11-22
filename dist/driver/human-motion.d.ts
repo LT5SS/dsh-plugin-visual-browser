@@ -15,8 +15,10 @@ export declare class HumanMotionController {
         showTakeoverControl?: boolean;
         takeoverHotkey?: string;
         unloadGuard?: boolean;
+        activeSession?: boolean;
         shouldAbort?: () => boolean;
     });
+    getTakeoverMode(): TakeoverControlMode;
     getPosition(): Point2D;
     setPosition(x: number, y: number): void;
     resetPosition(x?: number, y?: number): void;

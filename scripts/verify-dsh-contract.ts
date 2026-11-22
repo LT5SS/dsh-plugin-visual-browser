@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
+import { chromium } from 'playwright-core';
 import {
   assertObjectJsonSchema,
   assertSupportedJsonSchema,
@@ -24,6 +28,7 @@ import {
   PageSnapshotSampler,
   SUBAGENT_SYSTEM_PROMPT,
   apply,
+  buildVirtualCursorInitScript,
   classifyJsonDecision,
   computeDefaultBackgroundWindowBounds,
   computePatchMeanPixelDiff,
@@ -31,6 +36,7 @@ import {
   decodePngRgba,
   extractHostStreamChunk,
   extractVisualPaletteFromPng,
+  findLocalBrowserExecutable,
   formatDesignBlock,
   loadPersistedSettings,
   normSplit,
@@ -3447,6 +3453,417 @@ async function main() {
     assert.ok(String(truncPersistVal.subagent_report).includes('本轮有 1 步决策走了 fallback'));
     await truncPersistPlugin.runner.closeAllSessions();
     console.log('[Strict DSH 0.2 Contract] 5t Verified coordinate inspect_motion, Controls filtered, visualPalette & TRUNCATED_JSON diagnostics!');
+
+    // 5u. TASK-v1.4.3: Takeover pill defaults to 'idle' with hidden button, fixed 3-state copy, quick_snapshot/reload stay idle & closeAllSessions() proactive cleanup
+    // 1) Fresh session & re-injection & manual reload without active subagent stay 'idle'
+    const v143IdleSession = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+    }).start();
+    try {
+      await v143IdleSession.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded');
+      const initPill = await safeEvaluate(
+        v143IdleSession.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const panel = document.getElementById('__dsh_vc_panel__');
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            panelDisplay: panel ? getComputedStyle(panel).display : '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        { takeoverMode: '', text: '', panelDisplay: '', btnDisplay: '' },
+        0
+      );
+      assert.equal(initPill.takeoverMode, 'idle');
+      assert.equal(initPill.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(initPill.panelDisplay, 'flex');
+      assert.equal(initPill.btnDisplay, 'none');
+
+      // F8 must not trigger human takeover while idle
+      await v143IdleSession.page.keyboard.press('F8');
+      assert.equal(await v143IdleSession.checkHumanTakeoverRequested(), false);
+
+      // Re-injecting default init script over stale running state resets back to idle + hidden button
+      await safeEvaluate(
+        v143IdleSession.page,
+        (scriptStr: string) => {
+          (window as any).__dshCursorAPI?.setTakeoverState?.('running', 'StaleRole');
+          (0, eval)(scriptStr);
+        },
+        undefined,
+        { arg: buildVirtualCursorInitScript({}, { showTakeoverControl: true }), retries: 0 }
+      );
+      const afterReinject = await safeEvaluate(
+        v143IdleSession.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        { takeoverMode: '', text: '', btnDisplay: '' },
+        0
+      );
+      assert.equal(afterReinject.takeoverMode, 'idle');
+      assert.equal(afterReinject.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(afterReinject.btnDisplay, 'none');
+
+      // Manual reload stays idle
+      await v143IdleSession.page.reload({ waitUntil: 'domcontentloaded' });
+      await v143IdleSession.motion.ensureCursorHUD(true);
+      const afterReload = await safeEvaluate(
+        v143IdleSession.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        { takeoverMode: '', text: '', btnDisplay: '' },
+        0
+      );
+      assert.equal(afterReload.takeoverMode, 'idle');
+      assert.equal(afterReload.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(afterReload.btnDisplay, 'none');
+    } finally {
+      await v143IdleSession.close();
+    }
+
+    // 2) Full DSH tool lifecycle: quick_snapshot + set_cursor_trail stay idle; subagent_run -> running -> idle; F8 -> paused ('继续执行')
+    let v143Step = 0;
+    let duringRunPill: any = null;
+    let capturedV143PauseSession: BrowserSession | null = null;
+    const v143Host = createCordisStrictCtx({ validateSchemas: false });
+    let v143Plugin!: ReturnType<typeof apply>;
+    v143Plugin = apply(v143Host.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+      artifactDir,
+      customPlanner: async () => {
+        v143Step++;
+        const activeSess = v143Plugin.runner.getSharedSession();
+        assert.ok(activeSess, 'Expected shared session during active subagent task');
+        if (v143Step === 1) {
+          duringRunPill = await safeEvaluate(
+            activeSess.page,
+            () => {
+              const st = (window as any).__dshCursorAPI?.getState?.();
+              const txt = document.getElementById('__dsh_vc_status_text__');
+              const btn = document.getElementById('__dsh_vc_takeover_btn__');
+              return {
+                takeoverMode: st?.takeoverMode ?? '',
+                text: txt?.textContent ?? '',
+                btnDisplay: btn ? getComputedStyle(btn).display : '',
+                btnText: btn?.textContent ?? '',
+              };
+            },
+            null as any,
+            0
+          );
+          return { type: 'complete', report: 'V143_RUNNING_TO_IDLE_OK' };
+        }
+        capturedV143PauseSession = activeSess;
+        await activeSess.page.keyboard.press('F8');
+        return { type: 'scroll', deltaY: 120, reason: 'Trigger F8 pause for v1.4.3 pill check' };
+      },
+    });
+    allDisposers.push(...v143Host.effectDisposers);
+    const v143Quick = v143Host.registeredTools.get('browser_quick_snapshot')!;
+    const v143Trail = v143Host.registeredTools.get('browser_set_cursor_trail')!;
+    const v143Run = v143Host.registeredTools.get('browser_subagent_run')!;
+    try {
+      await v143Quick.execute({ url: `${srv.url}__layer-fixture.html` }, fakeExec);
+      const sharedAfterQuick = v143Plugin.runner.getSharedSession();
+      assert.ok(sharedAfterQuick && sharedAfterQuick.isAlive(), 'Expected quick_snapshot to reuse/keep open shared session');
+      const quickPill = await safeEvaluate(
+        sharedAfterQuick.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(quickPill?.takeoverMode, 'idle');
+      assert.equal(quickPill?.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(quickPill?.btnDisplay, 'none');
+
+      await v143Trail.execute({ preset: 'comet-gold' }, fakeExec);
+      await new Promise((r) => setTimeout(r, 100));
+      const trailPill = await safeEvaluate(
+        sharedAfterQuick.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(trailPill?.takeoverMode, 'idle');
+      assert.equal(trailPill?.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(trailPill?.btnDisplay, 'none');
+
+      // Subagent run transitions -> running (red button) -> back to idle (hidden button)
+      const v143RunDone: any = await v143Run.execute(
+        {
+          url: `${srv.url}__layer-fixture.html`,
+          role: 'v1.4.3 Runner',
+          task_prompt: 'Verify running -> idle pill state machine',
+          max_steps: 2,
+        },
+        fakeExec
+      );
+      assert.equal(v143RunDone.status, 'COMPLETED');
+      assert.equal(duringRunPill?.takeoverMode, 'running');
+      assert.ok(String(duringRunPill?.text ?? '').includes('DSH Agent 运行中'));
+      assert.ok(String(duringRunPill?.text ?? '').includes('按 F8 接管'));
+      assert.notEqual(duringRunPill?.btnDisplay, 'none');
+      assert.equal(duringRunPill?.btnText, '按 F8 接管');
+
+      const sharedAfterRun = v143Plugin.runner.getSharedSession();
+      assert.ok(sharedAfterRun);
+      const afterRunPill = await safeEvaluate(
+        sharedAfterRun.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(afterRunPill?.takeoverMode, 'idle');
+      assert.equal(afterRunPill?.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(afterRunPill?.btnDisplay, 'none');
+
+      // Reload after completion stays idle
+      await sharedAfterRun.page.reload({ waitUntil: 'domcontentloaded' });
+      await sharedAfterRun.motion.ensureCursorHUD(true);
+      const reloadAfterRun = await safeEvaluate(
+        sharedAfterRun.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(reloadAfterRun?.takeoverMode, 'idle');
+      assert.equal(reloadAfterRun?.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(reloadAfterRun?.btnDisplay, 'none');
+
+      // Subagent F8 pause -> paused copy '已暂停 · 等待人工接管' + button '继续执行'
+      const v143PausedVal: any = await v143Run.execute(
+        {
+          url: `${srv.url}__layer-fixture.html`,
+          role: 'v1.4.3 Pause Check',
+          task_prompt: 'Verify paused pill text and resume button',
+          max_steps: 3,
+        },
+        fakeExec
+      );
+      assert.equal(v143PausedVal.status, 'PAUSED_FOR_TAKEOVER');
+      assert.ok(capturedV143PauseSession);
+      const pausedPill = await safeEvaluate(
+        capturedV143PauseSession!.page,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+            btnText: btn?.textContent ?? '',
+            btnPointerEvents: btn ? getComputedStyle(btn).pointerEvents : '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(pausedPill?.takeoverMode, 'paused');
+      assert.equal(pausedPill?.text, '已暂停 · 等待人工接管');
+      assert.notEqual(pausedPill?.btnDisplay, 'none');
+      assert.equal(pausedPill?.btnText, '继续执行');
+      assert.equal(pausedPill?.btnPointerEvents, 'auto');
+    } finally {
+      await v143Plugin.runner.closeAllSessions();
+    }
+
+    // 3) Real CDP-attach test: DSH restart clears leftover 'running' & closeAllSessions() proactively sets 'idle'
+    const cdpPort = await new Promise<number>((resolve, reject) => {
+      const freeSrv = net.createServer();
+      freeSrv.unref();
+      freeSrv.on('error', reject);
+      freeSrv.listen(0, '127.0.0.1', () => {
+        const addr = freeSrv.address();
+        const port = typeof addr === 'object' && addr ? addr.port : 0;
+        freeSrv.close((err) => (err ? reject(err) : resolve(port)));
+      });
+    });
+    const cdpProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-contract-cdp-'));
+    const cdpChild = spawn(
+      findLocalBrowserExecutable(),
+      [
+        '--headless=new',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--mute-audio',
+        `--remote-debugging-port=${cdpPort}`,
+        `--user-data-dir=${cdpProfile}`,
+        `${srv.url}__layer-fixture.html`,
+      ],
+      { stdio: 'ignore', windowsHide: true }
+    );
+    let extCdpBrowser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | null = null;
+    try {
+      const cdpDeadline = Date.now() + 10000;
+      let cdpReady = false;
+      while (Date.now() < cdpDeadline) {
+        try {
+          const resp = await fetch(`http://127.0.0.1:${cdpPort}/json/version`);
+          if (resp.ok) {
+            cdpReady = true;
+            break;
+          }
+        } catch {
+          // retry
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(cdpReady, `Timed out waiting for CDP endpoint on port ${cdpPort}`);
+
+      extCdpBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
+      const extPage = extCdpBrowser.contexts()[0].pages()[0];
+      await extPage.waitForLoadState('domcontentloaded');
+
+      // Inject stale running pill as left behind by previous session before restart
+      await safeEvaluate(
+        extPage,
+        (scriptStr: string) => {
+          (0, eval)(scriptStr);
+        },
+        undefined,
+        {
+          arg: buildVirtualCursorInitScript({}, { showTakeoverControl: true, activeSession: true, takeoverHotkey: 'F8' }),
+          retries: 0,
+        }
+      );
+
+      // Fresh idle CDP-attach BrowserSession clears leftover running -> idle immediately
+      const restartAttach = await new BrowserSession({
+        mode: 'cdp-attach',
+        cdpEndpoint: `http://127.0.0.1:${cdpPort}`,
+        showTakeoverControl: true,
+        takeoverHotkey: 'F8',
+      }).start();
+      await restartAttach.close();
+
+      const afterAttachPill = await safeEvaluate(
+        extPage,
+        () => {
+          const st = (window as any).__dshCursorAPI?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(afterAttachPill?.takeoverMode, 'idle');
+      assert.equal(afterAttachPill?.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(afterAttachPill?.btnDisplay, 'none');
+
+      // runner.closeAllSessions() resets active running pill + unloadGuard back to idle on unload/exit
+      const p1CdpRunner = new BrowserSubagentRunner();
+      const acqCdp = await p1CdpRunner.acquireReusableSession(
+        {
+          mode: 'cdp-attach',
+          cdpEndpoint: `http://127.0.0.1:${cdpPort}`,
+          showTakeoverControl: true,
+          takeoverHotkey: 'F8',
+        },
+        true
+      );
+      await acqCdp.session.motion.setUnloadGuard(true);
+      await acqCdp.session.motion.setTakeoverState('running', 'ExitingAgent');
+      await p1CdpRunner.closeAllSessions();
+
+      const afterCloseAllPill = await safeEvaluate(
+        extPage,
+        () => {
+          const api = (window as any).__dshCursorAPI;
+          const st = api?.getState?.();
+          const txt = document.getElementById('__dsh_vc_status_text__');
+          const btn = document.getElementById('__dsh_vc_takeover_btn__');
+          return {
+            takeoverMode: st?.takeoverMode ?? '',
+            text: txt?.textContent ?? '',
+            btnDisplay: btn ? getComputedStyle(btn).display : '',
+            unloadGuard: api?.isUnloadGuardActive?.() ?? false,
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(afterCloseAllPill?.takeoverMode, 'idle');
+      assert.equal(afterCloseAllPill?.text, 'DSH 待命 · 窗口保持打开（无任务）');
+      assert.equal(afterCloseAllPill?.btnDisplay, 'none');
+      assert.equal(afterCloseAllPill?.unloadGuard, false);
+    } finally {
+      await extCdpBrowser?.close().catch(() => {});
+      try {
+        cdpChild.kill();
+      } catch {}
+      await new Promise((r) => setTimeout(r, 300));
+      fs.rmSync(cdpProfile, { recursive: true, force: true });
+    }
+    console.log('[Strict DSH 0.2 Contract] 5u Verified idle-by-default takeover pill, 3-state copy & closeAllSessions() cleanup!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

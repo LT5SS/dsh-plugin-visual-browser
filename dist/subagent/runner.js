@@ -872,6 +872,7 @@ export class BrowserSubagentRunner {
     pausedSessions = new Map();
     lostSessions = new Map();
     watchedSessions = new WeakSet();
+    activeSessions = new Set();
     sharedSession = null;
     sharedSessionBusy = false;
     buildFallbackHostFacts(subagentId, role, latestScreenshot = null) {
@@ -980,6 +981,7 @@ export class BrowserSubagentRunner {
     handleSessionDisconnected(session) {
         const at = new Date().toISOString();
         const reason = 'user_closed_window';
+        this.activeSessions.delete(session);
         if (this.sharedSession === session) {
             this.sharedSession = null;
             this.sharedSessionBusy = false;
@@ -1068,6 +1070,16 @@ export class BrowserSubagentRunner {
                 out.push(paused.session);
             }
         }
+        for (const active of [...this.activeSessions]) {
+            if (!active.isAlive()) {
+                this.activeSessions.delete(active);
+                continue;
+            }
+            if (!seen.has(active)) {
+                seen.add(active);
+                out.push(active);
+            }
+        }
         return out;
     }
     isSharedSessionBusy() {
@@ -1077,6 +1089,7 @@ export class BrowserSubagentRunner {
         const existing = allowReuse ? this.getSharedSession() : null;
         if (allowReuse && existing && !this.sharedSessionBusy) {
             this.sharedSessionBusy = true;
+            this.activeSessions.add(existing);
             this.watchSessionDisconnect(existing);
             if (opts.cursorStyle) {
                 await existing.motion.setCursorStyle(opts.cursorStyle).catch(() => { });
@@ -1084,6 +1097,7 @@ export class BrowserSubagentRunner {
             return { session: existing, isShared: true, reused: true };
         }
         const session = await new BrowserSession(opts).start();
+        this.activeSessions.add(session);
         this.watchSessionDisconnect(session);
         if (allowReuse && !this.getSharedSession()) {
             this.sharedSession = session;
@@ -1099,15 +1113,19 @@ export class BrowserSubagentRunner {
         if (session === this.sharedSession) {
             if (keepAlive && session.isAlive()) {
                 this.sharedSessionBusy = false;
-                await session.motion.setTakeoverState('idle').catch(() => { });
+                if (session.motion && session.motion.getTakeoverMode() !== 'hidden') {
+                    await session.motion.setTakeoverState('idle').catch(() => { });
+                }
                 return;
             }
             this.sharedSession = null;
             this.sharedSessionBusy = false;
+            this.activeSessions.delete(session);
             await session.close().catch(() => { });
             return;
         }
         if (!keepAlive) {
+            this.activeSessions.delete(session);
             await session.close().catch(() => { });
         }
     }
@@ -1118,25 +1136,33 @@ export class BrowserSubagentRunner {
         }
     }
     async closeAllSessions() {
-        const sessions = [...this.pausedSessions.values()];
+        const sessionsToClose = new Set();
+        for (const state of this.pausedSessions.values()) {
+            if (state.session)
+                sessionsToClose.add(state.session);
+        }
         this.pausedSessions.clear();
-        for (const state of sessions) {
+        if (this.sharedSession) {
+            sessionsToClose.add(this.sharedSession);
+            this.sharedSession = null;
+            this.sharedSessionBusy = false;
+        }
+        for (const active of this.activeSessions) {
+            sessionsToClose.add(active);
+        }
+        this.activeSessions.clear();
+        for (const sess of sessionsToClose) {
             try {
-                await state.session.close();
+                if (sess.isAlive()) {
+                    await sess.motion?.setUnloadGuard?.(false).catch(() => { });
+                    if (sess.motion && sess.motion.getTakeoverMode() !== 'hidden') {
+                        await sess.motion.setTakeoverState('idle').catch(() => { });
+                    }
+                }
+                await sess.close();
             }
             catch {
                 // ignore cleanup error on already-closed browser
-            }
-        }
-        if (this.sharedSession) {
-            const shared = this.sharedSession;
-            this.sharedSession = null;
-            this.sharedSessionBusy = false;
-            try {
-                await shared.close();
-            }
-            catch {
-                // ignore cleanup error on already-closed shared browser
             }
         }
     }

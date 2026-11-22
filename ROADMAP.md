@@ -94,6 +94,14 @@
 
 ---
 
+## v1.4.3 已交付（状态条默认 `idle` + 固定三态文案与按钮可见性 + 退出主动复位）
+
+- **注入与重注入默认 `idle`**：`buildVirtualCursorInitScript` 与 `HumanMotionController` 新增 `activeSession`（默认 `false`）与 `takeoverMode` 状态同步，彻底消除 DSH 重启、`browser_quick_snapshot`、`browser_set_cursor_trail` 或页面手动刷新重注入时无任务却误显示「DSH Agent 运行中」的问题；`F8` 热键与按钮点击仅在 `running` 态生效；附着外部 CDP 页面时在 `start()` 立即同步状态覆盖残留 `running`。
+- **固定三态文案与按钮可见性**：`running` 显示 `DSH Agent 运行中 · 按 F8 接管` + 红色「按 F8 接管」按钮；`paused` 显示 `已暂停 · 等待人工接管` + 「继续执行」按钮；`idle` 显示 `DSH 待命 · 窗口保持打开（无任务）` 并**隐藏接管按钮**只留状态圆点。
+- **卸载与关闭前主动收尾**：`BrowserSubagentRunner` 跟踪全部活跃会话并在 `closeAllSessions()` 与 `BrowserSession.close()` 中先解除 `beforeunload` 守卫、将非隐藏窗体置回 `idle`，避免残留 `running` 状态跨进程继承。
+
+---
+
 ## v2.0.0 规划（TODO）
 
 - **其余 4 + 1 固定只读探针与架构升级**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_region(x, y, radius, zoom)` 局部 2× 放大能力，并辅以相邻帧区域差异文本补偿。

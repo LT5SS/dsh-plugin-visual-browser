@@ -247,6 +247,7 @@ export declare class BrowserSubagentRunner {
     private pausedSessions;
     private lostSessions;
     private watchedSessions;
+    private activeSessions;
     private sharedSession;
     private sharedSessionBusy;
     private buildFallbackHostFacts;

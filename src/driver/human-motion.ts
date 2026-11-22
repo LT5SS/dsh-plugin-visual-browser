@@ -49,16 +49,25 @@ export class HumanMotionController {
       showTakeoverControl?: boolean;
       takeoverHotkey?: string;
       unloadGuard?: boolean;
+      activeSession?: boolean;
       shouldAbort?: () => boolean;
     } = {}
   ) {
     this.page = page;
     this.cursorStyle = resolveCursorStyle(initialStyle);
     this.showTakeoverControl = Boolean(opts.showTakeoverControl);
-    this.takeoverMode = this.showTakeoverControl ? 'running' : 'hidden';
+    this.takeoverMode = this.showTakeoverControl
+      ? opts.activeSession
+        ? 'running'
+        : 'idle'
+      : 'hidden';
     this.takeoverHotkey = typeof opts.takeoverHotkey === 'string' ? opts.takeoverHotkey : 'F8';
     this.unloadGuardEnabled = Boolean(opts.unloadGuard);
     this.shouldAbort = opts.shouldAbort;
+  }
+
+  public getTakeoverMode(): TakeoverControlMode {
+    return this.takeoverMode;
   }
 
   public getPosition(): Point2D {
@@ -130,6 +139,8 @@ export class HumanMotionController {
       roleLabel: this.takeoverRole,
       takeoverHotkey: this.takeoverHotkey,
       unloadGuard: this.unloadGuardEnabled,
+      activeSession: this.takeoverMode === 'running',
+      takeoverMode: this.takeoverMode,
     });
     await safeEvaluate(
       this.page,
@@ -139,6 +150,8 @@ export class HumanMotionController {
         style: VirtualCursorStyleConfig;
         hotkey: string;
         unloadGuard: boolean;
+        takeoverMode: TakeoverControlMode;
+        roleLabel: string;
       }) => {
         if (!(window as any).__dshVirtualCursorInstalled) {
           (0, eval)(arg.script);
@@ -148,6 +161,7 @@ export class HumanMotionController {
           (window as any).__dshCursorAPI.setStyle?.(arg.style, { fromHost: true });
           (window as any).__dshCursorAPI.setTakeoverHotkey?.(arg.hotkey);
           (window as any).__dshCursorAPI.setUnloadGuard?.(arg.unloadGuard);
+          (window as any).__dshCursorAPI.setTakeoverState?.(arg.takeoverMode, arg.roleLabel);
         }
       },
       undefined,
@@ -158,6 +172,8 @@ export class HumanMotionController {
           style: resolvedStyle,
           hotkey: this.takeoverHotkey,
           unloadGuard: this.unloadGuardEnabled,
+          takeoverMode: this.takeoverMode,
+          roleLabel: this.takeoverRole,
         },
         retries: 1,
       }
@@ -180,6 +196,8 @@ export class HumanMotionController {
   public async setTakeoverState(mode: TakeoverControlMode, roleLabel?: string): Promise<void> {
     if (typeof roleLabel === 'string') {
       this.takeoverRole = roleLabel;
+    } else if (mode === 'idle' || mode === 'hidden') {
+      this.takeoverRole = '';
     }
     this.takeoverMode = mode;
     this.showTakeoverControl = mode !== 'hidden';
