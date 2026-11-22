@@ -501,6 +501,7 @@ interface PlannerExecutionTracker {
   model?: string;
   fallbackCount: number;
   lastFallbackReason?: string;
+  lastFallbackPreview?: string;
   steps: PlannerStepDiagnostic[];
 }
 
@@ -527,6 +528,7 @@ function resolveSubagentPlanner(
     if (diag.fallback_reason) {
       tracker.fallbackCount++;
       tracker.lastFallbackReason = diag.fallback_reason;
+      tracker.lastFallbackPreview = diag.text_preview;
       tracker.effectiveMode =
         initialMode === 'host-ctx-llm' ? 'host-ctx-llm-fallback' : 'external-vision-api-fallback';
     }
@@ -920,6 +922,13 @@ export function createVisualBrowserTools(
         ...(tracker.model ? { model: tracker.model } : {}),
         fallback_count: tracker.fallbackCount,
         ...(tracker.lastFallbackReason ? { last_fallback_reason: tracker.lastFallbackReason } : {}),
+        ...(tracker.lastFallbackReason
+          ? {
+              fallback_reason: tracker.lastFallbackPreview
+                ? `${tracker.lastFallbackReason}: ${tracker.lastFallbackPreview}`
+                : tracker.lastFallbackReason,
+            }
+          : {}),
         ...(tracker.steps.length > 0 ? { llm_steps: tracker.steps } : {}),
       });
 
@@ -999,11 +1008,19 @@ export function createVisualBrowserTools(
               ...(info.at ? { at: info.at } : {}),
               ...(info.midFrame ? { mid_frame: info.midFrame } : {}),
               ...(info.scroll ? { scroll: info.scroll } : {}),
+              ...(info.motion ? { motion: info.motion } : {}),
             };
             const existing = tracker.steps.find((s) => s.step === info.stepIndex);
             if (existing) {
               existing.action = actionSummary;
-            } else if (info.blocked || info.midFrame || info.scroll || !info.ok || info.skipped) {
+            } else if (
+              info.blocked ||
+              info.midFrame ||
+              info.scroll ||
+              info.motion ||
+              !info.ok ||
+              info.skipped
+            ) {
               tracker.steps.push({
                 step: info.stepIndex,
                 backend:

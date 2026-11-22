@@ -1,5 +1,5 @@
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { ActionBlockedReason, NavigateWaitUntil, NavigationDiagnostic, Point2D, ScrollDiagnostic, VirtualCursorStyleConfig } from '../driver/types.js';
+import type { ActionBlockedReason, MotionInspectResult, NavigateWaitUntil, NavigationDiagnostic, Point2D, ScrollDiagnostic, VirtualCursorStyleConfig } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
 export interface DomInspectSample {
     tag: string;
@@ -32,6 +32,7 @@ export interface AtomicToolResult {
     midFramePath?: string;
     navigation?: NavigationDiagnostic;
     scroll?: ScrollDiagnostic;
+    motion?: MotionInspectResult;
     extraData?: unknown;
 }
 /**
@@ -61,7 +62,15 @@ export declare class AtomicBrowserToolset {
         signal?: AbortSignal;
         onPhase?: (phase: 'down' | 'dragging' | 'up') => Promise<void> | void;
     }): Promise<AtomicToolResult>;
-    scroll(directionOrDelta?: 'down' | 'up' | number, waitMs?: number): Promise<AtomicToolResult>;
+    scroll(directionOrDelta?: 'down' | 'up' | number, waitMs?: number, opts?: {
+        driver?: 'wheel' | 'programmatic';
+    }): Promise<AtomicToolResult>;
+    /**
+     * Read-only pointer-driven motion probe (`inspect_motion`):
+     * records target computed styles & rect before moving mouse to center, moves without clicking,
+     * waits settleMs (default 120ms), re-reads state, and reports property deltas & active animations.
+     */
+    inspectMotion(target: string | Point2D, settleMs?: number): Promise<AtomicToolResult>;
     /**
      * Read-only DOM & computed style inspection query for the agent.
      * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.

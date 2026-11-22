@@ -24,14 +24,19 @@ Respond ONLY with a single valid JSON object matching one of these actions (any 
 - {"type":"drag","from":"#2","to":{"x":640,"y":380},"steps":12,"reason":"..."}
 - {"type":"type_text","target":"#5","text":"hello","pressEnter":true,"reason":"..."}
 - {"type":"scroll","deltaY":800,"reason":"..."}
+- {"type":"inspect_motion","target":"#3","reason":"..."} (read-only pointer-driven hover/transform/animation probe without clicking)
 - {"type":"navigate","url":"https://...","reason":"..."}
 - {"type":"pause_for_takeover","blockReason":"LOGIN_REQUIRED","message":"..."}
 - {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}
+
+JSON 输出格式红线（反例警示）：
+- 严禁包裹 \`\`\`json ... \`\`\` 代码块，严禁在 JSON 前后写任何解释、思考或寒暄（例如反例：\`好的，接下来点击 #2：{"type":"click",...}\` 为非法输出）；每次回复有且仅有一个裸 JSON 对象本身。
 
 事实纪律（违反即为报告失败）：
 1. 只能报告 HUD / 工具返回值里**实际出现**的字段。HUD 没有暴露的字段（例如未暴露 href 或 value），必须明确写「HUD 未暴露该字段」，禁止用你对站点的先验知识或训练记忆补全，也禁止写"依据标准结构推断"。
 2. 报告里每个关键事实后面必须标注来源，例如 \`href=... (来源: #1 HUD)\` 或 \`标题=... (来源: page title)\`。
 3. 不确定就明说不确定，绝不为了完成报告而编造或猜测未观测到的内容。
+4. 调研/复刻网站动效时，综合 \`## Design\`、\`DOM & Tech\`、\`Scroll Result\` 与 \`inspect_motion\`，按「滚动驱动 / 指针驱动 / 时间驱动」三类给出并附具体测量值（如 \`effective_dom_delta\`、\`transform\` 变化或 \`transition\` 数量）。
 
 动作效率与步数预算规则：
 1. \`move_mouse\` 的装饰性轨迹动作（如 jiggle、slow approach、probe）**仅在用户明确要求演示鼠标轨迹时使用**；否则直接使用 \`hover\` / \`click\` / \`scroll\` / \`type_text\` / \`navigate\` 等语义动作，或直接汇总结果。
@@ -93,6 +98,15 @@ export function summarizeDecisionAction(decision) {
             };
         case 'scroll':
             return { type: 'scroll', deltaY: decision.deltaY, ...noteExtra };
+        case 'inspect_motion':
+            return {
+                type: 'inspect_motion',
+                target: decision.target,
+                ...(typeof decision.target === 'string' && decision.target.startsWith('#')
+                    ? { ref: decision.target }
+                    : {}),
+                ...noteExtra,
+            };
         case 'set_cursor_style':
             return {
                 type: 'set_cursor_style',
@@ -128,6 +142,9 @@ function formatShortActionForFinding(decision, blocked) {
             break;
         case 'scroll':
             base = `scroll ${decision.deltaY >= 0 ? '+' : ''}${Math.round(decision.deltaY)}`;
+            break;
+        case 'inspect_motion':
+            base = typeof decision.target === 'string' ? `inspect_motion ${decision.target}` : 'inspect_motion';
             break;
         case 'set_cursor_style':
             base = 'set_cursor_style';
@@ -201,6 +218,10 @@ export function isValidSubagentDecision(value) {
             return typeof d.target === 'string' && d.target.length > 0 && typeof d.text === 'string';
         case 'scroll':
             return typeof d.deltaY === 'number' && Number.isFinite(d.deltaY);
+        case 'inspect_motion':
+            return (d.target !== undefined &&
+                d.target !== null &&
+                (typeof d.target === 'string' ? d.target.length > 0 : isPoint2D(d.target)));
         case 'set_cursor_style':
             return d.style !== null && typeof d.style === 'object' && !Array.isArray(d.style);
         case 'complete':
@@ -357,7 +378,7 @@ export function createDshHostLlmPlanner(opts) {
                 // Fallback to text-only HUD if attachment admission fails
             }
         }
-        const runStreamAttempt = async (blocks) => {
+        const runStreamAttempt = async (blocks, attemptOpts) => {
             let fullText = '';
             let chunkCount = 0;
             const chunkTypes = {};
@@ -369,6 +390,7 @@ export function createDshHostLlmPlanner(opts) {
                     provider: opts.provider,
                     model: opts.model,
                     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+                    ...(attemptOpts?.temperature !== undefined ? { temperature: attemptOpts.temperature } : {}),
                     system: SUBAGENT_SYSTEM_PROMPT,
                     messages: [
                         {
@@ -408,13 +430,43 @@ export function createDshHostLlmPlanner(opts) {
             }
             return { fullText, chunkCount, chunkTypes, sampleUnrecognizedKeys, streamError, threw };
         };
-        let attempt = await runStreamAttempt(imageBlock ? [textBlock, imageBlock] : [textBlock]);
+        const initialBlocks = imageBlock ? [textBlock, imageBlock] : [textBlock];
+        const firstAttempt = await runStreamAttempt(initialBlocks);
+        let attempt = firstAttempt;
         let decision = parseJsonDecision(attempt.fullText);
         let retriedTextOnly = false;
+        let retriedJsonSchema = false;
         const isImageRejection = /image|vision|multimodal|attachment/i.test(attempt.streamError ?? '');
         const isConfigError = !isImageRejection &&
             /NO_ADAPTER|NO_API_KEY|UNAUTHORIZED|MODEL_NOT_FOUND|INVALID_REQUEST|MissingSessionID/i.test(attempt.streamError ?? '');
-        if (!decision && imageBlock && !ctx.signal?.aborted && !isConfigError) {
+        if (!decision &&
+            !attempt.streamError &&
+            !attempt.threw &&
+            attempt.fullText.trim().length > 0 &&
+            !ctx.signal?.aborted) {
+            retriedJsonSchema = true;
+            const correctionBlock = {
+                type: 'text',
+                text: '\n[FORMAT_CORRECTION] Your previous reply was NOT valid JSON for the action schema. ' +
+                    'Output ONLY one raw JSON object (for example {"type":"scroll","deltaY":600,"reason":"..."} or {"type":"complete","report":"..."}). ' +
+                    'Do NOT wrap it in ```json fences and do NOT add any prose before or after.',
+            };
+            const retryBlocks = imageBlock ? [textBlock, correctionBlock, imageBlock] : [textBlock, correctionBlock];
+            const retryAttempt = await runStreamAttempt(retryBlocks, { temperature: 0 });
+            attempt = {
+                ...retryAttempt,
+                chunkTypes: Object.keys(retryAttempt.chunkTypes).length > 0
+                    ? retryAttempt.chunkTypes
+                    : firstAttempt.chunkTypes,
+                sampleUnrecognizedKeys: retryAttempt.sampleUnrecognizedKeys ?? firstAttempt.sampleUnrecognizedKeys,
+                fullText: retryAttempt.fullText.trim().length > 0 ? retryAttempt.fullText : firstAttempt.fullText,
+            };
+            decision = parseJsonDecision(retryAttempt.fullText);
+        }
+        else if (!decision &&
+            imageBlock &&
+            !ctx.signal?.aborted &&
+            !isConfigError) {
             retriedTextOnly = true;
             attempt = await runStreamAttempt([textBlock]);
             decision = parseJsonDecision(attempt.fullText);
@@ -427,6 +479,7 @@ export function createDshHostLlmPlanner(opts) {
             ...(attempt.sampleUnrecognizedKeys ? { sample_unrecognized_keys: attempt.sampleUnrecognizedKeys } : {}),
             text_length: attempt.fullText.length,
             ...(retriedTextOnly ? { retried_text_only: true } : {}),
+            ...(retriedJsonSchema ? { retried_json_schema: true } : {}),
             ...(attempt.streamError ? { stream_error: attempt.streamError } : {}),
         };
         if (decision) {
@@ -1207,6 +1260,9 @@ export class BrowserSubagentRunner {
                     else if (decision.type === 'scroll') {
                         actionResult = await tools.scroll(decision.deltaY, 220);
                     }
+                    else if (decision.type === 'inspect_motion') {
+                        actionResult = await tools.inspectMotion(decision.target);
+                    }
                     else {
                         throw new Error(`Unsupported decision: ${JSON.stringify(decision)}`);
                     }
@@ -1279,6 +1335,7 @@ export class BrowserSubagentRunner {
                     hint: actionResult.hint,
                     ...(actionResult.midFrame ? { midFrame: actionResult.midFrame } : {}),
                     ...(actionResult.scroll ? { scroll: actionResult.scroll } : {}),
+                    ...(actionResult.motion ? { motion: actionResult.motion } : {}),
                 });
                 hostFacts.recordStep(actionResult.observation.screenshotPath);
                 history.pushObservation(`${actionResult.action} — ${decision.reason}`, actionResult.observation, actionResult.llmSummary);

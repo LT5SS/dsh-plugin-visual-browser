@@ -286,7 +286,8 @@ export class AtomicBrowserToolset {
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };
     }
-    async scroll(directionOrDelta = 'down', waitMs = 220) {
+    async scroll(directionOrDelta = 'down', waitMs = 220, opts) {
+        const driver = opts?.driver ?? 'wheel';
         const deltaY = typeof directionOrDelta === 'number'
             ? directionOrDelta
             : directionOrDelta === 'down'
@@ -303,6 +304,10 @@ export class AtomicBrowserToolset {
             const overflowHidden = (csHtml.overflowY === 'hidden' && (!csBody || csBody.overflowY === 'hidden')) ||
                 (csBody?.overflowY === 'hidden' && scrollHeight <= clientHeight + 2) ||
                 (csHtml.overflowY === 'hidden' && scrollHeight <= clientHeight + 2);
+            const hasLenisContainer = Boolean(document.documentElement.classList.contains('lenis') ||
+                document.querySelector('[data-lenis-prevent], .lenis-smooth, .lenis') ||
+                window.lenis ||
+                window.Lenis);
             return {
                 scrollTop: Math.round(se ? se.scrollTop : window.scrollY || 0),
                 scrollHeight,
@@ -310,6 +315,7 @@ export class AtomicBrowserToolset {
                 vw,
                 vh,
                 overflowHidden,
+                hasLenisContainer,
                 url: window.location.href,
                 textLen: (document.body?.innerText || '').trim().length,
             };
@@ -320,6 +326,7 @@ export class AtomicBrowserToolset {
             vw: 1280,
             vh: 720,
             overflowHidden: false,
+            hasLenisContainer: false,
             url: '',
             textLen: 0,
         }, 0);
@@ -339,7 +346,14 @@ export class AtomicBrowserToolset {
                 .screenshot({ clip: probeClip, type: 'jpeg', quality: 65 })
                 .catch(() => null)
             : null;
-        await this.session.motion.smoothScroll(deltaY, 18, 380);
+        if (driver === 'programmatic') {
+            await safeEvaluate(this.session.page, (dy) => {
+                window.scrollBy(0, dy);
+            }, undefined, { arg: deltaY, retries: 0 });
+        }
+        else {
+            await this.session.motion.smoothScroll(deltaY, 18, 380);
+        }
         if (waitMs > 0)
             await this.session.page.waitForTimeout(waitMs);
         const afterState = await safeEvaluate(this.session.page, () => {
@@ -367,6 +381,12 @@ export class AtomicBrowserToolset {
             }
         }
         const locked = effectiveDomDelta === 0 && !visualChanged && (!domScrollable || !atBoundary);
+        const programmaticBlockedHint = driver === 'programmatic' &&
+            effectiveDomDelta === 0 &&
+            beforeState.hasLenisContainer &&
+            !atBoundary
+            ? '⚠️ 该页拦截程序化滚动（Lenis 类），请用 wheel/scroll 动作而非 window.scrollTo'
+            : undefined;
         const scrollDiag = {
             attempted: Math.round(deltaY),
             effective_dom_delta: effectiveDomDelta,
@@ -374,13 +394,223 @@ export class AtomicBrowserToolset {
             visual_changed: visualChanged,
             at_boundary: atBoundary,
             locked,
+            driver,
+            ...(programmaticBlockedHint ? { programmatic_blocked_hint: programmaticBlockedHint } : {}),
         };
         const observation = await this.sampler.captureSnapshot('scroll');
         observation.scrollDiagnostic = scrollDiag;
         return {
             ok: true,
             scroll: scrollDiag,
-            action: `Scrolled by ${deltaY}px`,
+            action: driver === 'programmatic' ? `Scrolled (programmatic) by ${deltaY}px` : `Scrolled by ${deltaY}px`,
+            observation,
+            llmSummary: this.sampler.formatObservationForLLM(observation),
+        };
+    }
+    /**
+     * Read-only pointer-driven motion probe (`inspect_motion`):
+     * records target computed styles & rect before moving mouse to center, moves without clicking,
+     * waits settleMs (default 120ms), re-reads state, and reports property deltas & active animations.
+     */
+    async inspectMotion(target, settleMs = 120) {
+        const targetLabel = typeof target === 'string'
+            ? target.trim()
+            : `(${Math.round(target.x)}, ${Math.round(target.y)})`;
+        let pt;
+        let selector = null;
+        if (typeof target === 'string') {
+            selector = resolveTargetSelector(target);
+            const probe = await this.session.motion.resolveTargetPoint(selector, 1200);
+            if (!probe.ok) {
+                const observation = await this.sampler.captureSnapshot('inspect_motion_refused');
+                const motionFail = {
+                    target: targetLabel,
+                    ok: false,
+                    blocked: probe.blocked,
+                    changed: [],
+                    delta: {},
+                    animations: 0,
+                    triggers: [],
+                    hint: probe.hint,
+                };
+                observation.motionInspect = motionFail;
+                const refusalJson = JSON.stringify({
+                    ok: false,
+                    blocked: probe.blocked,
+                    target: targetLabel,
+                    hint: probe.hint,
+                });
+                return {
+                    ok: false,
+                    blocked: probe.blocked,
+                    ...(/^#\d+$/.test(targetLabel) ? { ref: targetLabel } : {}),
+                    hit: probe.hit,
+                    hint: probe.hint,
+                    motion: motionFail,
+                    action: `Inspect motion skipped on ${targetLabel} (${probe.blocked ?? 'ELEMENT_NOT_FOUND'})`,
+                    observation,
+                    llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+                };
+            }
+            pt = probe.point;
+        }
+        else {
+            pt = { x: Math.round(target.x), y: Math.round(target.y) };
+        }
+        // Ensure baseline is captured outside target hover area if cursor already rests inside it
+        const curPos = this.session.motion.getPosition();
+        const preRect = await safeEvaluate(this.session.page, (arg) => {
+            const el = arg.sel ? document.querySelector(arg.sel) : document.elementFromPoint(arg.x, arg.y);
+            if (!el)
+                return null;
+            const r = el.getBoundingClientRect();
+            return {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+                vw: window.innerWidth || 1280,
+                vh: window.innerHeight || 720,
+            };
+        }, null, { arg: { sel: selector, x: pt.x, y: pt.y }, retries: 0 });
+        if (preRect &&
+            curPos.x >= preRect.left - 2 &&
+            curPos.x <= preRect.right + 2 &&
+            curPos.y >= preRect.top - 2 &&
+            curPos.y <= preRect.bottom + 2) {
+            const outX = preRect.left >= 24 ? Math.max(4, Math.round(preRect.left - 16)) : Math.min(preRect.vw - 4, Math.round(preRect.right + 16));
+            const outY = preRect.top >= 24 ? Math.max(4, Math.round(preRect.top - 16)) : Math.min(preRect.vh - 4, Math.round(preRect.bottom + 16));
+            await this.session.motion.moveTo(outX, outY, { steps: 6, durationMs: 80, label: 'BASELINE' });
+            await this.session.page.waitForTimeout(80);
+        }
+        const sampleProbe = async () => safeEvaluate(this.session.page, (arg) => {
+            const el = arg.sel ? document.querySelector(arg.sel) : document.elementFromPoint(arg.x, arg.y);
+            if (!el)
+                return null;
+            const cs = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            const se = document.scrollingElement || document.documentElement || document.body;
+            let childTransform;
+            const child = el.querySelector('img, video, svg, span, div');
+            if (child) {
+                childTransform = window.getComputedStyle(child).transform || 'none';
+            }
+            const anims = typeof el.getAnimations === 'function' ? el.getAnimations().length : 0;
+            const subAnims = typeof el.getAnimations === 'function'
+                ? el.getAnimations({ subtree: true }).length
+                : 0;
+            return {
+                transform: cs.transform || 'none',
+                opacity: cs.opacity || '1',
+                filter: cs.filter || 'none',
+                color: cs.color || '',
+                backgroundColor: cs.backgroundColor || '',
+                borderColor: cs.borderColor || '',
+                boxShadow: cs.boxShadow || 'none',
+                scrollTop: Math.round(se ? se.scrollTop : window.scrollY || 0),
+                rect: {
+                    x: Math.round(r.x * 10) / 10,
+                    y: Math.round(r.y * 10) / 10,
+                    width: Math.round(r.width * 10) / 10,
+                    height: Math.round(r.height * 10) / 10,
+                },
+                animations: anims,
+                subtreeAnimations: subAnims,
+                transitionDuration: cs.transitionDuration || '0s',
+                animationName: cs.animationName || 'none',
+                ...(childTransform !== undefined ? { childTransform } : {}),
+            };
+        }, null, { arg: { sel: selector, x: pt.x, y: pt.y }, retries: 0 });
+        const before = await sampleProbe();
+        await this.session.motion.moveTo(pt.x, pt.y, {
+            steps: 10,
+            durationMs: 140,
+            label: 'INSPECT MOTION',
+        });
+        if (settleMs > 0)
+            await this.session.page.waitForTimeout(settleMs);
+        const after = await sampleProbe();
+        const changed = [];
+        const delta = {};
+        if (before && after) {
+            const strKeys = [
+                'transform',
+                'opacity',
+                'filter',
+                'color',
+                'backgroundColor',
+                'borderColor',
+                'boxShadow',
+            ];
+            for (const k of strKeys) {
+                if (before[k] !== after[k]) {
+                    changed.push(k);
+                    delta[k] = { before: before[k], after: after[k] };
+                }
+            }
+            if (before.childTransform !== after.childTransform) {
+                changed.push('child_transform');
+                delta.child_transform = {
+                    before: before.childTransform ?? 'none',
+                    after: after.childTransform ?? 'none',
+                };
+            }
+            if (before.scrollTop !== after.scrollTop) {
+                changed.push('scrollTop');
+                delta.scrollTop = { before: before.scrollTop, after: after.scrollTop };
+            }
+            for (const rk of ['x', 'y', 'width', 'height']) {
+                if (Math.abs(before.rect[rk] - after.rect[rk]) >= 0.5) {
+                    const name = `rect.${rk}`;
+                    changed.push(name);
+                    delta[name] = { before: before.rect[rk], after: after.rect[rk] };
+                }
+            }
+        }
+        const animCount = after ? Math.max(after.animations, after.subtreeAnimations) : 0;
+        const triggers = [];
+        if (after) {
+            const hasTransDur = after.transitionDuration
+                .split(',')
+                .some((d) => parseFloat(d) > 0);
+            if (changed.length > 0 && (hasTransDur || animCount > 0)) {
+                triggers.push('hover-transition');
+            }
+            if (changed.includes('transform') ||
+                changed.includes('child_transform') ||
+                changed.includes('rect.width') ||
+                changed.includes('rect.height')) {
+                triggers.push('pointer-transform');
+            }
+            if ((after.animationName && after.animationName !== 'none') ||
+                (before && after.animations > before.animations)) {
+                triggers.push('css-animation');
+            }
+            if (changed.includes('scrollTop')) {
+                triggers.push('scroll-coupled');
+            }
+            if (changed.length > 0 && triggers.length === 0) {
+                triggers.push('hover-style-change');
+            }
+        }
+        const motionResult = {
+            target: targetLabel,
+            ok: true,
+            at: pt,
+            changed,
+            delta,
+            animations: animCount,
+            triggers,
+            ...(before ? { before } : {}),
+            ...(after ? { after } : {}),
+        };
+        const observation = await this.sampler.captureSnapshot('inspect_motion');
+        observation.motionInspect = motionResult;
+        return {
+            ok: true,
+            at: pt,
+            motion: motionResult,
+            action: `Inspected motion on ${targetLabel}: changed=[${changed.join(', ')}], animations=${animCount}`,
             observation,
             llmSummary: this.sampler.formatObservationForLLM(observation),
         };

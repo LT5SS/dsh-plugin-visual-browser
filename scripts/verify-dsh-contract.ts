@@ -29,6 +29,7 @@ import {
   extractHostStreamChunk,
   formatDesignBlock,
   loadPersistedSettings,
+  normSplit,
   parseJsonDecision,
   readVolatileValue,
   resolveBrowserWindowMode,
@@ -3086,6 +3087,159 @@ async function main() {
     assert.ok(ledgerCheck.getTotalChars() === 0 && MAX_FINDING_NOTE_CHARS === 120);
     await findingsPlugin.runner.closeAllSessions();
     console.log('[Strict DSH 0.2 Contract] 5r Verified ## Design HUD block, truncation priority & cumulative findings!');
+
+    // 5s. TASK-v1.4.1: normSplit, geometric split-char headings, headings n/a reason codes, 0-controls neutral hint, scroll driver, inspect_motion & INVALID_JSON_DECISION retry
+    assert.equal(normSplit('C R E A T I V E'), 'CREATIVE');
+    assert.equal(normSplit('I collaborate with agencies and designers'), 'I collaborate with agencies and designers');
+    assert.equal(
+      normSplit('I collaborate with agencies. W W W W W O O O O O R R R R R K K K K K'),
+      'I collaborate with agencies. WORK'
+    );
+    assert.equal(
+      normSplit('前端开发 C R E A T I V E 作品 collaborate 展示'),
+      '前端开发 CREATIVE 作品 collaborate 展示'
+    );
+    assert.ok(SUBAGENT_SYSTEM_PROMPT.includes('inspect_motion'));
+
+    const v141Session = await new BrowserSession({ mode: 'auto', windowMode: 'headless' }).start();
+    try {
+      const v141Tools = new AtomicBrowserToolset(v141Session, path.join(artifactDir, 'v141-checks'));
+
+      // Split-char geometric heading + hover motion + Lenis programmatic block + 0-controls neutral hint
+      await v141Session.page.setContent(`<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  html, body { margin: 0; height: 2200px; font-family: sans-serif; }
+  h1 { text-transform: uppercase; margin: 24px; }
+  h1 span { display: inline-block; width: 18px; height: 24px; }
+  .card { width: 180px; height: 60px; background: #111; color: #fff; transition: transform 0.2s ease; }
+  .card:hover { transform: translateY(-10px) scale(1.05); }
+</style></head>
+<body class="lenis">
+  <h1>
+    <span>C</span><span>r</span><span>e</span><span>a</span><span>t</span><span>i</span><span>v</span><span>e</span>
+    <span style="margin-left:18px;">D</span><span>e</span><span>v</span><span>e</span><span>l</span><span>o</span><span>p</span><span>e</span><span>r</span>
+  </h1>
+  <div id="hover-card" class="card">Hover Card</div>
+  <button id="static-btn" style="margin-top:20px;">Static</button>
+  <script>
+    window.lenis = true;
+    const origScrollBy = window.scrollBy.bind(window);
+    window.scrollBy = () => {};
+  </script>
+</body></html>`);
+      const splitObs = await v141Tools.sampler.captureSnapshot('v141_split');
+      assert.equal(splitObs.design?.headings[0]?.text, 'CREATIVE DEVELOPER');
+
+      const hoverRes = await v141Tools.inspectMotion('#hover-card');
+      assert.ok(hoverRes.motion?.ok);
+      assert.ok(hoverRes.motion?.changed.includes('transform'), `Expected transform change, got ${JSON.stringify(hoverRes.motion)}`);
+      assert.ok(hoverRes.llmSummary.includes('Motion Probe'));
+
+      const staticRes = await v141Tools.inspectMotion('#static-btn');
+      assert.ok(staticRes.motion?.ok);
+      assert.deepEqual(staticRes.motion?.changed, []);
+
+      const progScroll = await v141Tools.scroll(500, 100, { driver: 'programmatic' });
+      assert.equal(progScroll.scroll?.driver, 'programmatic');
+      assert.ok(progScroll.llmSummary.includes('driver=programmatic'));
+      assert.ok(progScroll.llmSummary.includes('拦截程序化滚动'));
+
+      const wheelScroll = await v141Tools.scroll(500, 100);
+      assert.equal(wheelScroll.scroll?.driver, 'wheel');
+      assert.ok((wheelScroll.scroll?.effective_dom_delta ?? 0) > 100);
+
+      // Clipped heading n/a reason + 0 controls neutral explanation
+      await v141Session.page.setContent(`<!doctype html>
+<html><body style="margin:0;height:600px;"><div style="width:120px;height:40px;overflow:hidden;position:relative;"><h1 style="position:absolute;left:400px;top:0;">HiddenHeading</h1></div></body></html>`);
+      const clippedObs = await v141Tools.sampler.captureSnapshot('v141_clipped');
+      const clippedHud = v141Tools.sampler.formatObservationForLLM(clippedObs);
+      assert.ok(clippedHud.includes('headings: n/a（标题被裁切）'));
+      assert.ok(clippedHud.includes('Visible Interactive Controls: 0 个（滚动后站点可能隐藏了固定导航；不代表页面没有控件）'));
+
+      const emptyObs = await v141Tools.navigate(`${srv.url}__design-blank.html`, 80);
+      assert.ok(emptyObs.llmSummary.includes('headings: n/a（视口内无 h1-h3）'));
+
+      const canvasObs = await v141Tools.navigate(`${srv.url}__design-canvas.html`, 80);
+      assert.ok(canvasObs.llmSummary.includes('headings: n/a（标题可能在 <canvas> 内）'));
+    } finally {
+      await v141Session.close();
+    }
+
+    // INVALID_JSON_DECISION retry succeeds on retry with temperature=0
+    let jsonRetryCalls = 0;
+    let sawTempZero = false;
+    const jsonRetryHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream(params: any) {
+            jsonRetryCalls++;
+            if (jsonRetryCalls === 1) {
+              yield { type: 'text-delta', delta: '让我先解释一下：这是一个红色创意网站。' };
+            } else {
+              if (params?.temperature === 0) sawTempZero = true;
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'JSON_RETRY_OK' }) };
+            }
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const jsonRetryPlugin = apply(jsonRetryHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...jsonRetryHost.effectDisposers);
+    const jsonRetryDef = jsonRetryHost.registeredTools.get('browser_subagent_run')!;
+    const jsonRetryVal: any = await jsonRetryDef.execute(
+      { url: `${srv.url}__design-editorial.html`, role: 'JSON Retry', task_prompt: 'Check retry', max_steps: 2, window_mode: 'headless' },
+      fakeExec
+    );
+    assert.equal(jsonRetryVal.status, 'COMPLETED');
+    assert.equal(jsonRetryVal.planner_mode, 'host-ctx-llm');
+    assert.equal(jsonRetryVal.planner_detail?.fallback_count, 0);
+    assert.equal(jsonRetryVal.planner_detail?.llm_steps?.[0]?.retried_json_schema, true);
+    assert.equal(sawTempZero, true);
+    assert.ok(jsonRetryVal.subagent_report.includes('JSON_RETRY_OK'));
+    await jsonRetryPlugin.runner.closeAllSessions();
+
+    // Persistent INVALID_JSON_DECISION surfaces raw preview inside planner_detail.fallback_reason in diagnostics.json
+    const jsonFailHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        llm: {
+          async *stream() {
+            yield { type: 'text-delta', delta: 'RAW_PROSE_SNIPPET_NOT_JSON_12345' };
+          },
+        },
+      },
+    });
+    const jsonFailPlugin = apply(jsonFailHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...jsonFailHost.effectDisposers);
+    const jsonFailDef = jsonFailHost.registeredTools.get('browser_subagent_run')!;
+    const jsonFailVal: any = await jsonFailDef.execute(
+      { url: srv.url, role: 'JSON Fail Diag', task_prompt: 'Check fallback_reason preview', max_steps: 1, window_mode: 'headless' },
+      fakeExec
+    );
+    assert.equal(jsonFailVal.planner_mode, 'host-ctx-llm-fallback');
+    const jsonFailDiag = JSON.parse(fs.readFileSync(jsonFailVal.diagnostics_path, 'utf8'));
+    assert.ok(String(jsonFailDiag.planner_detail?.fallback_reason ?? '').includes('INVALID_JSON_DECISION'));
+    assert.ok(String(jsonFailDiag.planner_detail?.fallback_reason ?? '').includes('RAW_PROSE_SNIPPET_NOT_JSON_12345'));
+    await jsonFailPlugin.runner.closeAllSessions();
+    console.log('[Strict DSH 0.2 Contract] 5s Verified normSplit, geometric headings, headings n/a reasons, 0-controls hint, scroll driver, inspect_motion & JSON retry!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

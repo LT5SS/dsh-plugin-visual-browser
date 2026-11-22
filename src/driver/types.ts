@@ -22,6 +22,39 @@ export interface ScrollDiagnostic {
   visual_changed: boolean;
   at_boundary: boolean;
   locked: boolean;
+  driver?: 'wheel' | 'programmatic';
+  programmatic_blocked_hint?: string;
+}
+
+export interface MotionProbeState {
+  transform: string;
+  opacity: string;
+  filter: string;
+  color: string;
+  backgroundColor: string;
+  borderColor: string;
+  boxShadow: string;
+  scrollTop: number;
+  rect: { x: number; y: number; width: number; height: number };
+  animations: number;
+  subtreeAnimations: number;
+  transitionDuration: string;
+  animationName: string;
+  childTransform?: string;
+}
+
+export interface MotionInspectResult {
+  target: string;
+  ok: boolean;
+  blocked?: ActionBlockedReason;
+  at?: Point2D;
+  changed: string[];
+  delta: Record<string, { before: string | number; after: string | number }>;
+  animations: number;
+  triggers: string[];
+  before?: MotionProbeState;
+  after?: MotionProbeState;
+  hint?: string;
 }
 
 export type BrowserRuntimeMode =

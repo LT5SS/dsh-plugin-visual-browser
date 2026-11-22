@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { NavigationDiagnostic, Point2D, ScrollDiagnostic } from '../driver/types.js';
+import type { MotionInspectResult, NavigationDiagnostic, Point2D, ScrollDiagnostic } from '../driver/types.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
 /** Returns true when a Playwright error stems from mid-evaluation navigation or frame detachment. */
 export declare function isNavigationRaceError(error: unknown): boolean;
@@ -72,6 +72,7 @@ export interface DesignSnapshot {
     }>;
     headingsTotal: number;
     headingsError?: boolean;
+    headingsNaReason?: '无 h1-h3' | '被裁切' | '可能在 canvas 内';
     sections: number[];
     sectionsTotal: number;
     sectionsError?: boolean;
@@ -137,10 +138,16 @@ export interface PageObservation {
     degradedReason?: string;
     navigation?: NavigationDiagnostic;
     scrollDiagnostic?: ScrollDiagnostic;
+    motionInspect?: MotionInspectResult;
     snapshotGen?: number;
     design?: DesignSnapshot;
 }
 export declare const MAX_DESIGN_BLOCK_CHARS = 1200;
+/**
+ * Normalizes split-character animated text & repeated single-letter marquees while preserving
+ * normal multi-character English words (e.g. "collaborate") and CJK prose intact.
+ */
+export declare function normSplit(raw: string): string;
 export declare function formatDesignBlock(design?: DesignSnapshot): string;
 export declare class PageSnapshotSampler {
     private session;

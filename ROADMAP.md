@@ -76,9 +76,18 @@
 
 ---
 
-## v1.4.1 / v1.3.4 规划（TODO）
+## v1.4.1 已交付（文本保真 + 滚轮驱动区分 + `inspect_motion` + JSON 纠偏重试）
 
-- **5 + 1 固定只读探针（v1.4.1）**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`、`inspect_motion`（前后 `transform`/`style` 差分）与 `inspect_canvas`（前后像素差交互探针），并辅以相邻帧区域差异文本补偿。
+- **逐字动画文本归一化与几何标题分行**：`normSplit` 仅折叠单字母连续拆分与跑马灯，完整保留 `collaborate` 等正常词汇及中文混排；`headings` 按元素 `top/left` 几何分行与词间距重组，准确还原 `CREATIVE DEVELOPER` 词间空格。
+- **`headings: n/a` 原因码与 0 控件中性提示**：区分 `视口内无 h1-h3` / `标题被裁切` / `标题可能在 <canvas> 内`；控件为 0 时输出中性说明，避免模型误判为被插件 UI 遮挡。
+- **`ScrollDiagnostic.driver` & `inspect_motion` 动作**：区分 `wheel` 与 `programmatic`（拦截时给出 Lenis 提示）；子代理新增只读 `inspect_motion` 动作采集指针悬停前后 `transform`/`opacity`/尺寸/`getAnimations()` 差分。
+- **`INVALID_JSON_DECISION` 纠偏重试与诊断落盘**：非 JSON 输出自动附加裸 JSON 格式约束与 `temperature=0` 重试 1 次；仍失败时将前 200 字原始片段写入 `planner_detail.fallback_reason`。
+
+---
+
+## v1.4.2+ / v2.0.0 规划（TODO）
+
+- **其余 4 + 1 固定只读探针**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_canvas`（前后像素差交互探针），并辅以相邻帧区域差异文本补偿。
 - **`inspect_region(x, y, radius, zoom)` 局部 2× 放大能力**：针对全屏 WebGL / `<canvas>` 站点（`#ref` 为空、只能靠全屏截图盲估坐标）提供按需 2× 局部放大定位视图。
 - **Win32 `HWND_NOTOPMOST` 置顶自愈（v1.3.4 遗留）**：启动后及复用窗口前纠正意外 `WS_EX_TOPMOST` 状态。
 - **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性；不做任意 `evaluate_probe` JS 执行。

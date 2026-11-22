@@ -32,14 +32,75 @@ export async function safeEvaluate(page, fn, fallbackValue, retriesOrOptions) {
     return fallbackValue;
 }
 export const MAX_DESIGN_BLOCK_CHARS = 1200;
+/**
+ * Normalizes split-character animated text & repeated single-letter marquees while preserving
+ * normal multi-character English words (e.g. "collaborate") and CJK prose intact.
+ */
+export function normSplit(raw) {
+    const t = String(raw || '').replace(/\s+/g, ' ').trim();
+    const toks = t.split(' ').filter(Boolean);
+    if (toks.length < 6)
+        return t;
+    const single = toks.filter((x) => x.length === 1).length;
+    const foldRun = (run) => run.replace(/([A-Za-z])\1{1,}/g, '$1');
+    if (single / toks.length >= 0.45) {
+        let out = '';
+        let buf = '';
+        for (const tok of toks) {
+            if (tok.length === 1) {
+                buf += tok;
+            }
+            else {
+                if (buf) {
+                    out += foldRun(buf) + ' ';
+                    buf = '';
+                }
+                out += tok + ' ';
+            }
+        }
+        if (buf)
+            out += foldRun(buf);
+        return out.replace(/\s+/g, ' ').trim();
+    }
+    // Fallback for prose containing an embedded/trailing single-letter marquee run (>= 6 ASCII single-char tokens)
+    const outParts = [];
+    let i = 0;
+    while (i < toks.length) {
+        if (/^[A-Za-z]$/.test(toks[i])) {
+            let j = i;
+            while (j < toks.length && /^[A-Za-z]$/.test(toks[j])) {
+                j++;
+            }
+            if (j - i >= 6) {
+                outParts.push(foldRun(toks.slice(i, j).join('')));
+                i = j;
+                continue;
+            }
+        }
+        outParts.push(toks[i]);
+        i++;
+    }
+    return outParts.join(' ').replace(/\s+/g, ' ').trim();
+}
 export function formatDesignBlock(design) {
     if (!design)
         return '';
     const titleLine = `- title: ${design.title || 'n/a'}`;
     let headingsDetail = 'n/a';
-    if (!design.headingsError && design.headings.length > 0) {
-        const items = design.headings.map((h) => `${h.tag} "${h.text}"`).join(' | ');
-        headingsDetail = `${items} (共 ${design.headingsTotal} 条，最多 5)`;
+    if (!design.headingsError) {
+        if (design.headings.length > 0) {
+            const items = design.headings.map((h) => `${h.tag} "${h.text}"`).join(' | ');
+            headingsDetail = `${items} (共 ${design.headingsTotal} 条，最多 5)`;
+        }
+        else if (design.headingsNaReason === '被裁切') {
+            headingsDetail = 'n/a（标题被裁切）';
+        }
+        else if (design.headingsNaReason === '可能在 canvas 内') {
+            headingsDetail = 'n/a（标题可能在 <canvas> 内）';
+        }
+        else {
+            headingsDetail = 'n/a（视口内无 h1-h3）';
+        }
     }
     let headingsCompact = 'n/a';
     if (!design.headingsError && design.headings.length > 0) {
@@ -524,6 +585,7 @@ export class PageSnapshotSampler {
             const dHeadings = [];
             let dHeadingsTotal = 0;
             let dHeadingsError = false;
+            let clippedHeadingsCount = 0;
             try {
                 const seenHeadings = new Set();
                 const hEls = document.querySelectorAll('h1, h2, h3');
@@ -539,19 +601,141 @@ export class PageSnapshotSampler {
                     if (hcs.clip === 'rect(0px, 0px, 0px, 0px)' ||
                         hcs.clip === 'rect(0px 0px 0px 0px)' ||
                         (hcs.clipPath && hcs.clipPath.includes('inset(50%'))) {
+                        clippedHeadingsCount++;
                         continue;
                     }
                     const hr = hEl.getBoundingClientRect();
                     if (hr.width <= 0 || hr.height <= 0)
                         continue;
                     if (hr.width <= 1.5 && hr.height <= 1.5 && (hcs.overflow === 'hidden' || hcs.overflow === 'clip')) {
+                        clippedHeadingsCount++;
                         continue;
                     }
                     if (hr.bottom <= 0 || hr.top >= vh || hr.right <= 0 || hr.left >= vw)
                         continue;
-                    const hText = (hEl.innerText || hEl.textContent || '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
+                    let headingClippedOut = false;
+                    let hParent = hEl.parentElement;
+                    while (hParent && hParent !== document.documentElement) {
+                        const hpcs = window.getComputedStyle(hParent);
+                        if (hpcs.overflow === 'hidden' ||
+                            hpcs.overflow === 'clip' ||
+                            hpcs.overflowX === 'hidden' ||
+                            hpcs.overflowX === 'clip' ||
+                            hpcs.overflowY === 'hidden' ||
+                            hpcs.overflowY === 'clip') {
+                            const hpr = hParent.getBoundingClientRect();
+                            if (hr.right <= hpr.left + 0.5 ||
+                                hr.left >= hpr.right - 0.5 ||
+                                hr.bottom <= hpr.top + 0.5 ||
+                                hr.top >= hpr.bottom - 0.5) {
+                                headingClippedOut = true;
+                                break;
+                            }
+                        }
+                        if (hParent === document.body)
+                            break;
+                        hParent = hParent.parentElement;
+                    }
+                    if (headingClippedOut) {
+                        clippedHeadingsCount++;
+                        continue;
+                    }
+                    let hText = '';
+                    const charItems = [];
+                    const hLeaves = hEl.querySelectorAll('*');
+                    const leafCap = Math.min(hLeaves.length, 300);
+                    for (let li = 0; li < leafCap; li++) {
+                        const lEl = hLeaves[li];
+                        if (lEl.children.length > 0)
+                            continue;
+                        if (lEl.getAttribute('aria-hidden') === 'true')
+                            continue;
+                        const lText = (lEl.textContent || '').trim();
+                        if (lText.length !== 1)
+                            continue;
+                        const lcs = window.getComputedStyle(lEl);
+                        if (lcs.display === 'none' || lcs.visibility === 'hidden' || Number(lcs.opacity) < 0.05) {
+                            continue;
+                        }
+                        const lr = lEl.getBoundingClientRect();
+                        if (lr.width < 1 || lr.height < 1)
+                            continue;
+                        if (lr.bottom <= 0 || lr.top >= vh || lr.right <= 0 || lr.left >= vw)
+                            continue;
+                        let dup = false;
+                        for (let di = 0; di < charItems.length; di++) {
+                            const prevC = charItems[di];
+                            if (prevC.ch === lText &&
+                                Math.abs(prevC.left - lr.left) < 3 &&
+                                Math.abs(prevC.top - lr.top) < 3) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (!dup) {
+                            charItems.push({
+                                ch: lText,
+                                top: lr.top,
+                                left: lr.left,
+                                right: lr.right,
+                                width: lr.width,
+                                height: lr.height,
+                            });
+                        }
+                    }
+                    if (charItems.length >= 4) {
+                        charItems.sort((a, b) => a.top - b.top || a.left - b.left);
+                        let minH = charItems[0].height;
+                        let sumW = 0;
+                        for (let ci = 0; ci < charItems.length; ci++) {
+                            if (charItems[ci].height < minH)
+                                minH = charItems[ci].height;
+                            sumW += charItems[ci].width;
+                        }
+                        const rowTol = Math.max(4, minH * 0.25);
+                        const avgW = sumW / charItems.length;
+                        const wordGap = Math.max(8, avgW * 0.45);
+                        const rows = [];
+                        for (let ci = 0; ci < charItems.length; ci++) {
+                            const item = charItems[ci];
+                            let placed = false;
+                            for (let ri = 0; ri < rows.length; ri++) {
+                                if (Math.abs(rows[ri].top - item.top) <= rowTol) {
+                                    rows[ri].items.push(item);
+                                    placed = true;
+                                    break;
+                                }
+                            }
+                            if (!placed) {
+                                rows.push({ top: item.top, items: [item] });
+                            }
+                        }
+                        rows.sort((a, b) => a.top - b.top);
+                        const rowStrings = [];
+                        for (let ri = 0; ri < rows.length; ri++) {
+                            const items = rows[ri].items;
+                            items.sort((a, b) => a.left - b.left);
+                            let lineStr = '';
+                            for (let ii = 0; ii < items.length; ii++) {
+                                if (ii > 0 && items[ii].left - items[ii - 1].right > wordGap) {
+                                    lineStr += ' ';
+                                }
+                                lineStr += items[ii].ch;
+                            }
+                            if (lineStr)
+                                rowStrings.push(lineStr);
+                        }
+                        hText = rowStrings.join(' ').replace(/\s+/g, ' ').trim();
+                        if (hcs.textTransform === 'uppercase')
+                            hText = hText.toUpperCase();
+                        else if (hcs.textTransform === 'lowercase')
+                            hText = hText.toLowerCase();
+                    }
+                    else {
+                        hText = (hEl.innerText || hEl.textContent || '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                    }
                     if (!hText)
                         continue;
                     const hTag = hEl.tagName.toLowerCase();
@@ -1001,7 +1185,7 @@ export class PageSnapshotSampler {
                     let prevContainer = null;
                     let prevRaw = '';
                     let tNode = walker.nextNode();
-                    while (tNode && scannedNodes < 1500 && collectedChars < 220) {
+                    while (tNode && scannedNodes < 1500 && collectedChars < 900) {
                         scannedNodes++;
                         const rawVal = tNode.nodeValue || '';
                         const val = rawVal.trim();
@@ -1109,7 +1293,7 @@ export class PageSnapshotSampler {
                         }
                         tNode = walker.nextNode();
                     }
-                    dBodyText = textParts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+                    dBodyText = textParts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 900);
                 }
                 else {
                     dBodyText = '';
@@ -1142,11 +1326,19 @@ export class PageSnapshotSampler {
             catch {
                 dCanvasCoversViewport = false;
             }
+            const dHeadingsNaReason = !dHeadingsError && dHeadings.length === 0
+                ? clippedHeadingsCount > 0
+                    ? '被裁切'
+                    : dCanvasCoversViewport
+                        ? '可能在 canvas 内'
+                        : '无 h1-h3'
+                : undefined;
             const design = {
                 title: dTitle,
                 headings: dHeadings,
                 headingsTotal: dHeadingsTotal,
                 ...(dHeadingsError ? { headingsError: true } : {}),
+                ...(dHeadingsNaReason ? { headingsNaReason: dHeadingsNaReason } : {}),
                 sections: dSections,
                 sectionsTotal: dSectionsTotal,
                 ...(dSectionsError ? { sectionsError: true } : {}),
@@ -1201,6 +1393,15 @@ export class PageSnapshotSampler {
                 degradedReason = 'sampler degraded: navigation race';
             },
         });
+        if (extracted.design) {
+            extracted.design.headings = extracted.design.headings.map((h) => ({
+                tag: h.tag,
+                text: normSplit(h.text).slice(0, 60),
+            }));
+            if (typeof extracted.design.bodyText === 'string') {
+                extracted.design.bodyText = normSplit(extracted.design.bodyText).slice(0, 160);
+            }
+        }
         if (extracted.cursorState) {
             this.session.motion.setPosition?.(extracted.cursorState.x, extracted.cursorState.y);
         }
@@ -1231,7 +1432,7 @@ export class PageSnapshotSampler {
         };
     }
     formatObservationForLLM(obs) {
-        const { scroll, domStats, health, interactiveElements, cursorPosition, navigation, scrollDiagnostic } = obs;
+        const { scroll, domStats, health, interactiveElements, cursorPosition, navigation, scrollDiagnostic, motionInspect, } = obs;
         const lines = [
             `### [Step ${obs.stepIndex}] Page Observation HUD`,
             ...(obs.degradedReason ? [`- **Notice**: ${obs.degradedReason}`] : []),
@@ -1247,14 +1448,24 @@ export class PageSnapshotSampler {
             `- **Scroll Progress**: ${scroll.scrollProgressPercent}% (Y: ${scroll.scrollY} / ${scroll.scrollHeight}px, Viewport: ${scroll.viewportWidth}x${scroll.viewportHeight})`,
             ...(scrollDiagnostic
                 ? [
-                    `- **Scroll Result**: attempted=${scrollDiagnostic.attempted}, effective_dom_delta=${scrollDiagnostic.effective_dom_delta}, dom_scrollable=${scrollDiagnostic.dom_scrollable}, visual_changed=${scrollDiagnostic.visual_changed}, at_boundary=${scrollDiagnostic.at_boundary}, locked=${scrollDiagnostic.locked}` +
-                        (scrollDiagnostic.locked
-                            ? ' (scroll locked — do not retry scroll; use clicks, drags, or nav links instead)'
-                            : scrollDiagnostic.at_boundary
-                                ? ' (reached scroll boundary)'
-                                : !scrollDiagnostic.dom_scrollable && scrollDiagnostic.visual_changed
-                                    ? ' (native scrollbar fixed, but visual canvas/scene responded to wheel)'
-                                    : ''),
+                    `- **Scroll Result**: driver=${scrollDiagnostic.driver ?? 'wheel'}, attempted=${scrollDiagnostic.attempted}, effective_dom_delta=${scrollDiagnostic.effective_dom_delta}, dom_scrollable=${scrollDiagnostic.dom_scrollable}, visual_changed=${scrollDiagnostic.visual_changed}, at_boundary=${scrollDiagnostic.at_boundary}, locked=${scrollDiagnostic.locked}` +
+                        (scrollDiagnostic.programmatic_blocked_hint
+                            ? ` (${scrollDiagnostic.programmatic_blocked_hint})`
+                            : scrollDiagnostic.locked
+                                ? ' (scroll locked — do not retry scroll; use clicks, drags, or nav links instead)'
+                                : scrollDiagnostic.at_boundary
+                                    ? ' (reached scroll boundary)'
+                                    : !scrollDiagnostic.dom_scrollable && scrollDiagnostic.visual_changed
+                                        ? ' (native scrollbar fixed, but visual canvas/scene responded to wheel)'
+                                        : ''),
+                ]
+                : []),
+            ...(motionInspect
+                ? [
+                    `- **Motion Probe**: target=${motionInspect.target}, changed=[${motionInspect.changed.join(', ')}], animations=${motionInspect.animations}, triggers=[${motionInspect.triggers.join(', ')}]` +
+                        (Object.keys(motionInspect.delta).length > 0
+                            ? ` | delta=${JSON.stringify(motionInspect.delta).slice(0, 260)}`
+                            : ''),
                 ]
                 : []),
             `- **DOM & Tech**: canvas=${domStats.counts.canvas}, svg=${domStats.counts.svg}, video=${domStats.counts.video}, img=${domStats.counts.img}, section=${domStats.counts.section}, openDialogs=${domStats.counts.openDialogs} | Tech=[${domStats.detectedTechHints.join(', ')}] | htmlData=${JSON.stringify(domStats.htmlDataAttributes)}`,
@@ -1267,6 +1478,9 @@ export class PageSnapshotSampler {
             ``,
             `#### Visible Interactive Controls (${interactiveElements.length} in viewport):`,
         ];
+        if (interactiveElements.length === 0) {
+            lines.push(`- Visible Interactive Controls: 0 个（滚动后站点可能隐藏了固定导航；不代表页面没有控件）`);
+        }
         for (const el of interactiveElements.slice(0, 20)) {
             const attrs = [];
             if (el.href)
