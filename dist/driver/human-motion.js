@@ -437,6 +437,26 @@ export class HumanMotionController {
         };
     }
     async clickSelector(selector, opts = {}) {
+        const isPluginUiSelector = await safeEvaluate(this.page, (sel) => {
+            try {
+                const el = document.querySelector(sel);
+                return Boolean(el && el.closest?.('#__dsh_vc_root__'));
+            }
+            catch {
+                return false;
+            }
+        }, false, { arg: selector, retries: 0 });
+        if (isPluginUiSelector) {
+            return {
+                ok: false,
+                x: this.pos.x,
+                y: this.pos.y,
+                at: { x: this.pos.x, y: this.pos.y },
+                blocked: 'PLUGIN_UI_LAYER',
+                hit: selector,
+                hint: '该选择器属于插件顶层控制条，拒绝点击',
+            };
+        }
         const probe = await this.probeSelector(selector, opts.timeoutMs);
         if (!probe.ok) {
             return {
@@ -453,12 +473,39 @@ export class HumanMotionController {
             ...opts,
             label: `AIM ${selector}`,
         });
-        return this.clickAt(probe.center.x, probe.center.y, {
-            ...opts,
-            steps: 2,
-            durationMs: 20,
-            label: opts.label ?? `CLICK ${selector}`,
-        });
+        let temporarilyPassThrough = false;
+        const preHit = await this.hitTestAt(probe.center.x, probe.center.y);
+        if (preHit.hitsPluginUi) {
+            const canPassThrough = await safeEvaluate(this.page, () => {
+                try {
+                    return new URLSearchParams(window.location.search).get('__dsh_test_center_pill') !== '1';
+                }
+                catch {
+                    return true;
+                }
+            }, false, 0);
+            if (canPassThrough) {
+                temporarilyPassThrough = true;
+                await safeEvaluate(this.page, () => {
+                    window.__dshCursorAPI?.setPanelPassThrough?.(true);
+                }, undefined, 0);
+            }
+        }
+        try {
+            return await this.clickAt(probe.center.x, probe.center.y, {
+                ...opts,
+                steps: 2,
+                durationMs: 20,
+                label: opts.label ?? `CLICK ${selector}`,
+            });
+        }
+        finally {
+            if (temporarilyPassThrough) {
+                await safeEvaluate(this.page, () => {
+                    window.__dshCursorAPI?.setPanelPassThrough?.(false);
+                }, undefined, 0).catch(() => { });
+            }
+        }
     }
     async resolveTargetPoint(target, timeoutMs = 1200) {
         if (typeof target !== 'string') {

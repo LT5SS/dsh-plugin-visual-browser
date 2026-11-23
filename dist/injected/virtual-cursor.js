@@ -187,6 +187,11 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     });
     return `
 (() => {
+  try {
+    if (window.self !== window.top) return;
+  } catch {
+    return;
+  }
   const PRESETS = ${presetsJson};
   const SHAPE_PATHS = ${shapePathsJson};
   const INITIAL_STYLE = ${initialJson};
@@ -255,6 +260,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     takeoverLabel: INITIAL_OPTS.roleLabel || '',
     takeoverHotkey: INITIAL_OPTS.takeoverHotkey || 'F8',
     takeoverPending: Boolean(window.__dshTakeoverRequested),
+    panelPassThrough: false,
     dragActive: false,
     dragOrigin: null,
     dragTarget: null,
@@ -466,6 +472,12 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     \`;
 
     document.documentElement.appendChild(root);
+    const panelEl = root.querySelector('#__dsh_vc_panel__');
+    if (panelEl) {
+      panelEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+      });
+    }
     const btn = root.querySelector('#__dsh_vc_takeover_btn__');
     if (btn) {
       btn.addEventListener('click', (e) => {
@@ -549,16 +561,19 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       panel.style.right = '14px';
       panel.style.left = 'auto';
       panel.style.transform = 'none';
-      panel.style.pointerEvents = 'none';
+      panel.style.pointerEvents = state.panelPassThrough ? 'none' : 'auto';
     }
 
     if (!centerTest && state.takeoverMode === 'hidden') {
       panel.style.display = 'none';
+      panel.style.pointerEvents = 'none';
       btn.style.pointerEvents = 'none';
       return;
     }
 
+    const panelInteractive = centerTest || !state.panelPassThrough;
     panel.style.display = 'flex';
+    panel.style.pointerEvents = panelInteractive ? 'auto' : 'none';
     const roleSuffix = state.takeoverLabel ? ' · ' + state.takeoverLabel : '';
     const hotkey = state.takeoverHotkey ? state.takeoverHotkey : '';
     const hotkeyHint = hotkey ? ' · 按 ' + hotkey + ' 接管' : '';
@@ -570,10 +585,11 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       txt.textContent = '已请求接管 · 正在暂停...';
       btn.style.display = 'inline-block';
       btn.textContent = '正在暂停...';
+      btn.title = '';
       btn.disabled = true;
       btn.style.background = '#b45309';
       btn.style.cursor = 'wait';
-      btn.style.pointerEvents = centerTest ? 'auto' : 'none';
+      btn.style.pointerEvents = panelInteractive ? 'auto' : 'none';
       return;
     }
 
@@ -591,7 +607,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       btn.title = '点击继续执行当前子代理任务';
       btn.style.background = '#d97706';
       btn.style.cursor = 'pointer';
-      btn.style.pointerEvents = 'auto';
+      btn.style.pointerEvents = panelInteractive ? 'auto' : 'none';
       return;
     }
 
@@ -615,16 +631,11 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     txt.textContent = 'DSH Agent 运行中' + roleSuffix + hotkeyHint;
     btn.style.display = 'inline-block';
     btn.disabled = false;
-    btn.textContent = hotkey ? '按 ' + hotkey + ' 接管' : '暂停并接管';
-    btn.title = '';
+    btn.textContent = '暂停并接管';
+    btn.title = hotkey ? '点击暂停并交给人工（等同按 ' + hotkey + '）' : '点击暂停并交给人工';
     btn.style.background = '#ef4444';
-    if (centerTest) {
-      btn.style.pointerEvents = 'auto';
-      btn.style.cursor = 'pointer';
-    } else {
-      btn.style.pointerEvents = 'none';
-      btn.style.cursor = 'default';
-    }
+    btn.style.pointerEvents = panelInteractive ? 'auto' : 'none';
+    btn.style.cursor = panelInteractive ? 'pointer' : 'default';
   }
 
   function promoteToTopLayer(root) {
@@ -1051,6 +1062,10 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     },
     setTakeoverHotkey(hotkey = 'F8') {
       state.takeoverHotkey = typeof hotkey === 'string' ? hotkey : 'F8';
+      renderTakeoverPanel();
+    },
+    setPanelPassThrough(on) {
+      state.panelPassThrough = Boolean(on);
       renderTakeoverPanel();
     },
     resetTakeoverRequest() {

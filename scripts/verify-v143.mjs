@@ -199,7 +199,7 @@ try {
   assert.ok(duringTaskPill.text.includes('DSH Agent 运行中'));
   assert.ok(duringTaskPill.text.includes('按 F8 接管'));
   assert.notEqual(duringTaskPill.btnDisplay, 'none');
-  assert.equal(duringTaskPill.btnText, '按 F8 接管');
+  assert.equal(duringTaskPill.btnText, '暂停并接管');
 
   const sharedAfterRun = runner.getSharedSession();
   assert.ok(sharedAfterRun);

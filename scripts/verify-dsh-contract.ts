@@ -1675,19 +1675,22 @@ async function main() {
             activeSession.page,
             () => {
               const root = document.getElementById('__dsh_vc_root__');
+              const panel = document.getElementById('__dsh_vc_panel__');
               const btn = document.getElementById('__dsh_vc_takeover_btn__');
               return {
                 popover: root?.getAttribute('popover') ?? '',
                 rootPointerEvents: root ? getComputedStyle(root).pointerEvents : '',
+                panelPointerEvents: panel ? getComputedStyle(panel).pointerEvents : '',
                 btnPointerEvents: btn ? getComputedStyle(btn).pointerEvents : '',
               };
             },
-            { popover: '', rootPointerEvents: '', btnPointerEvents: '' },
+            { popover: '', rootPointerEvents: '', panelPointerEvents: '', btnPointerEvents: '' },
             0
           );
           assert.equal(runningStyles.popover, 'manual');
           assert.equal(runningStyles.rootPointerEvents, 'none');
-          assert.equal(runningStyles.btnPointerEvents, 'none', 'Takeover button must be click-through during RUNNING');
+          assert.equal(runningStyles.panelPointerEvents, 'auto', 'Visible takeover capsule must absorb clicks during RUNNING');
+          assert.equal(runningStyles.btnPointerEvents, 'auto', 'Takeover pause button must be clickable during RUNNING');
           await activeSession.page.keyboard.press('F8');
           return { type: 'scroll', deltaY: 120, reason: 'Check F8 hotkey takeover signal' };
         }
@@ -3648,7 +3651,7 @@ async function main() {
       assert.ok(String(duringRunPill?.text ?? '').includes('DSH Agent 运行中'));
       assert.ok(String(duringRunPill?.text ?? '').includes('按 F8 接管'));
       assert.notEqual(duringRunPill?.btnDisplay, 'none');
-      assert.equal(duringRunPill?.btnText, '按 F8 接管');
+      assert.equal(duringRunPill?.btnText, '暂停并接管');
 
       const sharedAfterRun = v143Plugin.runner.getSharedSession();
       assert.ok(sharedAfterRun);
@@ -4063,6 +4066,270 @@ async function main() {
       await v144Plugin.runner.closeAllSessions();
     }
     console.log('[Strict DSH 0.2 Contract] 5v Verified Option C continue-button resume (binding + 500ms watcher), diagnostics & watcher cleanup!');
+
+    // 5w. TASK-v1.4.5: Visible capsule absorbs real mouse clicks without leaking, running button is clickable ('暂停并接管'), & paused_by === 'button'
+    const v145Session = await new BrowserSession({
+      mode: 'auto',
+      windowMode: 'headless',
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+    }).start();
+    try {
+      await v145Session.page.setViewportSize({ width: 1000, height: 700 });
+      await v145Session.navigate(`${srv.url}__layer-fixture.html`, 'domcontentloaded');
+      await safeEvaluate(
+        v145Session.page,
+        () => {
+          const link = document.getElementById('menu-link');
+          if (link) {
+            link.style.top = '14px';
+            link.style.right = '14px';
+            link.style.width = '380px';
+            link.style.height = '44px';
+          }
+          (window as any).__menuClicked = 0;
+          (window as any).__dshTakeoverRequested = false;
+          (window as any).__dshTakeoverSource = '';
+          (window as any).__dshResumeRequested = false;
+        },
+        undefined,
+        0
+      );
+
+      // 1) running state: text area absorbs real mouse click; button is clickable ('暂停并接管') and sets source='button' without leaking to #menu-link
+      await v145Session.motion.setTakeoverState('running', 'RealClickQA');
+      const runHitMeta = await safeEvaluate(
+        v145Session.page,
+        () => {
+          const txt = document.getElementById('__dsh_vc_status_text__')!;
+          const btn = document.getElementById('__dsh_vc_takeover_btn__')!;
+          const tr = txt.getBoundingClientRect();
+          const br = btn.getBoundingClientRect();
+          const tx = Math.round(tr.left + Math.min(24, tr.width / 2));
+          const ty = Math.round(tr.top + tr.height / 2);
+          const bx = Math.round(br.left + br.width / 2);
+          const by = Math.round(br.top + br.height / 2);
+          const hitTxt = document.elementFromPoint(tx, ty);
+          const hitBtn = document.elementFromPoint(bx, by);
+          return {
+            tx,
+            ty,
+            bx,
+            by,
+            btnText: btn.textContent?.trim() ?? '',
+            btnTitle: btn.getAttribute('title') ?? '',
+            btnPe: getComputedStyle(btn).pointerEvents,
+            btnCursor: getComputedStyle(btn).cursor,
+            txtInRoot: Boolean(hitTxt?.closest?.('#__dsh_vc_root__')),
+            hitBtnId: hitBtn?.id ?? '',
+          };
+        },
+        null as any,
+        0
+      );
+      assert.equal(runHitMeta.btnText, '暂停并接管');
+      assert.ok(runHitMeta.btnTitle.includes('F8'));
+      assert.equal(runHitMeta.btnPe, 'auto');
+      assert.equal(runHitMeta.btnCursor, 'pointer');
+      assert.equal(runHitMeta.txtInRoot, true);
+      assert.equal(runHitMeta.hitBtnId, '__dsh_vc_takeover_btn__');
+
+      await v145Session.page.mouse.click(runHitMeta.tx, runHitMeta.ty);
+      const afterTxtReal = await safeEvaluate(
+        v145Session.page,
+        () => ({
+          menu: Number((window as any).__menuClicked || 0),
+          takeover: Boolean((window as any).__dshTakeoverRequested),
+        }),
+        { menu: -1, takeover: true },
+        0
+      );
+      assert.equal(afterTxtReal.menu, 0, 'Running pill text area must absorb real mouse click without hitting #menu-link');
+      assert.equal(afterTxtReal.takeover, false, 'Clicking pill text area must not trigger takeover');
+
+      await v145Session.page.mouse.click(runHitMeta.bx, runHitMeta.by);
+      const afterBtnReal = await safeEvaluate(
+        v145Session.page,
+        () => ({
+          menu: Number((window as any).__menuClicked || 0),
+          takeover: Boolean((window as any).__dshTakeoverRequested),
+          source: String((window as any).__dshTakeoverSource || ''),
+        }),
+        { menu: -1, takeover: false, source: '' },
+        0
+      );
+      assert.equal(afterBtnReal.menu, 0, 'Running red button must not leak click to #menu-link');
+      assert.equal(afterBtnReal.takeover, true);
+      assert.equal(afterBtnReal.source, 'button');
+
+      // 2) paused & idle states: real mouse clicks absorbed; idle triggers zero actions
+      await v145Session.motion.setTakeoverState('paused', 'RealClickQA');
+      await safeEvaluate(v145Session.page, () => {
+        (window as any).__menuClicked = 0;
+        (window as any).__dshResumeRequested = false;
+      }, undefined, 0);
+      const pausePts = await safeEvaluate(
+        v145Session.page,
+        () => {
+          const tr = document.getElementById('__dsh_vc_status_text__')!.getBoundingClientRect();
+          const br = document.getElementById('__dsh_vc_takeover_btn__')!.getBoundingClientRect();
+          return {
+            tx: Math.round(tr.left + Math.min(24, tr.width / 2)),
+            ty: Math.round(tr.top + tr.height / 2),
+            bx: Math.round(br.left + br.width / 2),
+            by: Math.round(br.top + br.height / 2),
+          };
+        },
+        { tx: 0, ty: 0, bx: 0, by: 0 },
+        0
+      );
+      await v145Session.page.mouse.click(pausePts.tx, pausePts.ty);
+      assert.equal(await safeEvaluate(v145Session.page, () => Number((window as any).__menuClicked || 0), -1, 0), 0);
+      assert.equal(await safeEvaluate(v145Session.page, () => Boolean((window as any).__dshResumeRequested), true, 0), false);
+      await v145Session.page.mouse.click(pausePts.bx, pausePts.by);
+      assert.equal(await safeEvaluate(v145Session.page, () => Number((window as any).__menuClicked || 0), -1, 0), 0);
+      assert.equal(await safeEvaluate(v145Session.page, () => Boolean((window as any).__dshResumeRequested), false, 0), true);
+
+      await v145Session.motion.setTakeoverState('idle');
+      await safeEvaluate(v145Session.page, () => {
+        (window as any).__menuClicked = 0;
+        (window as any).__dshTakeoverRequested = false;
+        (window as any).__dshResumeRequested = false;
+      }, undefined, 0);
+      const idlePt = await safeEvaluate(
+        v145Session.page,
+        () => {
+          const panel = document.getElementById('__dsh_vc_panel__')!;
+          const pr = panel.getBoundingClientRect();
+          const x = Math.round(pr.left + pr.width / 2);
+          const y = Math.round(pr.top + pr.height / 2);
+          const hit = document.elementFromPoint(x, y);
+          return { x, y, inRoot: Boolean(hit?.closest?.('#__dsh_vc_root__')) };
+        },
+        { x: 0, y: 0, inRoot: false },
+        0
+      );
+      assert.equal(idlePt.inRoot, true);
+      await v145Session.page.mouse.click(idlePt.x, idlePt.y);
+      const afterIdleReal = await safeEvaluate(
+        v145Session.page,
+        () => ({
+          menu: Number((window as any).__menuClicked || 0),
+          takeover: Boolean((window as any).__dshTakeoverRequested),
+          resume: Boolean((window as any).__dshResumeRequested),
+        }),
+        { menu: -1, takeover: true, resume: true },
+        0
+      );
+      assert.equal(afterIdleReal.menu, 0);
+      assert.equal(afterIdleReal.takeover, false);
+      assert.equal(afterIdleReal.resume, false);
+
+      // 3) Raw coord click on pill still refused with PLUGIN_UI_LAYER while selector click on #menu-link passes through cleanly
+      const v145Tools = new AtomicBrowserToolset(v145Session, path.join(artifactDir, 'v145-layer'));
+      await v145Session.motion.setTakeoverState('running', 'GuardCheck');
+      await safeEvaluate(v145Session.page, () => { (window as any).__menuClicked = 0; (window as any).__dshTakeoverRequested = false; }, undefined, 0);
+      const coordRefused = await v145Tools.click({ x: runHitMeta.bx, y: runHitMeta.by }, 50);
+      assert.equal(coordRefused.ok, false);
+      assert.equal(coordRefused.blocked, 'PLUGIN_UI_LAYER');
+      const selRefused = await v145Tools.click('#__dsh_vc_takeover_btn__', 50);
+      assert.equal(selRefused.ok, false);
+      assert.equal(selRefused.blocked, 'PLUGIN_UI_LAYER');
+      const menuPass = await v145Tools.click('a#menu-link', 50);
+      assert.equal(menuPass.ok, true);
+      assert.equal(await safeEvaluate(v145Session.page, () => Number((window as any).__menuClicked || 0), 0, 0), 1);
+      assert.equal(await safeEvaluate(v145Session.page, () => getComputedStyle(document.getElementById('__dsh_vc_panel__')!).pointerEvents, '', 0), 'auto');
+    } finally {
+      await v145Session.close();
+    }
+
+    // 4) Full E2E with real mouse button pause (paused_by === 'button') -> real mouse continue (resumed_by === 'button') -> COMPLETED
+    let v145LlmCalls = 0;
+    const v145Host = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream() {
+            v145LlmCalls++;
+            const sess = v145Plugin.runner.getSharedSession() ?? v145Plugin.runner.getAllActiveSessions()[0];
+            if (v145LlmCalls === 1) {
+              assert.ok(sess);
+              const pt = await safeEvaluate(
+                sess.page,
+                () => {
+                  const b = document.getElementById('__dsh_vc_takeover_btn__')!.getBoundingClientRect();
+                  return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) };
+                },
+                { x: 0, y: 0 },
+                0
+              );
+              await sess.page.mouse.click(pt.x, pt.y);
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'scroll', deltaY: 100, reason: 'Step 1 before real button pause' }) };
+              yield { type: 'finish', reason: { kind: 'stop' } };
+              return;
+            }
+            yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'V145_FULL_BUTTON_LOOP_OK' }) };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const v145Plugin = apply(v145Host.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...v145Host.effectDisposers);
+    const v145RunDef = v145Host.registeredTools.get('browser_subagent_run')!;
+    try {
+      const pauseRun145: any = await v145RunDef.execute(
+        { url: `${srv.url}__layer-fixture.html`, role: 'v1.4.5 E2E', task_prompt: 'Verify button pause & resume full loop', max_steps: 4 },
+        fakeExec
+      );
+      assert.equal(pauseRun145.status, 'PAUSED_FOR_TAKEOVER');
+      const dPause145 = JSON.parse(fs.readFileSync(pauseRun145.diagnostics_path, 'utf8'));
+      assert.equal(dPause145.paused_by, 'button', `Expected paused_by==='button', got ${dPause145.paused_by}`);
+
+      const pausedSess145 = v145Plugin.runner.getPausedSession(pauseRun145.subagent_id)?.session;
+      assert.ok(pausedSess145);
+      const rBtnPt = await safeEvaluate(
+        pausedSess145.page,
+        () => {
+          const b = document.getElementById('__dsh_vc_takeover_btn__')!.getBoundingClientRect();
+          return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) };
+        },
+        { x: 0, y: 0 },
+        0
+      );
+      await pausedSess145.page.mouse.click(rBtnPt.x, rBtnPt.y);
+
+      let finalDiag145: any = null;
+      const d145End = Date.now() + 6000;
+      while (Date.now() < d145End) {
+        try {
+          const cur = JSON.parse(fs.readFileSync(pauseRun145.diagnostics_path, 'utf8'));
+          if (cur.status === 'COMPLETED') {
+            finalDiag145 = cur;
+            break;
+          }
+        } catch {}
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      assert.ok(finalDiag145, 'Expected v1.4.5 real button flow to reach COMPLETED');
+      assert.equal(finalDiag145.paused_by, 'button');
+      assert.equal(finalDiag145.resumed_by, 'button');
+      assert.equal(finalDiag145.planner_detail?.llm_steps?.length, 2);
+      assert.equal(v145Plugin.runner.getActiveResumeWatcherCount(), 0);
+    } finally {
+      await v145Plugin.runner.closeAllSessions();
+    }
+    console.log('[Strict DSH 0.2 Contract] 5w Verified non-leaking pill capsule, clickable running button, paused_by=button & resumed_by=button!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

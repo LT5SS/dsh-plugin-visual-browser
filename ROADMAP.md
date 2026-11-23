@@ -109,6 +109,13 @@
 
 ---
 
+## v1.4.5 已交付（状态条防穿透胶囊 + `running` 态红色「暂停并接管」真可点）
+
+- **P0 · 可见胶囊本体封闭不穿透**：外层 `#__dsh_vc_root__` 保持全屏 `pointer-events: none`，可见状态条胶囊 `#__dsh_vc_panel__` 在非 `hidden` 态默认开启 `pointer-events: auto` 并拦截点击冒泡，任何点击落在状态条文字或圆点上都不会穿透命中页面底层链接；同时 `clickSelector`（`#ref`/选择器点击）在命中非测试态插件胶囊时临时放行并通过 `try/finally` 立即复位，保证子代理点击被状态条挡住的网页控件不回归，而裸坐标点击（`clickAt`）仍严格返回 `blocked: 'PLUGIN_UI_LAYER'`。
+- **P0.5 · `running` 态按钮可点并更名**：运行态红色按钮改为 `pointer-events: auto` / `cursor: pointer`，文案由「按 F8 接管」更新为「暂停并接管」并附 `title` 热键说明，真实鼠标点击即可暂停并记录 `paused_by: 'button'`。
+
+---
+
 ## v2.0.0 规划（TODO）
 
 - **其余 4 + 1 固定只读探针与架构升级**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_region(x, y, radius, zoom)` 局部 2× 放大能力，并辅以相邻帧区域差异文本补偿。
