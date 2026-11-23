@@ -1,4 +1,4 @@
-# `dsh-plugin-visual-browser` (v1.4.3 — Idle-by-Default Takeover Pill, Fixed 3-State Copy & Exit Cleanup)
+# `dsh-plugin-visual-browser` (v1.4.4 — Clickable Paused「继续执行」Resume Button, Watcher/Binding Recovery & Pause Diagnostics)
 
 为 **DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`)** 打造的 **“可视化虚拟鼠标 + 视觉多模态走查 + 独立子代理（Subagent）隔离 + 100% 后台静默无打扰”** 浏览器插件。
 
@@ -23,6 +23,7 @@
    - **HUD 徽标防裁切、CSS 隔离与坐标同步**：顶层注入 UI 带作用域 CSS Reset（不受页面全局 `svg`/`div` margin/width 规则干扰），光标光环与箭头精确对齐落点，导航后宿主 `Virtual Cursor` 与页面徽标坐标实时保持一致；
    - 采用 Chromium `popover="manual"` Top-Layer 与 **点击前 `elementsFromPoint` 穿透层级命中测试**（穿透 Shadow DOM 与同源 iframe）：运行期右上角接管提示条默认 `pointer-events: none` 不挡下方 `Menu` 等站点元素；一旦任意点击落点命中处于顶层且可交互的插件 UI，立即拒绝派发真实 `mouse.click` 并返回 `{ ok: false, blocked: 'PLUGIN_UI_LAYER', hit }` 记录入 `diagnostics.json`；默认支持按 `F8`（可在设置自定义热键）随时触发人工接管。
    - **v1.4.3 接管状态条三态收敛（默认 `idle`）**：未运行子代理或经 `browser_quick_snapshot`、`browser_set_cursor_trail`、DSH 重启/手动刷新重新注入时，状态条默认进入 `idle`（`DSH 待命 · 窗口保持打开（无任务）`，隐藏右侧接管按钮且不响应 `F8`）；仅当活跃子代理运行中显示 `running`（`DSH Agent 运行中 · 按 F8 接管` + 红色「按 F8 接管」按钮），按下 `F8` 暂停后显示 `paused`（`已暂停 · 等待人工接管` + 「继续执行」按钮）；插件卸载或调用 `runner.closeAllSessions()` 时主动重置活跃窗口为 `idle` 并解除 `beforeunload` 守卫。
+   - **v1.4.4 暂停态「继续执行」按钮真恢复（Option C）**：`PAUSED_FOR_TAKEOVER` 期间状态条明确提示 `已暂停 · 等待人工接管（再按 F8 无效果，请点右侧或说「继续」）`；点击右上角「继续执行」按钮通过 `__dshRequestResume` 绑定与 500ms 插件侧 watcher（`paused` 时挂载、恢复/断连/`closeAllSessions()` 时回收）在 1 秒内原位续跑子代理，同时保留 `browser_subagent_resume` 工具通道并将 `paused_at` / `paused_by`（`'f8' | 'button' | 'gate'`）与 `resumed_at` / `resumed_by`（`'button' | 'tool'`）实时同步至 `diagnostics.json`。
    - **运行/暂停期关窗保护与 `SESSION_LOST` 安全恢复**：任务执行或 `PAUSED_FOR_TAKEOVER` 期间自动启用 `beforeunload` 守卫，回到 `idle` 或插件主动关闭会话前自动卸载；监听 `browser.on('disconnected')` 在窗口被手动关闭后清理挂起会话并向 `diagnostics.json` 追加 `browser_disconnected` 事件，后续调用 `browser_subagent_resume` 返回结构化 `SESSION_LOST` / `SESSION_NOT_FOUND` 状态而不再抛出裸 `Target closed` 异常。
      > ⚠️ **Chrome `beforeunload` 说明（非插件缺陷）**：Chrome 要求页面有过用户激活（如点击页面或按 `F8`）后才会弹出「离开此网站？」系统确认框，确认框文案由浏览器决定不可自定义，纯 headless 无窗口会话也不会弹窗；无论是否弹窗，关闭窗口后插件都会安全认账清理并在下次快照/运行自动重开窗口。
    - 支持 `?__dsh_test_center_pill=1` 测试开关，可将插件状态条临时居中用于验证 Top-Layer 遮挡拒点行为。
@@ -62,7 +63,7 @@
 > 💡 本包目前通过 GitHub Releases 分发（尚未发布至公共 npm registry，请勿直接运行不带 `link:` 的 `dsh plugin add dsh-plugin-visual-browser`）。
 
 ```bash
-# 1. 下载最新 Release zip (v1.4.3+) 并解压到你的插件目录，例如：
+# 1. 下载最新 Release zip (v1.4.4+) 并解压到你的插件目录，例如：
 #    <DSH_HOME>/plugins/dsh-plugin-visual-browser
 
 # 2. 进入插件目录，仅安装运行时依赖（playwright-core；dsh-tools 与 cordis 自动复用宿主版本，不要把私有副本装进 node_modules）

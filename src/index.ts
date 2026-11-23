@@ -949,22 +949,28 @@ export function createVisualBrowserTools(
         ),
       };
 
+      let diagWriteChain = Promise.resolve();
       const writeDiagnostics = async (
         payload: Record<string, unknown>
       ): Promise<string | undefined> => {
-        try {
-          const subagentDir = path.join(artifactRoot, subagentId);
-          const targetFile = path.join(subagentDir, 'diagnostics.json');
-          await fs.promises.mkdir(subagentDir, { recursive: true });
-          await fs.promises.writeFile(
-            targetFile,
-            JSON.stringify(toLosslessJson(payload), null, 2),
-            'utf8'
-          );
-          return targetFile.replace(/\\/g, '/');
-        } catch {
-          return undefined;
-        }
+        const subagentDir = path.join(artifactRoot, subagentId);
+        const targetFile = path.join(subagentDir, 'diagnostics.json');
+        let writtenPath: string | undefined;
+        diagWriteChain = diagWriteChain.then(async () => {
+          try {
+            await fs.promises.mkdir(subagentDir, { recursive: true });
+            await fs.promises.writeFile(
+              targetFile,
+              JSON.stringify(toLosslessJson(payload), null, 2),
+              'utf8'
+            );
+            writtenPath = targetFile.replace(/\\/g, '/');
+          } catch {
+            writtenPath = undefined;
+          }
+        });
+        await diagWriteChain;
+        return writtenPath;
       };
 
       const effectiveWindowMode = getLiveWindowMode(args.window_mode as BrowserWindowMode | undefined);
@@ -1044,6 +1050,26 @@ export function createVisualBrowserTools(
               });
             }
           },
+          onDiagnosticsUpdate: async (update) => {
+            await writeDiagnostics({
+              timestamp: new Date().toISOString(),
+              status: update.status,
+              ...(update.result?.reason ? { reason: update.result.reason } : {}),
+              ...(update.pausedAt ? { paused_at: update.pausedAt } : {}),
+              ...(update.pausedBy ? { paused_by: update.pausedBy } : {}),
+              ...(update.resumedAt ? { resumed_at: update.resumedAt } : {}),
+              ...(update.resumedBy ? { resumed_by: update.resumedBy } : {}),
+              subagent_id: update.subagentId,
+              window_mode: effectiveWindowMode,
+              ...(update.navigation ? { navigation: update.navigation } : {}),
+              planner_mode: tracker.effectiveMode,
+              planner_detail: buildPlannerDetail(),
+              host_services: hostServicesStatus,
+              ...(update.contextStats ? { steps: update.contextStats } : {}),
+              ...(update.findings ? { findings: update.findings } : {}),
+              ...(update.hostFacts ? { host_facts: update.hostFacts } : {}),
+            });
+          },
           planner,
         });
 
@@ -1054,20 +1080,28 @@ export function createVisualBrowserTools(
         );
 
         const plannerDetail = buildPlannerDetail();
-        const diagnosticsPath = await writeDiagnostics({
-          timestamp: new Date().toISOString(),
-          status: res.status,
-          ...(res.reason ? { reason: res.reason } : {}),
-          subagent_id: res.subagentId,
-          window_mode: effectiveWindowMode,
-          ...(res.navigation ? { navigation: res.navigation } : {}),
-          planner_mode: tracker.effectiveMode,
-          planner_detail: plannerDetail,
-          host_services: hostServicesStatus,
-          steps: res.contextStats,
-          findings: res.findings ?? [],
-          host_facts: res.hostFacts,
-        });
+        const stalePauseAfterButtonResume =
+          res.status === 'PAUSED_FOR_TAKEOVER' && runner.isResumingOrCompleted(subagentId);
+        const diagnosticsPath = stalePauseAfterButtonResume
+          ? path.join(artifactRoot, subagentId, 'diagnostics.json').replace(/\\/g, '/')
+          : await writeDiagnostics({
+              timestamp: new Date().toISOString(),
+              status: res.status,
+              ...(res.reason ? { reason: res.reason } : {}),
+              ...(res.pausedAt ? { paused_at: res.pausedAt } : {}),
+              ...(res.pausedBy ? { paused_by: res.pausedBy } : {}),
+              ...(res.resumedAt ? { resumed_at: res.resumedAt } : {}),
+              ...(res.resumedBy ? { resumed_by: res.resumedBy } : {}),
+              subagent_id: res.subagentId,
+              window_mode: effectiveWindowMode,
+              ...(res.navigation ? { navigation: res.navigation } : {}),
+              planner_mode: tracker.effectiveMode,
+              planner_detail: plannerDetail,
+              host_services: hostServicesStatus,
+              steps: res.contextStats,
+              findings: res.findings ?? [],
+              host_facts: res.hostFacts,
+            });
 
         if (res.status === 'PAUSED_FOR_TAKEOVER') {
           try {

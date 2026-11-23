@@ -102,6 +102,13 @@
 
 ---
 
+## v1.4.4 已交付（暂停态「继续执行」按钮真恢复 + F8 提示 + 暂停/恢复诊断落盘）
+
+- **方案 C（绑定即时通知 + 500ms 插件侧 watcher 兜底）**：页面在 `paused` 态点击「继续执行」触发 `window.__dshResumeRequested = true` 与 `__dshRequestResume()` 并立即将状态条切回 `running`；宿主 `BrowserSubagentRunner` 通过 `resumeWatchers` 接管后在 1 秒内调用 `resumeTask` 真正推进后续 `llm_steps`；仍完全兼容不点按钮而通过 `browser_subagent_resume` 恢复的原有通道（若按钮先完成，`browser_subagent_resume` 返回已缓存结果），并在窗口断连、恢复或 `closeAllSessions()` 时彻底清除定时器与监听器。
+- **F8 暂停防误解文案与诊断增强**：`paused` 态状态条提示 `已暂停 · 等待人工接管（再按 F8 无效果，请点右侧或说「继续」）`；`diagnostics.json` 在暂停/恢复/完成阶段串行写入 `paused_at`、`paused_by`（`'f8' | 'button' | 'gate'`）、`resumed_at`、`resumed_by`（`'button' | 'tool'`）与完整 `llm_steps`。
+
+---
+
 ## v2.0.0 规划（TODO）
 
 - **其余 4 + 1 固定只读探针与架构升级**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_region(x, y, radius, zoom)` 局部 2× 放大能力，并辅以相邻帧区域差异文本补偿。

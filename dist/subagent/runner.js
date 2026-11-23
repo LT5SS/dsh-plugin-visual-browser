@@ -873,6 +873,9 @@ export class BrowserSubagentRunner {
     lostSessions = new Map();
     watchedSessions = new WeakSet();
     activeSessions = new Set();
+    resumeWatchers = new Map();
+    inFlightResumes = new Map();
+    completedButtonResumes = new Map();
     sharedSession = null;
     sharedSessionBusy = false;
     buildFallbackHostFacts(subagentId, role, latestScreenshot = null) {
@@ -990,6 +993,7 @@ export class BrowserSubagentRunner {
             if (paused.session !== session)
                 continue;
             this.pausedSessions.delete(id);
+            this.stopResumeWatcher(id);
             const { hostFacts, hostFactsBlock } = this.safeReadHostFacts(paused);
             const contextStats = this.safeReadContextStats(paused);
             this.recordLostSession({
@@ -1048,6 +1052,127 @@ export class BrowserSubagentRunner {
     }
     getPausedSessionCount() {
         return this.pausedSessions.size;
+    }
+    getActiveResumeWatcherCount() {
+        return this.resumeWatchers.size;
+    }
+    isResumingOrCompleted(subagentId) {
+        return this.inFlightResumes.has(subagentId) || this.completedButtonResumes.has(subagentId);
+    }
+    stopResumeWatcher(subagentId) {
+        const entry = this.resumeWatchers.get(subagentId);
+        if (!entry)
+            return;
+        this.resumeWatchers.delete(subagentId);
+        clearInterval(entry.timer);
+        try {
+            entry.offBinding();
+        }
+        catch {
+            // ignore unbind error
+        }
+    }
+    stopAllResumeWatchers() {
+        for (const id of [...this.resumeWatchers.keys()]) {
+            this.stopResumeWatcher(id);
+        }
+    }
+    startResumeWatcher(subagentId, session) {
+        this.stopResumeWatcher(subagentId);
+        const offBinding = session.addResumeListener(() => {
+            this.handleResumeSignal(subagentId);
+        });
+        let polling = false;
+        const timer = setInterval(() => {
+            if (polling)
+                return;
+            if (!this.pausedSessions.has(subagentId) || !session.isAlive()) {
+                this.stopResumeWatcher(subagentId);
+                return;
+            }
+            polling = true;
+            void session
+                .checkAndClearResumeRequested()
+                .then((want) => {
+                if (want) {
+                    this.handleResumeSignal(subagentId);
+                }
+            })
+                .catch(() => { })
+                .finally(() => {
+                polling = false;
+            });
+        }, 500);
+        timer.unref?.();
+        this.resumeWatchers.set(subagentId, { timer, offBinding });
+    }
+    handleResumeSignal(subagentId) {
+        if (this.inFlightResumes.has(subagentId) || !this.pausedSessions.has(subagentId))
+            return;
+        this.stopResumeWatcher(subagentId);
+        void this.resumeTask(subagentId, 'Resumed via in-page continue button', undefined, { trigger: 'button' })
+            .then((res) => {
+            if (res.status !== 'PAUSED_FOR_TAKEOVER') {
+                this.completedButtonResumes.set(subagentId, res);
+                if (this.completedButtonResumes.size > 50) {
+                    const oldestKey = this.completedButtonResumes.keys().next().value;
+                    if (oldestKey)
+                        this.completedButtonResumes.delete(oldestKey);
+                }
+            }
+        })
+            .catch(() => {
+            // background button resume failure is isolated to diagnostics/session state
+        });
+    }
+    async emitDiagnosticsUpdate(req, update) {
+        if (req.onDiagnosticsUpdate) {
+            try {
+                await req.onDiagnosticsUpdate(update);
+            }
+            catch {
+                // diagnostics hook must never break execution
+            }
+            return;
+        }
+        if (!req.artifactDir)
+            return;
+        try {
+            const subagentDir = path.join(req.artifactDir, update.subagentId);
+            const targetFile = path.join(subagentDir, 'diagnostics.json');
+            await fs.promises.mkdir(subagentDir, { recursive: true });
+            let existing = {};
+            if (fs.existsSync(targetFile)) {
+                try {
+                    const parsed = JSON.parse(await fs.promises.readFile(targetFile, 'utf8'));
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                        existing = parsed;
+                    }
+                }
+                catch {
+                    existing = {};
+                }
+            }
+            const nextPayload = {
+                ...existing,
+                timestamp: new Date().toISOString(),
+                status: update.status,
+                subagent_id: update.subagentId,
+                ...(update.result?.reason ? { reason: update.result.reason } : {}),
+                ...(update.pausedAt ? { paused_at: update.pausedAt } : {}),
+                ...(update.pausedBy ? { paused_by: update.pausedBy } : {}),
+                ...(update.resumedAt ? { resumed_at: update.resumedAt } : {}),
+                ...(update.resumedBy ? { resumed_by: update.resumedBy } : {}),
+                ...(update.navigation ? { navigation: update.navigation } : {}),
+                ...(update.contextStats ? { steps: update.contextStats } : {}),
+                ...(update.findings ? { findings: update.findings } : {}),
+                ...(update.hostFacts ? { host_facts: update.hostFacts } : {}),
+            };
+            await fs.promises.writeFile(targetFile, JSON.stringify(nextPayload, null, 2), 'utf8');
+        }
+        catch {
+            // ignore disk write errors in fallback diagnostics writer
+        }
     }
     getSharedSession() {
         if (this.sharedSession && !this.sharedSession.isAlive()) {
@@ -1136,6 +1261,8 @@ export class BrowserSubagentRunner {
         }
     }
     async closeAllSessions() {
+        this.stopAllResumeWatchers();
+        this.completedButtonResumes.clear();
         const sessionsToClose = new Set();
         for (const state of this.pausedSessions.values()) {
             if (state.session)
@@ -1246,8 +1373,21 @@ export class BrowserSubagentRunner {
             req.signal?.removeEventListener('abort', onAbort);
         }
     }
-    async resumeTask(subagentId, userFollowupNote = 'Human takeover completed. Continue the task.', signal) {
+    async resumeTask(subagentId, userFollowupNote = 'Human takeover completed. Continue the task.', signal, opts) {
         signal?.throwIfAborted();
+        const resumedBy = opts?.trigger ?? 'tool';
+        if (resumedBy === 'tool') {
+            const inFlight = this.inFlightResumes.get(subagentId);
+            if (inFlight) {
+                return await inFlight;
+            }
+            const completed = this.completedButtonResumes.get(subagentId);
+            if (completed) {
+                this.completedButtonResumes.delete(subagentId);
+                return completed;
+            }
+        }
+        this.stopResumeWatcher(subagentId);
         const paused = this.pausedSessions.get(subagentId);
         if (!paused) {
             const lost = this.lostSessions.get(subagentId);
@@ -1297,45 +1437,90 @@ export class BrowserSubagentRunner {
             void session.close().catch(() => { });
         };
         signal?.addEventListener('abort', onAbort, { once: true });
-        try {
-            await session.resetHumanTakeoverRequest();
-            await session.motion.setUnloadGuard(true).catch(() => { });
-            if (req.sessionOptions?.showTakeoverControl ?? session.resolvedWindowMode !== 'headless') {
-                await session.motion.setTakeoverState('running', req.role).catch(() => { });
+        const resumedAt = new Date().toISOString();
+        let runPromise;
+        runPromise = (async () => {
+            try {
+                await session.resetHumanTakeoverRequest();
+                await session.checkAndClearResumeRequested().catch(() => false);
+                await session.motion.setUnloadGuard(true).catch(() => { });
+                if (req.sessionOptions?.showTakeoverControl ?? session.resolvedWindowMode !== 'headless') {
+                    await session.motion.setTakeoverState('running', req.role).catch(() => { });
+                }
+                await this.emitDiagnosticsUpdate(req, {
+                    phase: 'resuming',
+                    status: 'RUNNING',
+                    subagentId,
+                    pausedAt: paused.pausedAt,
+                    pausedBy: paused.pausedBy,
+                    resumedAt,
+                    resumedBy,
+                    hostFacts: hostFacts.getFacts(),
+                    contextStats: history.getStats(),
+                    findings: findingsLedger.getFindings(),
+                    navigation: paused.latestNavigation,
+                });
+                const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
+                signal?.throwIfAborted();
+                hostFacts.recordStep(postTakeoverObs.screenshotPath);
+                history.pushObservation(`Resumed after human takeover (${userFollowupNote})`, postTakeoverObs, tools.sampler.formatObservationForLLM(postTakeoverObs));
+                findingsLedger.record(Math.max(0, nextStep - 1), postTakeoverObs, 'resume');
+                const loopRes = await this.executeLoop({
+                    subagentId,
+                    req,
+                    session,
+                    tools,
+                    hostFacts,
+                    history,
+                    findingsLedger,
+                    planner,
+                    nextStep,
+                    maxSteps,
+                    latestObs: postTakeoverObs,
+                    latestNavigation: paused.latestNavigation,
+                    isSharedSession: false,
+                });
+                const finalRes = {
+                    ...loopRes,
+                    pausedAt: loopRes.pausedAt ?? paused.pausedAt,
+                    pausedBy: loopRes.pausedBy ?? paused.pausedBy,
+                    resumedAt,
+                    resumedBy,
+                };
+                await this.emitDiagnosticsUpdate(req, {
+                    phase: finalRes.status === 'PAUSED_FOR_TAKEOVER' ? 'paused' : 'finished',
+                    status: finalRes.status,
+                    subagentId,
+                    pausedAt: finalRes.pausedAt,
+                    pausedBy: finalRes.pausedBy,
+                    resumedAt,
+                    resumedBy,
+                    result: finalRes,
+                    hostFacts: finalRes.hostFacts,
+                    contextStats: finalRes.contextStats,
+                    findings: finalRes.findings ?? [],
+                    navigation: finalRes.navigation ?? paused.latestNavigation,
+                });
+                return finalRes;
             }
-            const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
-            signal?.throwIfAborted();
-            hostFacts.recordStep(postTakeoverObs.screenshotPath);
-            history.pushObservation(`Resumed after human takeover (${userFollowupNote})`, postTakeoverObs, tools.sampler.formatObservationForLLM(postTakeoverObs));
-            findingsLedger.record(Math.max(0, nextStep - 1), postTakeoverObs, 'resume');
-            return await this.executeLoop({
-                subagentId,
-                req,
-                session,
-                tools,
-                hostFacts,
-                history,
-                findingsLedger,
-                planner,
-                nextStep,
-                maxSteps,
-                latestObs: postTakeoverObs,
-                latestNavigation: paused.latestNavigation,
-                isSharedSession: false,
-            });
-        }
-        catch (err) {
-            if (!signal?.aborted && (!session.isAlive() || isNavigationRaceError(err))) {
-                const { hostFacts: safeFacts, hostFactsBlock: safeBlock } = this.safeReadHostFacts(paused);
-                const safeStats = this.safeReadContextStats(paused);
-                this.writeSessionLostDiagnostics(req.artifactDir, subagentId, new Date().toISOString(), 'user_closed_window');
-                return this.buildSessionLostResult(subagentId, req.role, safeFacts, safeBlock, safeStats, paused.findingsLedger?.getFindings?.() ?? []);
+            catch (err) {
+                if (!signal?.aborted && (!session.isAlive() || isNavigationRaceError(err))) {
+                    const { hostFacts: safeFacts, hostFactsBlock: safeBlock } = this.safeReadHostFacts(paused);
+                    const safeStats = this.safeReadContextStats(paused);
+                    this.writeSessionLostDiagnostics(req.artifactDir, subagentId, new Date().toISOString(), 'user_closed_window');
+                    return this.buildSessionLostResult(subagentId, req.role, safeFacts, safeBlock, safeStats, paused.findingsLedger?.getFindings?.() ?? []);
+                }
+                throw err;
             }
-            throw err;
-        }
-        finally {
-            signal?.removeEventListener('abort', onAbort);
-        }
+            finally {
+                signal?.removeEventListener('abort', onAbort);
+                if (this.inFlightResumes.get(subagentId) === runPromise) {
+                    this.inFlightResumes.delete(subagentId);
+                }
+            }
+        })();
+        this.inFlightResumes.set(subagentId, runPromise);
+        return await runPromise;
     }
     async executeLoop(state) {
         const { subagentId, req, session, tools, hostFacts, history, findingsLedger, planner, maxSteps, isSharedSession, } = state;
@@ -1346,6 +1531,12 @@ export class BrowserSubagentRunner {
         let lastStaleTarget = null;
         let sameStaleCount = 0;
         const pauseNow = async (nextStep, reason, url, details) => {
+            const pausedAt = new Date().toISOString();
+            const pausedBy = reason === 'USER_TAKEOVER'
+                ? session.getHumanTakeoverSource() === 'button'
+                    ? 'button'
+                    : 'f8'
+                : 'gate';
             keepSessionAlive = true;
             this.detachSharedSessionForTakeover(session);
             this.watchSessionDisconnect(session);
@@ -1363,7 +1554,10 @@ export class BrowserSubagentRunner {
                 nextStep,
                 maxSteps,
                 latestNavigation,
+                pausedAt,
+                pausedBy,
             });
+            this.startResumeWatcher(subagentId, session);
             const card = buildApprovalCard({
                 subagentId,
                 role: req.role,
@@ -1372,7 +1566,7 @@ export class BrowserSubagentRunner {
                 screenshotPath: latestObs.screenshotPath,
                 details,
             });
-            return {
+            const pausedRes = {
                 subagentId,
                 role: req.role,
                 status: 'PAUSED_FOR_TAKEOVER',
@@ -1382,8 +1576,25 @@ export class BrowserSubagentRunner {
                 contextStats: history.getStats(),
                 findings: findingsLedger.getFindings(),
                 approvalCard: card,
+                pausedAt,
+                pausedBy,
                 ...(latestNavigation ? { navigation: latestNavigation } : {}),
             };
+            if (!req.onDiagnosticsUpdate) {
+                await this.emitDiagnosticsUpdate(req, {
+                    phase: 'paused',
+                    status: 'PAUSED_FOR_TAKEOVER',
+                    subagentId,
+                    pausedAt,
+                    pausedBy,
+                    result: pausedRes,
+                    hostFacts: pausedRes.hostFacts,
+                    contextStats: pausedRes.contextStats,
+                    findings: pausedRes.findings,
+                    navigation: pausedRes.navigation,
+                });
+            }
+            return pausedRes;
         };
         try {
             for (let step = state.nextStep; step <= maxSteps; step++) {
@@ -1605,7 +1816,18 @@ export class BrowserSubagentRunner {
         }
         finally {
             if (!keepSessionAlive) {
-                await this.releaseReusableSession(session, Boolean(req.keepWindowOpen && isSharedSession && !req.signal?.aborted));
+                let shouldKeepAlive = Boolean(req.keepWindowOpen && isSharedSession && !req.signal?.aborted);
+                if (!shouldKeepAlive &&
+                    req.keepWindowOpen &&
+                    !req.signal?.aborted &&
+                    session.isAlive() &&
+                    !isSharedSession &&
+                    !this.getSharedSession()) {
+                    this.sharedSession = session;
+                    this.sharedSessionBusy = true;
+                    shouldKeepAlive = true;
+                }
+                await this.releaseReusableSession(session, shouldKeepAlive);
             }
         }
     }

@@ -3723,7 +3723,7 @@ async function main() {
         0
       );
       assert.equal(pausedPill?.takeoverMode, 'paused');
-      assert.equal(pausedPill?.text, '已暂停 · 等待人工接管');
+      assert.ok(String(pausedPill?.text ?? '').startsWith('已暂停 · 等待人工接管'), `Unexpected paused text: ${pausedPill?.text}`);
       assert.notEqual(pausedPill?.btnDisplay, 'none');
       assert.equal(pausedPill?.btnText, '继续执行');
       assert.equal(pausedPill?.btnPointerEvents, 'auto');
@@ -3864,6 +3864,205 @@ async function main() {
       fs.rmSync(cdpProfile, { recursive: true, force: true });
     }
     console.log('[Strict DSH 0.2 Contract] 5u Verified idle-by-default takeover pill, 3-state copy & closeAllSessions() cleanup!');
+
+    // 5v. TASK-v1.4.4 Option C: Paused '继续执行' button actually resumes via binding + 500ms watcher, updates diagnostics.json & clears watchers on closeAllSessions()
+    let v144LlmCalls = 0;
+    const v144Host = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream() {
+            v144LlmCalls++;
+            const sess = v144Plugin.runner.getSharedSession() ?? v144Plugin.runner.getAllActiveSessions()[0];
+            if (v144LlmCalls === 1) {
+              assert.ok(sess, 'Expected active session during v1.4.4 step 1');
+              await sess.page.keyboard.press('F8');
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'scroll', deltaY: 120, reason: 'Step 1 scroll before F8 pause' }) };
+              yield { type: 'finish', reason: { kind: 'stop' } };
+              return;
+            }
+            if (v144LlmCalls === 2) {
+              // Brief pause on resumed step 2 so diagnostics.json RUNNING transition is observable
+              await new Promise((r) => setTimeout(r, 260));
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'V144_BTN_RESUME_OK' }) };
+              yield { type: 'finish', reason: { kind: 'stop' } };
+              return;
+            }
+            if (v144LlmCalls === 3 || v144LlmCalls === 5) {
+              assert.ok(sess, 'Expected active session for pause cycle');
+              await sess.page.keyboard.press('F8');
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'scroll', deltaY: 100, reason: 'Pause for tool/poll check' }) };
+              yield { type: 'finish', reason: { kind: 'stop' } };
+              return;
+            }
+            yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: `V144_STEP_${v144LlmCalls}_OK` }) };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const v144Plugin = apply(v144Host.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: true,
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...v144Host.effectDisposers);
+    const v144RunDef = v144Host.registeredTools.get('browser_subagent_run')!;
+    const v144ResumeDef = v144Host.registeredTools.get('browser_subagent_resume')!;
+    try {
+      // 1) Run step 1 -> F8 pause -> real Playwright click on '继续执行'
+      const pRun1: any = await v144RunDef.execute(
+        { url: `${srv.url}__layer-fixture.html`, role: 'v1.4.4 Button QA', task_prompt: 'Test continuing via button click', max_steps: 4 },
+        fakeExec
+      );
+      assert.equal(pRun1.status, 'PAUSED_FOR_TAKEOVER');
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 1);
+      const pausedDiag1 = JSON.parse(fs.readFileSync(pRun1.diagnostics_path, 'utf8'));
+      assert.equal(pausedDiag1.status, 'PAUSED_FOR_TAKEOVER');
+      assert.equal(pausedDiag1.paused_by, 'f8');
+      assert.ok(pausedDiag1.paused_at);
+      assert.equal(pausedDiag1.planner_detail?.llm_steps?.length, 1);
+
+      const pausedSess1 = v144Plugin.runner.getPausedSession(pRun1.subagent_id)?.session;
+      assert.ok(pausedSess1);
+      const pillBeforeClick = await safeEvaluate(
+        pausedSess1.page,
+        () => ({
+          text: document.getElementById('__dsh_vc_status_text__')?.textContent ?? '',
+          btnText: document.getElementById('__dsh_vc_takeover_btn__')?.textContent ?? '',
+        }),
+        { text: '', btnText: '' },
+        0
+      );
+      assert.ok(pillBeforeClick.text.startsWith('已暂停 · 等待人工接管'));
+      assert.ok(pillBeforeClick.text.includes('再按 F8 无效果'));
+      assert.equal(pillBeforeClick.btnText, '继续执行');
+
+      const clickT0 = Date.now();
+      await pausedSess1.page.locator('#__dsh_vc_takeover_btn__').click();
+      const immediatePill = await safeEvaluate(
+        pausedSess1.page,
+        () => ({
+          mode: (window as any).__dshCursorAPI?.getState?.()?.takeoverMode ?? '',
+          text: document.getElementById('__dsh_vc_status_text__')?.textContent ?? '',
+        }),
+        { mode: '', text: '' },
+        0
+      );
+      assert.equal(immediatePill.mode, 'running');
+      assert.ok(immediatePill.text.includes('DSH Agent 运行中'));
+
+      let leftPausedMs = -1;
+      let sawRunningDiag = false;
+      let finalDiag1: any = null;
+      const pollDeadline = Date.now() + 6000;
+      while (Date.now() < pollDeadline) {
+        try {
+          const cur = JSON.parse(fs.readFileSync(pRun1.diagnostics_path, 'utf8'));
+          if (cur.status !== 'PAUSED_FOR_TAKEOVER' && leftPausedMs < 0) {
+            leftPausedMs = Date.now() - clickT0;
+          }
+          if (cur.status === 'RUNNING') sawRunningDiag = true;
+          if (cur.status === 'COMPLETED') {
+            finalDiag1 = cur;
+            break;
+          }
+        } catch {}
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      assert.ok(leftPausedMs >= 0 && leftPausedMs < 1000, `Expected diagnostics to leave PAUSED_FOR_TAKEOVER within 1s, took ${leftPausedMs}ms`);
+      assert.equal(sawRunningDiag, true, 'Expected intermediate status=RUNNING in diagnostics.json during resumed step');
+      assert.ok(finalDiag1, 'Expected final diagnostics.json status=COMPLETED');
+      assert.equal(finalDiag1.resumed_by, 'button');
+      assert.ok(finalDiag1.resumed_at);
+      assert.equal(finalDiag1.planner_detail?.llm_steps?.length, 2, 'Expected llm_steps to grow from 1 to 2 after button resume');
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 0);
+      assert.equal(v144Plugin.runner.getPausedSessionCount(), 0);
+
+      // Shared session re-adopted & reset to idle
+      const sharedAfterClick = v144Plugin.runner.getSharedSession();
+      assert.ok(sharedAfterClick && sharedAfterClick.isAlive());
+      const afterIdleMode = await safeEvaluate(
+        sharedAfterClick.page,
+        () => (window as any).__dshCursorAPI?.getState?.()?.takeoverMode ?? '',
+        '',
+        0
+      );
+      assert.equal(afterIdleMode, 'idle');
+
+      // Subsequent tool resume returns the cached COMPLETED result instead of SESSION_NOT_FOUND
+      const cachedResumeVal: any = await v144ResumeDef.execute({ subagent_id: pRun1.subagent_id }, fakeExec);
+      assert.equal(cachedResumeVal.status, 'COMPLETED');
+      assert.ok(String(cachedResumeVal.subagent_report).includes('V144_BTN_RESUME_OK'));
+
+      // 2) Tool resume still works when user does NOT click the button
+      const pRun2: any = await v144RunDef.execute(
+        { url: `${srv.url}__layer-fixture.html`, role: 'v1.4.4 Tool QA', task_prompt: 'Pause then resume via tool', max_steps: 4 },
+        fakeExec
+      );
+      assert.equal(pRun2.status, 'PAUSED_FOR_TAKEOVER');
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 1);
+      const toolResumeVal: any = await v144ResumeDef.execute({ subagent_id: pRun2.subagent_id, resume_note: 'Continue via tool' }, fakeExec);
+      assert.equal(toolResumeVal.status, 'COMPLETED');
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 0);
+      const finalDiag2 = JSON.parse(fs.readFileSync(pRun2.diagnostics_path, 'utf8'));
+      assert.equal(finalDiag2.status, 'COMPLETED');
+      assert.equal(finalDiag2.resumed_by, 'tool');
+
+      // 3) Pure 500ms interval fallback + closeAllSessions() clears active watchers when paused
+      const pRun3: any = await v144RunDef.execute(
+        { url: `${srv.url}__layer-fixture.html`, role: 'v1.4.4 Poll QA', task_prompt: 'Pause then set flag directly', max_steps: 4 },
+        fakeExec
+      );
+      assert.equal(pRun3.status, 'PAUSED_FOR_TAKEOVER');
+      const pausedSess3 = v144Plugin.runner.getPausedSession(pRun3.subagent_id)?.session;
+      assert.ok(pausedSess3);
+      await safeEvaluate(pausedSess3.page, () => { (window as any).__dshResumeRequested = true; }, undefined, 0);
+      let diag3Done: any = null;
+      const poll3Deadline = Date.now() + 2500;
+      while (Date.now() < poll3Deadline) {
+        try {
+          const cur3 = JSON.parse(fs.readFileSync(pRun3.diagnostics_path, 'utf8'));
+          if (cur3.status === 'COMPLETED') {
+            diag3Done = cur3;
+            break;
+          }
+        } catch {}
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      assert.ok(diag3Done, 'Expected 500ms watcher polling to resume and complete');
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 0);
+
+      // Pause and verify closeAllSessions() cleans up watcher
+      await v144Plugin.runner.runTask({
+        subagentId: 'v144-unload-watcher',
+        startUrl: `${srv.url}__layer-fixture.html`,
+        role: 'v1.4.4 Unload',
+        taskPrompt: 'Pause for unload watcher cleanup',
+        maxSteps: 3,
+        artifactDir,
+        keepWindowOpen: true,
+        sessionOptions: { mode: 'auto', windowMode: 'headless', keepWindowOpen: true, showTakeoverControl: true, takeoverHotkey: 'F8' },
+        planner: async () => {
+          const s = v144Plugin.runner.getSharedSession();
+          await s!.page.keyboard.press('F8');
+          return { type: 'scroll', deltaY: 50, reason: 'Pause for closeAllSessions' };
+        },
+      });
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 1);
+      await v144Plugin.runner.closeAllSessions();
+      assert.equal(v144Plugin.runner.getActiveResumeWatcherCount(), 0);
+      assert.equal(v144Plugin.runner.getPausedSessionCount(), 0);
+    } finally {
+      await v144Plugin.runner.closeAllSessions();
+    }
+    console.log('[Strict DSH 0.2 Contract] 5v Verified Option C continue-button resume (binding + 500ms watcher), diagnostics & watcher cleanup!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

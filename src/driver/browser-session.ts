@@ -65,12 +65,15 @@ export class BrowserSession {
   private isAttachedCDP = false;
   private ephemeralProfileDir?: string;
   private humanTakeoverRequested = false;
+  private humanTakeoverSource: 'f8' | 'button' | string | null = null;
   private takeoverBindingInstalled = false;
+  private resumeBindingInstalled = false;
   private styleBindingInstalled = false;
   private closingIntentionally = false;
   private navigatingViaSession = false;
   private lastMainFrameDocUrl = '';
   private disconnectListeners = new Set<() => void>();
+  private resumeListeners = new Set<() => void>();
 
   constructor(opts: BrowserSessionOptions = {}) {
     const resolvedWindowMode = resolveBrowserWindowMode(opts);
@@ -131,21 +134,59 @@ export class BrowserSession {
   public async checkHumanTakeoverRequested(): Promise<boolean> {
     if (this.humanTakeoverRequested) return true;
     if (!this.page) return false;
-    const flag = await safeEvaluate(
+    const probed = await safeEvaluate<{ requested: boolean; source: string | null }>(
       this.page,
-      () => Boolean((window as any).__dshTakeoverRequested),
-      false,
+      () => ({
+        requested: Boolean((window as any).__dshTakeoverRequested),
+        source:
+          typeof (window as any).__dshTakeoverSource === 'string' &&
+          (window as any).__dshTakeoverSource.trim()
+            ? String((window as any).__dshTakeoverSource).trim()
+            : null,
+      }),
+      { requested: false, source: null },
       0
-    ).catch(() => false);
-    if (flag) {
+    ).catch(() => ({ requested: false, source: null }));
+    if (probed.requested) {
       this.humanTakeoverRequested = true;
+      if (probed.source) {
+        this.humanTakeoverSource = probed.source;
+      }
     }
     return this.humanTakeoverRequested;
   }
 
+  public getHumanTakeoverSource(): 'f8' | 'button' | string | null {
+    return this.humanTakeoverSource;
+  }
+
   public async resetHumanTakeoverRequest(): Promise<void> {
     this.humanTakeoverRequested = false;
+    this.humanTakeoverSource = null;
     await this.motion?.resetTakeoverRequest().catch(() => {});
+  }
+
+  public addResumeListener(listener: () => void): () => void {
+    this.resumeListeners.add(listener);
+    return () => {
+      this.resumeListeners.delete(listener);
+    };
+  }
+
+  public async checkAndClearResumeRequested(): Promise<boolean> {
+    if (!this.isAlive() || !this.page) return false;
+    return await safeEvaluate<boolean>(
+      this.page,
+      () => {
+        if ((window as any).__dshResumeRequested) {
+          (window as any).__dshResumeRequested = false;
+          return true;
+        }
+        return false;
+      },
+      false,
+      0
+    ).catch(() => false);
   }
 
   public async start(): Promise<this> {
@@ -245,13 +286,32 @@ export class BrowserSession {
     await this.context.addInitScript(initScript);
     if (!this.takeoverBindingInstalled) {
       try {
-        await this.context.exposeBinding('__dshRequestTakeover', () => {
+        await this.context.exposeBinding('__dshRequestTakeover', (_source: unknown, trigger?: unknown) => {
           this.humanTakeoverRequested = true;
+          if (typeof trigger === 'string' && trigger.trim()) {
+            this.humanTakeoverSource = trigger.trim();
+          }
         });
       } catch {
         /* ignore if binding already registered on reused external CDP context */
       }
       this.takeoverBindingInstalled = true;
+    }
+    if (!this.resumeBindingInstalled) {
+      try {
+        await this.context.exposeBinding('__dshRequestResume', () => {
+          for (const cb of [...this.resumeListeners]) {
+            try {
+              cb();
+            } catch {
+              // ignore resume listener errors
+            }
+          }
+        });
+      } catch {
+        /* ignore if binding already registered on reused external CDP context */
+      }
+      this.resumeBindingInstalled = true;
     }
     if (!this.styleBindingInstalled) {
       try {

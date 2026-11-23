@@ -45,12 +45,15 @@ export class BrowserSession {
     isAttachedCDP = false;
     ephemeralProfileDir;
     humanTakeoverRequested = false;
+    humanTakeoverSource = null;
     takeoverBindingInstalled = false;
+    resumeBindingInstalled = false;
     styleBindingInstalled = false;
     closingIntentionally = false;
     navigatingViaSession = false;
     lastMainFrameDocUrl = '';
     disconnectListeners = new Set();
+    resumeListeners = new Set();
     constructor(opts = {}) {
         const resolvedWindowMode = resolveBrowserWindowMode(opts);
         this.resolvedWindowMode = resolvedWindowMode;
@@ -114,15 +117,45 @@ export class BrowserSession {
             return true;
         if (!this.page)
             return false;
-        const flag = await safeEvaluate(this.page, () => Boolean(window.__dshTakeoverRequested), false, 0).catch(() => false);
-        if (flag) {
+        const probed = await safeEvaluate(this.page, () => ({
+            requested: Boolean(window.__dshTakeoverRequested),
+            source: typeof window.__dshTakeoverSource === 'string' &&
+                window.__dshTakeoverSource.trim()
+                ? String(window.__dshTakeoverSource).trim()
+                : null,
+        }), { requested: false, source: null }, 0).catch(() => ({ requested: false, source: null }));
+        if (probed.requested) {
             this.humanTakeoverRequested = true;
+            if (probed.source) {
+                this.humanTakeoverSource = probed.source;
+            }
         }
         return this.humanTakeoverRequested;
     }
+    getHumanTakeoverSource() {
+        return this.humanTakeoverSource;
+    }
     async resetHumanTakeoverRequest() {
         this.humanTakeoverRequested = false;
+        this.humanTakeoverSource = null;
         await this.motion?.resetTakeoverRequest().catch(() => { });
+    }
+    addResumeListener(listener) {
+        this.resumeListeners.add(listener);
+        return () => {
+            this.resumeListeners.delete(listener);
+        };
+    }
+    async checkAndClearResumeRequested() {
+        if (!this.isAlive() || !this.page)
+            return false;
+        return await safeEvaluate(this.page, () => {
+            if (window.__dshResumeRequested) {
+                window.__dshResumeRequested = false;
+                return true;
+            }
+            return false;
+        }, false, 0).catch(() => false);
     }
     async start() {
         this.resolvedWindowMode = resolveBrowserWindowMode(this.options);
@@ -211,14 +244,35 @@ export class BrowserSession {
         await this.context.addInitScript(initScript);
         if (!this.takeoverBindingInstalled) {
             try {
-                await this.context.exposeBinding('__dshRequestTakeover', () => {
+                await this.context.exposeBinding('__dshRequestTakeover', (_source, trigger) => {
                     this.humanTakeoverRequested = true;
+                    if (typeof trigger === 'string' && trigger.trim()) {
+                        this.humanTakeoverSource = trigger.trim();
+                    }
                 });
             }
             catch {
                 /* ignore if binding already registered on reused external CDP context */
             }
             this.takeoverBindingInstalled = true;
+        }
+        if (!this.resumeBindingInstalled) {
+            try {
+                await this.context.exposeBinding('__dshRequestResume', () => {
+                    for (const cb of [...this.resumeListeners]) {
+                        try {
+                            cb();
+                        }
+                        catch {
+                            // ignore resume listener errors
+                        }
+                    }
+                });
+            }
+            catch {
+                /* ignore if binding already registered on reused external CDP context */
+            }
+            this.resumeBindingInstalled = true;
         }
         if (!this.styleBindingInstalled) {
             try {

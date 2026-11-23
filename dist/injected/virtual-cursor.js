@@ -317,13 +317,26 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     }
   }
 
-  function triggerHumanTakeover() {
+  function triggerHumanTakeover(source = 'button') {
     window.__dshTakeoverRequested = true;
+    window.__dshTakeoverSource = source;
     state.takeoverPending = true;
     renderTakeoverPanel();
     try {
       if (typeof window.__dshRequestTakeover === 'function') {
-        window.__dshRequestTakeover();
+        window.__dshRequestTakeover(source);
+      }
+    } catch {}
+  }
+
+  function triggerHumanResume() {
+    window.__dshResumeRequested = true;
+    state.takeoverMode = 'running';
+    state.takeoverPending = false;
+    render();
+    try {
+      if (typeof window.__dshRequestResume === 'function') {
+        window.__dshRequestResume();
       }
     } catch {}
   }
@@ -338,7 +351,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
         if (typeof e.key === 'string' && e.key.toLowerCase() === targetHotkey.toLowerCase()) {
           e.preventDefault();
           e.stopPropagation();
-          triggerHumanTakeover();
+          triggerHumanTakeover(targetHotkey.toLowerCase() === 'f8' ? 'f8' : targetHotkey.toLowerCase());
         }
       },
       true
@@ -459,7 +472,9 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
         e.stopPropagation();
         e.preventDefault();
         if (state.takeoverMode === 'running') {
-          triggerHumanTakeover();
+          triggerHumanTakeover('button');
+        } else if (state.takeoverMode === 'paused') {
+          triggerHumanResume();
         }
       });
     }
@@ -566,10 +581,14 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       panel.style.borderColor = '#f59e0b';
       dot.style.background = '#f59e0b';
       dot.style.boxShadow = '0 0 8px #f59e0b';
-      txt.textContent = '已暂停 · 等待人工接管';
+      const pausedHint = hotkey
+        ? '（再按 ' + hotkey + ' 无效果，请点右侧或说「继续」）'
+        : '（请点右侧或说「继续」）';
+      txt.textContent = '已暂停 · 等待人工接管' + pausedHint;
       btn.style.display = 'inline-block';
       btn.disabled = false;
       btn.textContent = '继续执行';
+      btn.title = '点击继续执行当前子代理任务';
       btn.style.background = '#d97706';
       btn.style.cursor = 'pointer';
       btn.style.pointerEvents = 'auto';
@@ -584,6 +603,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       btn.style.display = 'none';
       btn.disabled = true;
       btn.textContent = '';
+      btn.title = '';
       btn.style.cursor = 'default';
       btn.style.pointerEvents = 'none';
       return;
@@ -596,6 +616,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     btn.style.display = 'inline-block';
     btn.disabled = false;
     btn.textContent = hotkey ? '按 ' + hotkey + ' 接管' : '暂停并接管';
+    btn.title = '';
     btn.style.background = '#ef4444';
     if (centerTest) {
       btn.style.pointerEvents = 'auto';
@@ -1034,8 +1055,13 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     },
     resetTakeoverRequest() {
       window.__dshTakeoverRequested = false;
+      window.__dshTakeoverSource = '';
+      window.__dshResumeRequested = false;
       state.takeoverPending = false;
       render();
+    },
+    resetResumeRequest() {
+      window.__dshResumeRequested = false;
     },
     getState() {
       return { ...state };

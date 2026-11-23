@@ -241,7 +241,7 @@ try {
   assert.ok(capturedPauseSession);
   const pausedPill = await readPillState(capturedPauseSession.page);
   assert.equal(pausedPill.takeoverMode, 'paused');
-  assert.equal(pausedPill.text, '已暂停 · 等待人工接管');
+  assert.ok(pausedPill.text.startsWith('已暂停 · 等待人工接管'), `Unexpected paused text: ${pausedPill.text}`);
   assert.notEqual(pausedPill.btnDisplay, 'none');
   assert.equal(pausedPill.btnText, '继续执行');
   assert.equal(pausedPill.btnPointerEvents, 'auto');
