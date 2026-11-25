@@ -25,6 +25,8 @@ export class HumanMotionController {
     takeoverRole = '';
     takeoverHotkey;
     unloadGuardEnabled = false;
+    viewportEmulation = null;
+    protocolGuardArmed = false;
     constructor(page, initialStyle = {}, opts = {}) {
         this.page = page;
         this.cursorStyle = resolveCursorStyle(initialStyle);
@@ -94,6 +96,8 @@ export class HumanMotionController {
             unloadGuard: this.unloadGuardEnabled,
             activeSession: this.takeoverMode === 'running',
             takeoverMode: this.takeoverMode,
+            viewportEmulation: this.viewportEmulation,
+            protocolGuardArmed: this.protocolGuardArmed,
         });
         await safeEvaluate(this.page, (arg) => {
             if (!window.__dshVirtualCursorInstalled) {
@@ -104,6 +108,8 @@ export class HumanMotionController {
                 window.__dshCursorAPI.setStyle?.(arg.style, { fromHost: true });
                 window.__dshCursorAPI.setTakeoverHotkey?.(arg.hotkey);
                 window.__dshCursorAPI.setUnloadGuard?.(arg.unloadGuard);
+                window.__dshCursorAPI.setViewportEmulation?.(arg.viewportEmulation);
+                window.__dshCursorAPI.setProtocolGuardArmed?.(arg.protocolGuardArmed);
                 window.__dshCursorAPI.setTakeoverState?.(arg.takeoverMode, arg.roleLabel);
             }
         }, undefined, {
@@ -115,6 +121,8 @@ export class HumanMotionController {
                 unloadGuard: this.unloadGuardEnabled,
                 takeoverMode: this.takeoverMode,
                 roleLabel: this.takeoverRole,
+                viewportEmulation: this.viewportEmulation,
+                protocolGuardArmed: this.protocolGuardArmed,
             },
             retries: 1,
         });
@@ -144,6 +152,32 @@ export class HumanMotionController {
         await safeEvaluate(this.page, () => {
             window.__dshCursorAPI?.resetTakeoverRequest();
         }, undefined, 0);
+    }
+    async setViewportEmulation(info) {
+        this.viewportEmulation = info && info.active ? { ...info } : null;
+        await this.ensureCursorHUD(false);
+        await safeEvaluate(this.page, (arg) => {
+            window.__dshCursorAPI?.setViewportEmulation?.(arg);
+        }, undefined, { arg: this.viewportEmulation, retries: 0 });
+    }
+    getViewportEmulation() {
+        return this.viewportEmulation ? { ...this.viewportEmulation } : null;
+    }
+    async setProtocolGuardArmed(on) {
+        this.protocolGuardArmed = Boolean(on);
+        await safeEvaluate(this.page, (flag) => {
+            window.__dshCursorAPI?.setProtocolGuardArmed?.(flag);
+        }, undefined, { arg: this.protocolGuardArmed, retries: 0 });
+    }
+    async clearInterceptedProtocol() {
+        await safeEvaluate(this.page, () => {
+            window.__dshCursorAPI?.clearInterceptedProtocol?.();
+        }, undefined, 0);
+    }
+    async consumeInterceptedProtocol() {
+        return await safeEvaluate(this.page, () => {
+            return window.__dshCursorAPI?.consumeInterceptedProtocol?.() ?? null;
+        }, null, 0).catch(() => null);
     }
     /**
      * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).

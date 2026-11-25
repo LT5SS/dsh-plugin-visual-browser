@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-visual-browser",
-  "version": "1.4.5",
-  "description": "Dual-mode adaptive visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with Top-Layer hit-test isolation, persistent settings.json cursor customization, drag/scroll visuals, beforeunload/SESSION_LOST guards, Design HUD, and cumulative findings.",
+  "version": "2.0.0",
+  "description": "Dual-mode adaptive visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with explicit set_viewport/DPR, condition wait_for, key/select/history primitives, Win32 HWND_NOTOPMOST self-heal, external/javascript protocol guard, and native dialog visibility.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -46,6 +46,7 @@
     "test:v143": "node scripts/verify-v143.mjs",
     "test:v144": "node scripts/verify-v144.mjs",
     "test:v145": "node scripts/verify-v145.mjs",
+    "test:v200": "node scripts/verify-v200.mjs",
     "build": "tsc && node scripts/build-client.mjs"
   },
   "dependencies": {

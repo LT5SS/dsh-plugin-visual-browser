@@ -1,6 +1,50 @@
 import path from 'node:path';
 import { PageSnapshotSampler, safeEvaluate } from '../sampler/page-snapshot.js';
 import { computePatchMeanPixelDiff } from '../sampler/png-pixels.js';
+export function isReservedHotkey(key, takeoverHotkey = 'F8') {
+    const tokens = String(key ?? '')
+        .split('+')
+        .map((t) => t.trim().toLowerCase())
+        .filter(Boolean);
+    if (tokens.length === 0)
+        return false;
+    const normalizedTakeover = String(takeoverHotkey || 'F8')
+        .trim()
+        .toLowerCase();
+    if (tokens.includes('f8'))
+        return true;
+    if (normalizedTakeover && tokens.includes(normalizedTakeover))
+        return true;
+    if (tokens.includes('alt') && tokens.includes('f4'))
+        return true;
+    return false;
+}
+function normalizePlaywrightKey(key) {
+    const parts = key
+        .split('+')
+        .map((p) => p.trim())
+        .filter(Boolean);
+    if (parts.length <= 1)
+        return parts[0] ?? key.trim();
+    const hasShift = parts.slice(0, -1).some((p) => p.toLowerCase() === 'shift');
+    const normalizedMods = parts.slice(0, -1).map((p) => {
+        const low = p.toLowerCase();
+        if (low === 'ctrl' || low === 'control')
+            return 'Control';
+        if (low === 'alt' || low === 'option')
+            return 'Alt';
+        if (low === 'shift')
+            return 'Shift';
+        if (low === 'meta' || low === 'cmd' || low === 'command' || low === 'win')
+            return 'Meta';
+        return p;
+    });
+    let mainKey = parts[parts.length - 1];
+    if (!hasShift && /^[A-Z]$/.test(mainKey)) {
+        mainKey = mainKey.toLowerCase();
+    }
+    return [...normalizedMods, mainKey].join('+');
+}
 /**
  * Normalizes a target string:
  * - "#4" (when matching a sampled ref ID) -> '[data-dsh-ref="4"]'
@@ -23,11 +67,56 @@ export class AtomicBrowserToolset {
     }
     async navigate(url, waitMs = 800, opts) {
         const navigation = await this.session.navigate(url, opts?.waitUntil ?? 'domcontentloaded', opts?.timeoutMs ?? 30000);
+        if (navigation.blocked) {
+            const observation = await this.sampler.captureSnapshot('navigate_blocked');
+            observation.navigation = navigation;
+            const hint = navigation.blocked === 'JS_URL'
+                ? '已拦截 javascript: 协议链接（安全红线：禁止执行任意页面脚本）'
+                : `已拦截外部协议链接 (${navigation.protocol ?? 'external'})，未拉起系统应用；可直接使用 href 中的联系信息`;
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: navigation.blocked,
+                protocol: navigation.protocol,
+                href: navigation.href,
+                hint,
+            });
+            return {
+                ok: false,
+                blocked: navigation.blocked,
+                protocol: navigation.protocol,
+                href: navigation.href,
+                hint,
+                action: `Blocked navigation (${navigation.blocked}): ${navigation.href ?? url}`,
+                observation,
+                navigation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        await this.sampler.invalidateRefs?.({ bumpRefOffset: false });
         if (waitMs > 0)
             await this.session.page.waitForTimeout(waitMs);
+        const promptDialog = this.session.consumePendingPromptDialog?.();
         const observation = await this.sampler.captureSnapshot('navigate');
         observation.navigation = navigation;
+        if (promptDialog) {
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                message: promptDialog.message,
+            });
+            return {
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                promptDialog,
+                hint: `页面弹出 prompt("${promptDialog.message}")，已自动取消并等待人工处理`,
+                action: `Prompt dialog intercepted during navigate`,
+                observation,
+                navigation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
         return {
+            ok: true,
             action: `Navigated to ${url}`,
             observation,
             navigation,
@@ -89,6 +178,10 @@ export class AtomicBrowserToolset {
         };
     }
     async click(target, waitMs = 240, opts) {
+        if (this.session.motion.getTakeoverMode?.() !== 'paused') {
+            await this.session.motion.setProtocolGuardArmed?.(true).catch(() => { });
+        }
+        await this.session.motion.clearInterceptedProtocol?.().catch(() => { });
         const clickRes = typeof target === 'string'
             ? await this.session.motion.clickSelector(resolveTargetSelector(target), {
                 label: `CLICK ${target}`,
@@ -138,9 +231,53 @@ export class AtomicBrowserToolset {
                 llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
             };
         }
+        const intercepted = await this.session.motion.consumeInterceptedProtocol?.().catch(() => null);
+        if (intercepted) {
+            const observation = await this.sampler.captureSnapshot('click_protocol_blocked');
+            const hint = intercepted.kind === 'JS_URL'
+                ? '已拦截 javascript: 协议链接（安全红线：禁止执行任意页面脚本）'
+                : '已拦截外部协议链接，未拉起系统应用；可直接使用 href 中的联系信息';
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: intercepted.kind,
+                ...(typeof target === 'string' ? { ref: target } : {}),
+                protocol: intercepted.protocol,
+                href: intercepted.href,
+                hint,
+            });
+            return {
+                ok: false,
+                blocked: intercepted.kind,
+                ...(typeof target === 'string' ? { ref: target } : {}),
+                protocol: intercepted.protocol,
+                href: intercepted.href,
+                hint,
+                action: `Blocked link protocol (${intercepted.kind}): ${intercepted.href}`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
         if (waitMs > 0)
             await this.session.page.waitForTimeout(waitMs);
+        const promptDialog = this.session.consumePendingPromptDialog?.();
         const observation = await this.sampler.captureSnapshot('click');
+        if (promptDialog) {
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                message: promptDialog.message,
+            });
+            return {
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                ...(typeof target === 'string' ? { ref: target } : {}),
+                promptDialog,
+                hint: `点击触发了 prompt("${promptDialog.message}")，已自动取消并暂停等待人工处理`,
+                action: `Click triggered prompt() requiring human input`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
         return {
             ok: true,
             action: `Clicked ${typeof target === 'string' ? target : `(${target.x},${target.y})`}`,
@@ -343,8 +480,8 @@ export class AtomicBrowserToolset {
             }
             : null;
         const beforeProbe = probeClip
-            ? await this.session.page
-                .screenshot({ clip: probeClip, type: 'jpeg', quality: 65 })
+            ? await this.session
+                .captureClipBuffer(probeClip, { format: 'jpeg', quality: 65 })
                 .catch(() => null)
             : null;
         if (driver === 'programmatic') {
@@ -374,8 +511,8 @@ export class AtomicBrowserToolset {
             afterState.url !== beforeState.url ||
             afterState.textLen !== beforeState.textLen;
         if (!visualChanged && beforeProbe && probeClip) {
-            const afterProbe = await this.session.page
-                .screenshot({ clip: probeClip, type: 'jpeg', quality: 65 })
+            const afterProbe = await this.session
+                .captureClipBuffer(probeClip, { format: 'jpeg', quality: 65 })
                 .catch(() => null);
             if (afterProbe) {
                 visualChanged = !beforeProbe.equals(afterProbe);
@@ -587,11 +724,8 @@ export class AtomicBrowserToolset {
                 return prev;
             }, null, 0);
             try {
-                return await this.session.page
-                    .screenshot({
-                    clip: { x: clipX, y: clipY, width: clipW, height: clipH },
-                    type: 'png',
-                })
+                return await this.session
+                    .captureClipBuffer({ x: clipX, y: clipY, width: clipW, height: clipH }, { format: 'png' })
                     .catch(() => null);
             }
             finally {
@@ -834,5 +968,461 @@ export class AtomicBrowserToolset {
                 }),
             };
         }, fallback, { arg: selector, retries: 2 });
+    }
+    async setViewport(opts) {
+        const emu = await this.session.setViewport(opts);
+        const observation = await this.sampler.captureSnapshot(opts.reset ? 'set_viewport_reset' : 'set_viewport');
+        const actionDesc = opts.reset || !emu
+            ? 'Reset viewport to physical window size'
+            : `Set viewport to ${emu.width}x${emu.height} @${emu.deviceScaleFactor}x`;
+        return {
+            ok: true,
+            action: actionDesc,
+            observation,
+            extraData: emu,
+            llmSummary: this.sampler.formatObservationForLLM(observation),
+        };
+    }
+    async waitFor(opts) {
+        const hasCondition = Boolean(opts.selector ||
+            opts.goneSelector ||
+            (opts.text && opts.text.trim().length > 0) ||
+            opts.networkIdle ||
+            opts.animationsSettled);
+        if (!hasCondition) {
+            const observation = await this.sampler.captureSnapshot('wait_for_invalid');
+            return {
+                ok: false,
+                hint: 'wait_for requires at least one condition (selector, goneSelector, text, networkIdle, animationsSettled)',
+                action: 'wait_for skipped: no condition provided',
+                observation,
+                llmSummary: `[WAIT_INVALID] {"ok":false,"error":"no_condition"}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        const timeoutMs = Math.max(200, Math.min(15000, Math.round(opts.timeoutMs ?? 6000)));
+        const startedAt = Date.now();
+        const deadline = startedAt + timeoutMs;
+        let networkIdleDone = !opts.networkIdle;
+        if (opts.networkIdle) {
+            networkIdleDone = await this.session.page
+                .waitForLoadState('networkidle', { timeout: Math.min(timeoutMs, 2500) })
+                .then(() => true)
+                .catch(() => false);
+        }
+        const selResolved = opts.selector ? resolveTargetSelector(opts.selector) : null;
+        const goneResolved = opts.goneSelector ? resolveTargetSelector(opts.goneSelector) : null;
+        const textNeedle = opts.text && opts.text.trim() ? opts.text.trim().toLowerCase() : null;
+        const needAnim = Boolean(opts.animationsSettled);
+        let lastTextCheckAt = 0;
+        let lastTextOk = !textNeedle;
+        let abortedByTakeover = false;
+        let satisfied = [];
+        let pending = [];
+        while (true) {
+            if (await this.session.checkHumanTakeoverRequested().catch(() => false)) {
+                abortedByTakeover = true;
+                break;
+            }
+            const now = Date.now();
+            const checkTextThisTick = Boolean(textNeedle && (!lastTextCheckAt || now - lastTextCheckAt >= 250));
+            if (checkTextThisTick) {
+                lastTextCheckAt = now;
+            }
+            const probe = await safeEvaluate(this.session.page, (arg) => {
+                const isElVisible = (el) => {
+                    if (!el)
+                        return false;
+                    const cs = window.getComputedStyle(el);
+                    if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) <= 0.01) {
+                        return false;
+                    }
+                    const r = el.getBoundingClientRect();
+                    return r.width >= 1 && r.height >= 1;
+                };
+                let selectorOk = true;
+                if (arg.sel) {
+                    const matched = Array.from(document.querySelectorAll(arg.sel));
+                    selectorOk = matched.some((el) => isElVisible(el));
+                }
+                let goneOk = true;
+                if (arg.gone) {
+                    const matched = Array.from(document.querySelectorAll(arg.gone));
+                    goneOk = matched.length === 0 || matched.every((el) => !isElVisible(el));
+                }
+                let textOk = null;
+                if (arg.text) {
+                    const body = document.body;
+                    const rawContent = body ? (body.textContent || '').toLowerCase() : '';
+                    if (!rawContent.includes(arg.text)) {
+                        textOk = false;
+                    }
+                    else {
+                        const visibleText = body ? (body.innerText || '').toLowerCase() : '';
+                        textOk = visibleText.includes(arg.text);
+                    }
+                }
+                let animOk = true;
+                if (arg.checkAnim && typeof document.getAnimations === 'function') {
+                    const runningFinite = document.getAnimations().filter((anim) => {
+                        if (anim.playState !== 'running')
+                            return false;
+                        try {
+                            const timing = anim.effect?.getTiming?.();
+                            if (timing && timing.iterations === Infinity)
+                                return false;
+                        }
+                        catch { }
+                        const effectTarget = anim.effect?.target;
+                        if (effectTarget && effectTarget instanceof Element) {
+                            try {
+                                const cs = window.getComputedStyle(effectTarget);
+                                if (cs.animationIterationCount && cs.animationIterationCount.includes('infinite')) {
+                                    return false;
+                                }
+                            }
+                            catch { }
+                        }
+                        return true;
+                    });
+                    animOk = runningFinite.length === 0;
+                }
+                return { selectorOk, goneOk, textOk, animOk };
+            }, { selectorOk: !selResolved, goneOk: !goneResolved, textOk: textNeedle ? false : null, animOk: !needAnim }, {
+                arg: {
+                    sel: selResolved,
+                    gone: goneResolved,
+                    text: checkTextThisTick ? textNeedle : null,
+                    checkAnim: needAnim,
+                },
+                retries: 0,
+            }).catch(() => ({
+                selectorOk: !selResolved,
+                goneOk: !goneResolved,
+                textOk: textNeedle ? false : null,
+                animOk: !needAnim,
+            }));
+            if (checkTextThisTick && probe.textOk !== null) {
+                lastTextOk = probe.textOk;
+            }
+            satisfied = [];
+            pending = [];
+            if (opts.networkIdle)
+                (networkIdleDone ? satisfied : pending).push('networkIdle');
+            if (selResolved)
+                (probe.selectorOk ? satisfied : pending).push(`selector:${opts.selector}`);
+            if (goneResolved)
+                (probe.goneOk ? satisfied : pending).push(`goneSelector:${opts.goneSelector}`);
+            if (textNeedle)
+                (lastTextOk ? satisfied : pending).push(`text:${opts.text}`);
+            if (needAnim)
+                (probe.animOk ? satisfied : pending).push('animationsSettled');
+            if (pending.length === 0) {
+                const elapsedMs = Math.max(0, Date.now() - startedAt);
+                const waitResult = {
+                    ok: true,
+                    timed_out: false,
+                    elapsed_ms: elapsedMs,
+                    satisfied,
+                    pending: [],
+                };
+                const observation = await this.sampler.captureSnapshot('wait_for');
+                return {
+                    ok: true,
+                    waitResult,
+                    extraData: waitResult,
+                    action: `wait_for satisfied [${satisfied.join(', ')}] in ${elapsedMs}ms`,
+                    observation,
+                    llmSummary: `[WAIT_SATISFIED] ${JSON.stringify(waitResult)}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+                };
+            }
+            if (Date.now() >= deadline) {
+                break;
+            }
+            await this.session.page.waitForTimeout(120).catch(() => { });
+        }
+        const elapsedMs = Math.max(0, Date.now() - startedAt);
+        const waitResult = {
+            ok: false,
+            timed_out: !abortedByTakeover,
+            ...(abortedByTakeover ? { aborted_by_takeover: true } : {}),
+            elapsed_ms: elapsedMs,
+            satisfied,
+            pending,
+        };
+        const observation = await this.sampler.captureSnapshot('wait_for_timeout');
+        return {
+            ok: false,
+            waitResult,
+            extraData: waitResult,
+            hint: abortedByTakeover
+                ? 'wait_for aborted due to human takeover'
+                : `wait_for timed out after ${elapsedMs}ms; pending=[${pending.join(', ')}]`,
+            action: abortedByTakeover
+                ? `wait_for interrupted by human takeover (${elapsedMs}ms)`
+                : `wait_for timed out (${elapsedMs}ms); pending=[${pending.join(', ')}]`,
+            observation,
+            llmSummary: `[WAIT_TIMEOUT] ${JSON.stringify(waitResult)}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+        };
+    }
+    async pressKey(key, repeat = 1) {
+        const rawKey = String(key ?? '').trim();
+        const takeoverHotkey = this.session.options?.takeoverHotkey ?? 'F8';
+        if (!rawKey || isReservedHotkey(rawKey, takeoverHotkey)) {
+            const observation = await this.sampler.captureSnapshot('press_key_blocked');
+            const hint = `保留热键 (${rawKey || 'empty'}) 已被拦截，不允许子代理派发 F8 / 含 F8 组合键 / Alt+F4`;
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: 'RESERVED_HOTKEY',
+                key: rawKey,
+                hint,
+            });
+            return {
+                ok: false,
+                blocked: 'RESERVED_HOTKEY',
+                hit: rawKey,
+                hint,
+                action: `Blocked press_key (${rawKey}) by RESERVED_HOTKEY`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        const normalizedKey = normalizePlaywrightKey(rawKey);
+        const times = Math.max(1, Math.min(10, Math.round(Number.isFinite(repeat) ? repeat : 1)));
+        this.session.consumePendingPromptDialog?.();
+        for (let i = 0; i < times; i++) {
+            await this.session.page.keyboard.press(normalizedKey);
+            if (i + 1 < times) {
+                await this.session.page.waitForTimeout(45);
+            }
+        }
+        await this.session.page.waitForTimeout(180);
+        const promptDialog = this.session.consumePendingPromptDialog?.();
+        const observation = await this.sampler.captureSnapshot('press_key');
+        if (promptDialog) {
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                message: promptDialog.message,
+            });
+            return {
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                promptDialog,
+                hint: `按键触发了 prompt("${promptDialog.message}")，已自动取消并暂停等待人工处理`,
+                action: `press_key(${rawKey}) triggered prompt()`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        return {
+            ok: true,
+            action: times > 1 ? `Pressed key ${rawKey} ×${times}` : `Pressed key ${rawKey}`,
+            observation,
+            llmSummary: this.sampler.formatObservationForLLM(observation),
+        };
+    }
+    async selectOption(target, opts) {
+        const selector = resolveTargetSelector(target);
+        const probe = await this.session.motion.resolveTargetPoint(selector, 1200);
+        if (!probe.ok) {
+            const observation = await this.sampler.captureSnapshot('select_option_blocked');
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: probe.blocked,
+                ref: target,
+                hit: probe.hit,
+                hint: probe.hint,
+            });
+            return {
+                ok: false,
+                blocked: probe.blocked,
+                ref: target,
+                hit: probe.hit,
+                hint: probe.hint,
+                action: `Blocked select_option (${target}) by ${probe.blocked}`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        await this.session.motion.moveTo(probe.point.x, probe.point.y, { label: `SELECT ${target}` });
+        this.session.consumePendingPromptDialog?.();
+        const loc = this.session.page.locator(selector).first();
+        let optionSpec = {};
+        if (typeof opts.value === 'string')
+            optionSpec = { value: opts.value };
+        else if (typeof opts.label === 'string')
+            optionSpec = { label: opts.label };
+        else if (typeof opts.index === 'number' && Number.isFinite(opts.index)) {
+            optionSpec = { index: Math.max(0, Math.round(opts.index)) };
+        }
+        await loc.selectOption(optionSpec, { timeout: 3000 });
+        const selected = await safeEvaluate(this.session.page, (sel) => {
+            const el = document.querySelector(sel);
+            if (!el)
+                return { selectedValue: '', selectedLabel: '' };
+            const opt = el.selectedOptions && el.selectedOptions[0];
+            return {
+                selectedValue: el.value ?? '',
+                selectedLabel: (opt ? opt.text : '').trim(),
+            };
+        }, { selectedValue: '', selectedLabel: '' }, { arg: selector, retries: 1 }).catch(() => ({ selectedValue: '', selectedLabel: '' }));
+        await this.session.page.waitForTimeout(180);
+        const promptDialog = this.session.consumePendingPromptDialog?.();
+        const observation = await this.sampler.captureSnapshot('select_option');
+        if (promptDialog) {
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                message: promptDialog.message,
+            });
+            return {
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                ref: target,
+                promptDialog,
+                extraData: selected,
+                hint: `下拉选择触发了 prompt("${promptDialog.message}")，已自动取消并暂停等待人工处理`,
+                action: `select_option(${target}) triggered prompt()`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        return {
+            ok: true,
+            ref: target,
+            extraData: selected,
+            action: `Selected option (${selected.selectedLabel || selected.selectedValue}) on ${target}`,
+            observation,
+            llmSummary: `[SELECT_RESULT] ${JSON.stringify(selected)}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+        };
+    }
+    async goBack(opts) {
+        return await this.runHistoryNav('back', opts);
+    }
+    async goForward(opts) {
+        return await this.runHistoryNav('forward', opts);
+    }
+    async reload(opts) {
+        return await this.runHistoryNav('reload', opts);
+    }
+    async runHistoryNav(kind, opts) {
+        const waitUntil = opts?.waitUntil ?? 'domcontentloaded';
+        const timeoutMs = Number.isFinite(opts?.timeoutMs)
+            ? Math.max(1000, Math.min(120000, Math.round(opts.timeoutMs)))
+            : 15000;
+        const startedAt = Date.now();
+        const tag = kind === 'back' ? 'go_back' : kind === 'forward' ? 'go_forward' : 'reload';
+        if (this.session.motion.isUnloadGuardEnabled()) {
+            await safeEvaluate(this.session.page, () => {
+                window.__dshCursorAPI?.setUnloadGuard?.(false);
+            }, undefined, 0).catch(() => { });
+        }
+        if (kind === 'back' || kind === 'forward') {
+            const navHist = await this.session.getNavigationHistory?.().catch(() => null);
+            if (navHist) {
+                const noBackTarget = kind === 'back' &&
+                    (navHist.currentIndex <= 0 ||
+                        navHist.entries[navHist.currentIndex - 1]?.url === 'about:blank');
+                const noForwardTarget = kind === 'forward' && navHist.currentIndex >= navHist.entries.length - 1;
+                if (noBackTarget || noForwardTarget) {
+                    const observation = await this.sampler.captureSnapshot(`${tag}_no_history`);
+                    const payload = JSON.stringify({ ok: false, no_history: true, direction: kind });
+                    return {
+                        ok: false,
+                        no_history: true,
+                        hint: `No ${kind} browser history available`,
+                        action: `${tag}: no history available`,
+                        observation,
+                        llmSummary: `[NO_HISTORY] ${payload}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+                    };
+                }
+            }
+        }
+        const beforeUrl = (() => {
+            try {
+                return this.session.page.url();
+            }
+            catch {
+                return '';
+            }
+        })();
+        let response = null;
+        let timedOut = false;
+        try {
+            if (kind === 'back') {
+                response = await this.session.page.goBack({ waitUntil, timeout: timeoutMs });
+            }
+            else if (kind === 'forward') {
+                response = await this.session.page.goForward({ waitUntil, timeout: timeoutMs });
+            }
+            else {
+                response = await this.session.page.reload({ waitUntil, timeout: timeoutMs });
+            }
+        }
+        catch (err) {
+            const msg = String(err?.message ?? err);
+            if (/Timeout/i.test(msg)) {
+                timedOut = true;
+            }
+            else {
+                throw err;
+            }
+        }
+        const afterUrl = (() => {
+            try {
+                return this.session.page.url();
+            }
+            catch {
+                return '';
+            }
+        })();
+        if ((kind === 'back' || kind === 'forward') && response === null && afterUrl === beforeUrl && !timedOut) {
+            const observation = await this.sampler.captureSnapshot(`${tag}_no_history`);
+            const payload = JSON.stringify({ ok: false, no_history: true, direction: kind });
+            return {
+                ok: false,
+                no_history: true,
+                hint: `No ${kind} browser history available`,
+                action: `${tag}: no history available`,
+                observation,
+                llmSummary: `[NO_HISTORY] ${payload}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        await this.sampler.invalidateRefs({ bumpRefOffset: true });
+        await this.session.page.waitForTimeout(300).catch(() => { });
+        await this.session.motion.ensureCursorHUD(true).catch(() => { });
+        const navigation = {
+            wait_until: waitUntil,
+            timed_out: timedOut,
+            elapsed_ms: Math.max(0, Date.now() - startedAt),
+            final_url: this.session.page.url(),
+        };
+        const promptDialog = this.session.consumePendingPromptDialog?.();
+        const observation = await this.sampler.captureSnapshot(tag);
+        observation.navigation = navigation;
+        if (promptDialog) {
+            const refusalJson = JSON.stringify({
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                message: promptDialog.message,
+            });
+            return {
+                ok: false,
+                blocked: 'PROMPT_REQUIRES_HUMAN',
+                promptDialog,
+                navigation,
+                hint: `${tag} 触发了 prompt("${promptDialog.message}")，已自动取消并暂停等待人工处理`,
+                action: `${tag} triggered prompt()`,
+                observation,
+                llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+            };
+        }
+        return {
+            ok: true,
+            navigation,
+            action: `${tag} -> ${navigation.final_url}`,
+            observation,
+            llmSummary: this.sampler.formatObservationForLLM(observation),
+        };
     }
 }

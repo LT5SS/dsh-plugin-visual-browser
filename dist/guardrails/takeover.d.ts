@@ -1,5 +1,5 @@
 import type { Page } from 'playwright-core';
-export type GateReason = 'CAPTCHA_DETECTED' | 'PAYMENT_REQUIRED' | 'LOGIN_REQUIRED' | 'SENSITIVE_DOMAIN_READONLY';
+export type GateReason = 'CAPTCHA_DETECTED' | 'PAYMENT_REQUIRED' | 'LOGIN_REQUIRED' | 'SENSITIVE_DOMAIN_READONLY' | 'PROMPT_REQUIRES_HUMAN';
 export interface GateDetectionResult {
     detected: boolean;
     reason?: GateReason;

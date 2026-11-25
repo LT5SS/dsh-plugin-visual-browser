@@ -1,6 +1,7 @@
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { ActionBlockedReason, MotionInspectResult, NavigateWaitUntil, NavigationDiagnostic, Point2D, ScrollDiagnostic, VirtualCursorStyleConfig } from '../driver/types.js';
+import type { ActionBlockedReason, MotionInspectResult, NativeDialogRecord, NavigateWaitUntil, NavigationDiagnostic, Point2D, ScrollDiagnostic, SetViewportOptions, VirtualCursorStyleConfig, WaitForOptions, WaitForResult } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
+export declare function isReservedHotkey(key: string, takeoverHotkey?: string): boolean;
 export interface DomInspectSample {
     tag: string;
     text: string;
@@ -33,6 +34,11 @@ export interface AtomicToolResult {
     navigation?: NavigationDiagnostic;
     scroll?: ScrollDiagnostic;
     motion?: MotionInspectResult;
+    waitResult?: WaitForResult;
+    no_history?: boolean;
+    protocol?: string;
+    href?: string;
+    promptDialog?: NativeDialogRecord;
     extraData?: unknown;
 }
 /**
@@ -76,4 +82,25 @@ export declare class AtomicBrowserToolset {
      * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
      */
     inspectDom(selector: string): Promise<DomInspectResult>;
+    setViewport(opts: SetViewportOptions): Promise<AtomicToolResult>;
+    waitFor(opts: WaitForOptions): Promise<AtomicToolResult>;
+    pressKey(key: string, repeat?: number): Promise<AtomicToolResult>;
+    selectOption(target: string, opts: {
+        value?: string;
+        label?: string;
+        index?: number;
+    }): Promise<AtomicToolResult>;
+    goBack(opts?: {
+        waitUntil?: NavigateWaitUntil;
+        timeoutMs?: number;
+    }): Promise<AtomicToolResult>;
+    goForward(opts?: {
+        waitUntil?: NavigateWaitUntil;
+        timeoutMs?: number;
+    }): Promise<AtomicToolResult>;
+    reload(opts?: {
+        waitUntil?: NavigateWaitUntil;
+        timeoutMs?: number;
+    }): Promise<AtomicToolResult>;
+    private runHistoryNav;
 }

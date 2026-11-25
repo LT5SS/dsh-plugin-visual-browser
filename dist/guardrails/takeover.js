@@ -103,6 +103,7 @@ export function buildApprovalCard(params) {
         PAYMENT_REQUIRED: '💳 检测到支付/结算页面 — 请人工确认操作',
         LOGIN_REQUIRED: '🔐 检测到登录认证页面 — 请完成登录后继续',
         SENSITIVE_DOMAIN_READONLY: '🛡️ 敏感站点只读保护触发',
+        PROMPT_REQUIRES_HUMAN: '💬 页面弹出 prompt() 输入框 — 请人工处理',
         ORIGIN_BLOCKED: '🚫 目标域名已被宿主安全策略拦截',
         USER_TAKEOVER: '✋ 用户已手动接管 — 子代理已暂停',
     };

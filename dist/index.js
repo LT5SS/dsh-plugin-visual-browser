@@ -670,6 +670,18 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 type: 'integer',
                 description: 'Navigation goto timeout in ms (1000..120000, default: 30000)',
             },
+            viewport_width: {
+                type: 'integer',
+                description: 'Optional explicit desktop viewport width override (320..2560; default preserves window size)',
+            },
+            viewport_height: {
+                type: 'integer',
+                description: 'Optional explicit desktop viewport height override (240..1600; default preserves window size)',
+            },
+            device_scale_factor: {
+                type: 'number',
+                description: 'Optional explicit DPR scale override (1..2; requires viewport override)',
+            },
         },
         output: {
             schema: {
@@ -750,6 +762,18 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             const timeoutMs = Number.isFinite(rawTimeout)
                 ? Math.max(1000, Math.min(120000, Math.round(rawTimeout)))
                 : 30000;
+            const hasExplicitViewport = args.viewport_width !== undefined ||
+                args.viewport_height !== undefined ||
+                args.device_scale_factor !== undefined;
+            const viewportOverride = hasExplicitViewport
+                ? {
+                    width: Number.isFinite(Number(args.viewport_width)) ? Number(args.viewport_width) : 1440,
+                    height: Number.isFinite(Number(args.viewport_height)) ? Number(args.viewport_height) : 900,
+                    ...(Number.isFinite(Number(args.device_scale_factor))
+                        ? { deviceScaleFactor: Number(args.device_scale_factor) }
+                        : {}),
+                }
+                : undefined;
             try {
                 const res = await runner.runTask({
                     subagentId,
@@ -776,6 +800,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                         windowBounds: config.windowBounds,
                         backgroundSilent: effectiveWindowMode === 'headless',
                         cursorStyle: style,
+                        ...(viewportOverride ? { viewportOverride } : {}),
                     },
                     onActionResult: (info) => {
                         const actionSummary = {
@@ -1118,6 +1143,18 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 type: 'integer',
                 description: 'Navigation goto timeout in ms (1000..120000, default: 30000)',
             },
+            viewport_width: {
+                type: 'integer',
+                description: 'Optional explicit desktop viewport width override (320..2560; default preserves window size)',
+            },
+            viewport_height: {
+                type: 'integer',
+                description: 'Optional explicit desktop viewport height override (240..1600; default preserves window size)',
+            },
+            device_scale_factor: {
+                type: 'number',
+                description: 'Optional explicit DPR scale override (1..2)',
+            },
         },
         output: {
             schema: {
@@ -1140,6 +1177,18 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             const takeoverHotkey = getLiveTakeoverHotkey();
             const liveCursorStyle = getLiveCursorStyle();
             const useShared = keepWindowOpen && !runner.isSharedSessionBusy();
+            const hasExplicitViewport = args.viewport_width !== undefined ||
+                args.viewport_height !== undefined ||
+                args.device_scale_factor !== undefined;
+            const viewportOverride = hasExplicitViewport
+                ? {
+                    width: Number.isFinite(Number(args.viewport_width)) ? Number(args.viewport_width) : 1440,
+                    height: Number.isFinite(Number(args.viewport_height)) ? Number(args.viewport_height) : 900,
+                    ...(Number.isFinite(Number(args.device_scale_factor))
+                        ? { deviceScaleFactor: Number(args.device_scale_factor) }
+                        : {}),
+                }
+                : undefined;
             const acquired = useShared
                 ? await runner.acquireReusableSession({
                     mode: config.mode ?? 'auto',
@@ -1152,6 +1201,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     windowBounds: config.windowBounds,
                     backgroundSilent: effectiveWindowMode === 'headless',
                     cursorStyle: liveCursorStyle,
+                    ...(viewportOverride ? { viewportOverride } : {}),
                 }, true)
                 : {
                     session: await new BrowserSession({
@@ -1166,6 +1216,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                             ? true
                             : effectiveWindowMode === 'headless',
                         cursorStyle: liveCursorStyle,
+                        ...(viewportOverride ? { viewportOverride } : {}),
                     }).start(),
                     isShared: false,
                     reused: false,

@@ -65,6 +65,57 @@ export type SubagentActionDecision =
   | { type: 'scroll'; deltaY: number; reason: string; note?: string }
   | { type: 'inspect_motion'; target: string | Point2D; reason: string; note?: string }
   | { type: 'set_cursor_style'; style: VirtualCursorStyleConfig; reason: string; note?: string }
+  | {
+      type: 'set_viewport';
+      width?: number;
+      height?: number;
+      deviceScaleFactor?: number;
+      reset?: boolean;
+      reason: string;
+      note?: string;
+    }
+  | {
+      type: 'wait_for';
+      selector?: string;
+      goneSelector?: string;
+      text?: string;
+      networkIdle?: boolean;
+      animationsSettled?: boolean;
+      timeoutMs?: number;
+      reason: string;
+      note?: string;
+    }
+  | { type: 'press_key'; key: string; repeat?: number; reason: string; note?: string }
+  | {
+      type: 'select_option';
+      target: string;
+      value?: string;
+      label?: string;
+      index?: number;
+      reason: string;
+      note?: string;
+    }
+  | {
+      type: 'go_back';
+      waitUntil?: NavigateWaitUntil;
+      timeoutMs?: number;
+      reason: string;
+      note?: string;
+    }
+  | {
+      type: 'go_forward';
+      waitUntil?: NavigateWaitUntil;
+      timeoutMs?: number;
+      reason: string;
+      note?: string;
+    }
+  | {
+      type: 'reload';
+      waitUntil?: NavigateWaitUntil;
+      timeoutMs?: number;
+      reason: string;
+      note?: string;
+    }
   | { type: 'complete'; report: string; note?: string }
   | {
       type: 'pause_for_takeover';
@@ -202,6 +253,11 @@ Respond ONLY with a single valid JSON object matching one of these actions (any 
 - {"type":"type_text","target":"#5","text":"hello","pressEnter":true,"reason":"..."}
 - {"type":"scroll","deltaY":800,"reason":"..."}
 - {"type":"inspect_motion","target":"#3","reason":"..."} or {"type":"inspect_motion","target":{"x":640,"y":380},"reason":"..."} (read-only pointer-driven hover/transform/canvas-pixel probe without clicking; use {x,y} on <canvas> areas)
+- {"type":"set_viewport","width":1440,"height":900,"deviceScaleFactor":1.5,"reason":"..."} or {"type":"set_viewport","reset":true,"reason":"..."} (override desktop viewport/DPR when layout/small text is unreadable)
+- {"type":"wait_for","selector":"h1","goneSelector":".loader","text":"...","animationsSettled":true,"timeoutMs":6000,"reason":"..."} (wait cleanly for SPA/loader readiness without failing on timeout)
+- {"type":"press_key","key":"Escape","reason":"..."} (keyboard key/combo like Escape, Enter, Tab, ArrowDown, Control+A; F8/Alt+F4 are reserved)
+- {"type":"select_option","target":"#4","label":"Option B","reason":"..."} (select native <select> option by value/label/index)
+- {"type":"go_back","reason":"..."} / {"type":"go_forward","reason":"..."} / {"type":"reload","reason":"..."} (history navigation)
 - {"type":"navigate","url":"https://...","reason":"..."}
 - {"type":"pause_for_takeover","blockReason":"LOGIN_REQUIRED","message":"..."}
 - {"type":"complete","report":"COMPLETED / TASK_COMPLETED\\n\\nDetailed markdown report..."}
@@ -333,6 +389,52 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         ...(decision.style.preset ? { preset: decision.style.preset } : {}),
         ...noteExtra,
       };
+    case 'set_viewport':
+      return {
+        type: 'set_viewport',
+        ...(decision.width !== undefined ? { width: decision.width } : {}),
+        ...(decision.height !== undefined ? { height: decision.height } : {}),
+        ...(decision.deviceScaleFactor !== undefined
+          ? { deviceScaleFactor: decision.deviceScaleFactor }
+          : {}),
+        ...(decision.reset ? { reset: true } : {}),
+        ...noteExtra,
+      };
+    case 'wait_for':
+      return {
+        type: 'wait_for',
+        ...(decision.selector ? { selector: decision.selector } : {}),
+        ...(decision.goneSelector ? { goneSelector: decision.goneSelector } : {}),
+        ...(decision.text ? { text: decision.text.slice(0, 60) } : {}),
+        ...(decision.networkIdle ? { networkIdle: true } : {}),
+        ...(decision.animationsSettled ? { animationsSettled: true } : {}),
+        ...(decision.timeoutMs !== undefined ? { timeoutMs: decision.timeoutMs } : {}),
+        ...noteExtra,
+      };
+    case 'press_key':
+      return {
+        type: 'press_key',
+        key: decision.key,
+        ...(decision.repeat !== undefined ? { repeat: decision.repeat } : {}),
+        ...noteExtra,
+      };
+    case 'select_option':
+      return {
+        type: 'select_option',
+        target: decision.target,
+        ...(decision.value !== undefined ? { value: decision.value } : {}),
+        ...(decision.label !== undefined ? { label: decision.label } : {}),
+        ...(decision.index !== undefined ? { index: decision.index } : {}),
+        ...noteExtra,
+      };
+    case 'go_back':
+    case 'go_forward':
+    case 'reload':
+      return {
+        type: decision.type,
+        ...(decision.waitUntil ? { waitUntil: decision.waitUntil } : {}),
+        ...noteExtra,
+      };
     case 'complete':
       return { type: 'complete', report_length: decision.report.length, ...noteExtra };
     case 'pause_for_takeover':
@@ -373,6 +475,25 @@ function formatShortActionForFinding(decision: SubagentActionDecision, blocked?:
       break;
     case 'set_cursor_style':
       base = 'set_cursor_style';
+      break;
+    case 'set_viewport':
+      base = decision.reset
+        ? 'set_viewport(reset)'
+        : `set_viewport ${decision.width ?? 1440}x${decision.height ?? 900}`;
+      break;
+    case 'wait_for':
+      base = 'wait_for';
+      break;
+    case 'press_key':
+      base = `press_key ${decision.key}`;
+      break;
+    case 'select_option':
+      base = `select_option ${decision.target}`;
+      break;
+    case 'go_back':
+    case 'go_forward':
+    case 'reload':
+      base = decision.type;
       break;
     case 'complete':
       base = 'complete';
@@ -468,6 +589,58 @@ export function isValidSubagentDecision(value: unknown): value is SubagentAction
       );
     case 'set_cursor_style':
       return d.style !== null && typeof d.style === 'object' && !Array.isArray(d.style);
+    case 'set_viewport': {
+      const wOk = d.width === undefined || (typeof d.width === 'number' && Number.isFinite(d.width) && d.width > 0);
+      const hOk = d.height === undefined || (typeof d.height === 'number' && Number.isFinite(d.height) && d.height > 0);
+      const dprOk =
+        d.deviceScaleFactor === undefined ||
+        (typeof d.deviceScaleFactor === 'number' &&
+          Number.isFinite(d.deviceScaleFactor) &&
+          d.deviceScaleFactor >= 0.5 &&
+          d.deviceScaleFactor <= 4);
+      const resetOk = d.reset === undefined || typeof d.reset === 'boolean';
+      return wOk && hOk && dprOk && resetOk;
+    }
+    case 'wait_for': {
+      const hasAny =
+        (typeof d.selector === 'string' && d.selector.length > 0) ||
+        (typeof d.goneSelector === 'string' && d.goneSelector.length > 0) ||
+        (typeof d.text === 'string' && d.text.length > 0) ||
+        d.networkIdle === true ||
+        d.animationsSettled === true;
+      const timeoutOk =
+        d.timeoutMs === undefined ||
+        (typeof d.timeoutMs === 'number' && Number.isFinite(d.timeoutMs) && d.timeoutMs >= 100);
+      return hasAny && timeoutOk;
+    }
+    case 'press_key': {
+      const keyOk = typeof d.key === 'string' && d.key.trim().length > 0;
+      const repOk =
+        d.repeat === undefined ||
+        (typeof d.repeat === 'number' && Number.isFinite(d.repeat) && d.repeat >= 1);
+      return keyOk && repOk;
+    }
+    case 'select_option': {
+      const targetOk = typeof d.target === 'string' && d.target.length > 0;
+      const specOk =
+        typeof d.value === 'string' ||
+        typeof d.label === 'string' ||
+        (typeof d.index === 'number' && Number.isFinite(d.index) && d.index >= 0);
+      return targetOk && specOk;
+    }
+    case 'go_back':
+    case 'go_forward':
+    case 'reload': {
+      const waitUntilOk =
+        d.waitUntil === undefined ||
+        d.waitUntil === 'domcontentloaded' ||
+        d.waitUntil === 'load' ||
+        d.waitUntil === 'networkidle';
+      const timeoutOk =
+        d.timeoutMs === undefined ||
+        (typeof d.timeoutMs === 'number' && Number.isFinite(d.timeoutMs) && d.timeoutMs >= 1000);
+      return waitUntilOk && timeoutOk;
+    }
     case 'complete':
       return typeof d.report === 'string';
     case 'pause_for_takeover':
@@ -1593,6 +1766,10 @@ export class BrowserSubagentRunner {
       this.sharedSessionBusy = true;
       this.activeSessions.add(existing);
       this.watchSessionDisconnect(existing);
+      await existing.ensureNotTopmost?.().catch(() => {});
+      if (opts.viewportOverride) {
+        await existing.setViewport(opts.viewportOverride).catch(() => {});
+      }
       if (opts.cursorStyle) {
         await existing.motion.setCursorStyle(opts.cursorStyle).catch(() => {});
       }
@@ -1617,6 +1794,10 @@ export class BrowserSubagentRunner {
     if (session === this.sharedSession) {
       if (keepAlive && session.isAlive()) {
         this.sharedSessionBusy = false;
+        await session.motion?.setProtocolGuardArmed?.(false).catch(() => {});
+        if (session.getViewportEmulation?.()?.active) {
+          await session.setViewport({ reset: true }).catch(() => {});
+        }
         if (session.motion && session.motion.getTakeoverMode() !== 'hidden') {
           await session.motion.setTakeoverState('idle').catch(() => {});
         }
@@ -1700,6 +1881,7 @@ export class BrowserSubagentRunner {
 
     try {
       await session.resetHumanTakeoverRequest();
+      await session.motion.setProtocolGuardArmed?.(true).catch(() => {});
       await session.motion.setUnloadGuard(true).catch(() => {});
       if (req.sessionOptions?.showTakeoverControl ?? session.resolvedWindowMode !== 'headless') {
         await session.motion.setTakeoverState('running', req.role).catch(() => {});
@@ -2165,8 +2347,21 @@ export class BrowserSubagentRunner {
             res.observation,
             res.llmSummary
           );
-          findingsLedger.record(step, res.observation, 'navigate', decision.note);
+          findingsLedger.record(
+            step,
+            res.observation,
+            res.blocked ? `navigate(${res.blocked})` : 'navigate',
+            decision.note
+          );
           latestObs = res.observation;
+          if (res.blocked === 'PROMPT_REQUIRES_HUMAN') {
+            return await pauseNow(
+              step + 1,
+              'PROMPT_REQUIRES_HUMAN',
+              session.page.url(),
+              res.hint ?? '页面弹出 prompt() 输入框，请人工处理后继续。'
+            );
+          }
           if (await session.checkHumanTakeoverRequested()) {
             return await pauseNow(
               step + 1,
@@ -2217,6 +2412,45 @@ export class BrowserSubagentRunner {
             actionResult = await tools.scroll(decision.deltaY, 220);
           } else if (decision.type === 'inspect_motion') {
             actionResult = await tools.inspectMotion(decision.target);
+          } else if (decision.type === 'set_viewport') {
+            actionResult = await tools.setViewport({
+              width: decision.width,
+              height: decision.height,
+              deviceScaleFactor: decision.deviceScaleFactor,
+              reset: decision.reset,
+            });
+          } else if (decision.type === 'wait_for') {
+            actionResult = await tools.waitFor({
+              selector: decision.selector,
+              goneSelector: decision.goneSelector,
+              text: decision.text,
+              networkIdle: decision.networkIdle,
+              animationsSettled: decision.animationsSettled,
+              timeoutMs: decision.timeoutMs,
+            });
+          } else if (decision.type === 'press_key') {
+            actionResult = await tools.pressKey(decision.key, decision.repeat ?? 1);
+          } else if (decision.type === 'select_option') {
+            actionResult = await tools.selectOption(decision.target, {
+              value: decision.value,
+              label: decision.label,
+              index: decision.index,
+            });
+          } else if (decision.type === 'go_back') {
+            actionResult = await tools.goBack({
+              waitUntil: decision.waitUntil ?? req.waitUntil,
+              timeoutMs: decision.timeoutMs ?? req.timeoutMs,
+            });
+          } else if (decision.type === 'go_forward') {
+            actionResult = await tools.goForward({
+              waitUntil: decision.waitUntil ?? req.waitUntil,
+              timeoutMs: decision.timeoutMs ?? req.timeoutMs,
+            });
+          } else if (decision.type === 'reload') {
+            actionResult = await tools.reload({
+              waitUntil: decision.waitUntil ?? req.waitUntil,
+              timeoutMs: decision.timeoutMs ?? req.timeoutMs,
+            });
           } else {
             throw new Error(`Unsupported decision: ${JSON.stringify(decision)}`);
           }
@@ -2311,6 +2545,15 @@ export class BrowserSubagentRunner {
           decision.note
         );
         latestObs = actionResult.observation;
+
+        if (actionResult.blocked === 'PROMPT_REQUIRES_HUMAN') {
+          return await pauseNow(
+            step + 1,
+            'PROMPT_REQUIRES_HUMAN',
+            session.page.url(),
+            actionResult.hint ?? '页面弹出 prompt() 输入框，请人工处理完成后调用 browser_subagent_resume。'
+          );
+        }
 
         if (consecutiveFailures >= 3) {
           return {

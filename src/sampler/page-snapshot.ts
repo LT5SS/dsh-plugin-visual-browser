@@ -4,6 +4,7 @@ import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
 import type {
   MotionInspectResult,
+  NativeDialogRecord,
   NavigationDiagnostic,
   Point2D,
   ScrollDiagnostic,
@@ -172,6 +173,13 @@ export interface PageObservation {
   timestamp: string;
   screenshotPath: string;
   cursorPosition: Point2D;
+  viewport?: {
+    width: number;
+    height: number;
+    deviceScaleFactor: number;
+    emulated?: boolean;
+  };
+  dialogs?: NativeDialogRecord[];
   scroll: ScrollMetrics;
   domStats: DomTechStats;
   interactiveElements: InteractiveElementNode[];
@@ -440,6 +448,8 @@ export class PageSnapshotSampler {
   private outputDir: string;
   private stepCounter = 0;
   private snapshotGen = 0;
+  private refBaseOffset = 0;
+  private highestRefAssigned = 0;
 
   constructor(session: BrowserSession, outputDir: string) {
     this.session = session;
@@ -455,6 +465,30 @@ export class PageSnapshotSampler {
   }
 
   public getSnapshotGen(): number {
+    return this.snapshotGen;
+  }
+
+  /**
+   * Clears DOM ref attributes (defeating bfcache stale attributes) and advances snapshotGen.
+   * When bumpRefOffset is true (e.g. go_back/go_forward/reload), future ref IDs start past
+   * all previously issued numbers so stale #ref references strictly trigger REF_STALE.
+   */
+  public async invalidateRefs(opts?: { bumpRefOffset?: boolean }): Promise<number> {
+    this.snapshotGen++;
+    if (opts?.bumpRefOffset) {
+      this.refBaseOffset = Math.max(this.refBaseOffset, this.highestRefAssigned) + 100;
+    }
+    await safeEvaluate(
+      this.session.page,
+      () => {
+        document.querySelectorAll('[data-dsh-ref], [data-dsh-gen]').forEach((el) => {
+          el.removeAttribute('data-dsh-ref');
+          el.removeAttribute('data-dsh-gen');
+        });
+      },
+      undefined,
+      0
+    ).catch(() => {});
     return this.snapshotGen;
   }
 
@@ -514,14 +548,16 @@ export class PageSnapshotSampler {
         pluginUi: 0,
       } as ControlsFilterStats,
       cursorState: null as Point2D | null,
+      dpr: 1,
       design: undefined as DesignSnapshot | undefined,
     };
 
     const extracted = await safeEvaluate(
       page,
-      ({ gen }: { gen: number }) => {
+      ({ gen, refOffset }: { gen: number; refOffset: number }) => {
       const vw = window.innerWidth;
       const vh = window.innerHeight;
+      const dpr = Number(window.devicePixelRatio || 1);
       const sx = Math.round(window.scrollX);
       const sy = Math.round(window.scrollY);
       const sw = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0, vw);
@@ -573,7 +609,7 @@ export class PageSnapshotSampler {
         pluginUi: 0,
       };
 
-      let refIdx = 0;
+      let refIdx = refOffset;
       for (const el of candidates) {
         if (nodes.length >= 35) break;
         if (el.closest('#__dsh_vc_root__')) {
@@ -1654,18 +1690,26 @@ export class PageSnapshotSampler {
         interactiveElements: nodes,
         controlsFilterStats,
         cursorState,
+        dpr,
         design,
       };
     },
       fallbackExtracted,
       {
-        arg: { gen: currentGen },
+        arg: { gen: currentGen, refOffset: this.refBaseOffset },
         retries: 2,
         onDegraded: () => {
           degradedReason = 'sampler degraded: navigation race';
         },
       }
     );
+
+    for (const el of extracted.interactiveElements) {
+      const n = Number(el.ref.replace(/^#/, ''));
+      if (Number.isFinite(n) && n > this.highestRefAssigned) {
+        this.highestRefAssigned = n;
+      }
+    }
 
     if (extracted.design) {
       extracted.design.headings = extracted.design.headings.map((h) => ({
@@ -1705,12 +1749,22 @@ export class PageSnapshotSampler {
       (await this.session.motion.syncPositionFromPage?.()) ??
       this.session.motion.getPosition();
 
+    const emu = this.session.getViewportEmulation?.() ?? null;
+    const pendingDialogs = this.session.consumePendingDialogs?.() ?? [];
+
     return {
       stepIndex: this.stepCounter,
       snapshotGen: currentGen,
       timestamp: new Date().toISOString(),
       screenshotPath,
       cursorPosition: syncedPos,
+      viewport: {
+        width: extracted.scroll.viewportWidth,
+        height: extracted.scroll.viewportHeight,
+        deviceScaleFactor: Number(extracted.dpr || emu?.deviceScaleFactor || 1),
+        ...(emu?.active ? { emulated: true } : {}),
+      },
+      ...(pendingDialogs.length > 0 ? { dialogs: pendingDialogs } : {}),
       scroll: extracted.scroll,
       domStats: extracted.domStats,
       interactiveElements: extracted.interactiveElements,
@@ -1733,6 +1787,12 @@ export class PageSnapshotSampler {
       scrollDiagnostic,
       motionInspect,
     } = obs;
+    const dprVal = obs.viewport?.deviceScaleFactor ?? 1;
+    const dprSuffix =
+      obs.viewport && (obs.viewport.emulated || Math.abs(dprVal - 1) > 0.01)
+        ? ` @${Number.isInteger(dprVal) ? dprVal : Number(dprVal.toFixed(2))}x${obs.viewport.emulated ? ' (emulated)' : ''}`
+        : '';
+
     const lines: string[] = [
       `### [Step ${obs.stepIndex}] Page Observation HUD`,
       ...(obs.degradedReason ? [`- **Notice**: ${obs.degradedReason}`] : []),
@@ -1740,12 +1800,20 @@ export class PageSnapshotSampler {
       ...(navigation
         ? [
             `- **Navigation**: wait_until=${navigation.wait_until}, timed_out=${navigation.timed_out}, elapsed_ms=${navigation.elapsed_ms}, final_url=${navigation.final_url}` +
-              (navigation.retries ? `, retries=${navigation.retries}` : ''),
+              (navigation.retries ? `, retries=${navigation.retries}` : '') +
+              (navigation.blocked ? `, blocked=${navigation.blocked}` : ''),
+          ]
+        : []),
+      ...(obs.dialogs && obs.dialogs.length > 0
+        ? [
+            `- **Native Dialogs**: ${obs.dialogs
+              .map((d) => `[${d.type} (${d.handled})] ${JSON.stringify(d.message.slice(0, 160))}`)
+              .join(' | ')}`,
           ]
         : []),
       `- **Screenshot**: ${obs.screenshotPath}`,
       `- **Virtual Cursor**: (${Math.round(cursorPosition.x)}, ${Math.round(cursorPosition.y)})`,
-      `- **Scroll Progress**: ${scroll.scrollProgressPercent}% (Y: ${scroll.scrollY} / ${scroll.scrollHeight}px, Viewport: ${scroll.viewportWidth}x${scroll.viewportHeight})`,
+      `- **Scroll Progress**: ${scroll.scrollProgressPercent}% (Y: ${scroll.scrollY} / ${scroll.scrollHeight}px, Viewport: ${scroll.viewportWidth}x${scroll.viewportHeight}${dprSuffix})`,
       ...(scrollDiagnostic
         ? [
             `- **Scroll Result**: driver=${scrollDiagnostic.driver ?? 'wheel'}, attempted=${scrollDiagnostic.attempted}, effective_dom_delta=${scrollDiagnostic.effective_dom_delta}, dom_scrollable=${scrollDiagnostic.dom_scrollable}, visual_changed=${scrollDiagnostic.visual_changed}, at_boundary=${scrollDiagnostic.at_boundary}, locked=${scrollDiagnostic.locked}` +

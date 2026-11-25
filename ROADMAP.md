@@ -116,8 +116,20 @@
 
 ---
 
-## v2.0.0 规划（TODO）
+## v2.0.0 已交付（显式视口/DPR、条件等待、原语补齐、Win32 置顶自愈、外协议与弹窗纳管）
 
-- **其余 4 + 1 固定只读探针与架构升级**：`inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media` 与 `inspect_region(x, y, radius, zoom)` 局部 2× 放大能力，并辅以相邻帧区域差异文本补偿。
-- **Win32 `HWND_NOTOPMOST` 置顶自愈（v1.3.4 遗留）**：启动后及复用窗口前纠正意外 `WS_EX_TOPMOST` 状态。
-- **明确不做（历史记录）**：不在 LLM 思考期间冻结浏览器页面（`Emulation.setVirtualTimePolicy` 无法冻结网络流且恢复易触发 timer 风暴；`Animation.setPlaybackRate(0)` 对 rAF 无效；可见后台模式下会带来假死感），统一通过快速 `REF_STALE` 重采样 + 错误预算保证鲁棒性；不做任意 `evaluate_probe` JS 执行；不在 HUD 中对“虚拟滚动”下绝对判断；不从 WebGL canvas 帧缓冲读取像素/对象内容。
+- **P0 · `set_viewport(width, height, deviceScaleFactor)` 与零副作用基线**：未显式调用或传覆盖参数时，100% 保留物理窗体与系统 DPR；显式调用时通过 CDP `Emulation.setDeviceMetricsOverride` 设置 `320..2560` × `240..1600`、`DPR 1..2`（默认 `1`），`reset: true` 调用 `clearDeviceMetricsOverride()` 复位；启用仿真时截图与局部裁切（含 `inspect_motion` 32×32）走 CDP `Page.captureScreenshot`，防止 Playwright 覆盖仿真状态；`paused` 人工接管期间保持仿真视口不复位，状态条补提示 `已暂停 · 仿真 <W>×<H> @<DPR>x（物理窗口 <physW>px）`。
+- **P0 实测 DPR 截图样本口径（`verify-v200.mjs` 同夹具测量，含快照与 DOM 采样）**：`1440×900 @1`（`40,749 B` / `202 ms`）、`@1.5`（`82,390 B` / `469 ms`）、`@2`（`119,072 B` / `351 ms`，PNG `2880×1800`）。
+- **P1 · `wait_for` 条件等待**：支持 `selector`、`goneSelector`（判定 detached / `display:none` / `visibility:hidden` / `opacity<=0.01` / 零宽高）、`text`（`>=250ms` 轮询且先 `textContent` 初筛再 `innerText` 复核）、`networkIdle`、`animationsSettled`（显式过滤 `iterations === Infinity` 常驻动画）；支持 F8/按钮接管中断，超时结构化降级返回 `{ timed_out: true, satisfied, pending }` 不中断任务。
+- **P2 · 交互原语补齐 + 强制 `#ref` 失效守卫**：新增 `press_key`（组合键拦截 `F8`、含 `F8` 组合键与 `Alt+F4`，返回 `RESERVED_HOTKEY`）、`select_option`、`go_back`、`go_forward`、`reload`；通过 CDP `Page.getNavigationHistory` 防止退回初始 `about:blank` 并正确返回 `no_history: true`；导航/历史跳转后清理 `[data-dsh-ref]` 并递增 `snapshotGen` 与 ref 基址，旧 `#ref` 严格返回 `REF_STALE`。
+- **P3 · Win32 `HWND_NOTOPMOST` 自愈（v1.3.4 遗留）**：启动排布后及复用可见会话前检查 `WS_EX_TOPMOST`，通过 `SetWindowPos(HWND_NOTOPMOST)` 清零（不采用无效的 `SetWindowLong`）。
+- **P4 · 外部协议与 `javascript:` URL 双层拦截**：白名单严格收紧为 `{ http:, https:, about:, blob:, data:, file: }`（禁止 `javascript:`）；导航层与注入捕获层（`activeSession && !paused` 时生效）拦截 `javascript:` -> `JS_URL` 及 `mailto:`/`tel:` 等 -> `EXTERNAL_PROTOCOL`，并回传完整 `href`。
+- **P5 · 原生 `dialog` 纳管**：监听 `page.on('dialog')`，`alert` / `confirm` 自动接受并将文案记入 HUD `Native Dialogs`；`prompt` 自动取消并返回 `blocked: 'PROMPT_REQUIRES_HUMAN'` 暂停交人工；`beforeunload` 延续现有 `unloadGuard` 语义。
+
+---
+
+## 后续规划（v2.0.1 / v2.1.0）
+
+- **`v2.0.1`（只读深探针与局部放大通道）**：`inspect_region(x, y, radius, zoom)`（随用随消不占滑动窗 3 张历史名额）+ `inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`。
+- **`v2.1.0`（会话层与复杂站点）**：`TabManager` 多标签追踪（不自动切换，HUD `[Tabs]` 提示）+ 有界批量动作 `actions[]` 与早停守卫 + 反循环检测（anti-stall）+ 同源 `iframe` `#ref`。
+- **长期红线（明确不做）**：不开放任意 `evaluate_probe` JS 执行；不在 LLM 思考期间冻结页面（`Emulation.setVirtualTimePolicy` / `Animation.setPlaybackRate(0)` 会破坏网络流与 rAF 并制造假死感）；不绕过登录/支付/CAPTCHA 门控；不从 WebGL canvas 帧缓冲读取像素/对象内容。

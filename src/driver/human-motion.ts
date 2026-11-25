@@ -6,6 +6,8 @@ import type {
   DragActionResult,
   MotionOptions,
   Point2D,
+  ProtocolInterceptInfo,
+  ViewportEmulationState,
   VirtualCursorStyleConfig,
 } from './types.js';
 import { buildVirtualCursorInitScript, resolveCursorStyle } from '../injected/virtual-cursor.js';
@@ -41,6 +43,8 @@ export class HumanMotionController {
   private takeoverRole = '';
   private takeoverHotkey: string;
   private unloadGuardEnabled = false;
+  private viewportEmulation: ViewportEmulationState | null = null;
+  private protocolGuardArmed = false;
 
   constructor(
     page: Page,
@@ -141,6 +145,8 @@ export class HumanMotionController {
       unloadGuard: this.unloadGuardEnabled,
       activeSession: this.takeoverMode === 'running',
       takeoverMode: this.takeoverMode,
+      viewportEmulation: this.viewportEmulation,
+      protocolGuardArmed: this.protocolGuardArmed,
     });
     await safeEvaluate(
       this.page,
@@ -152,6 +158,8 @@ export class HumanMotionController {
         unloadGuard: boolean;
         takeoverMode: TakeoverControlMode;
         roleLabel: string;
+        viewportEmulation: ViewportEmulationState | null;
+        protocolGuardArmed: boolean;
       }) => {
         if (!(window as any).__dshVirtualCursorInstalled) {
           (0, eval)(arg.script);
@@ -161,6 +169,8 @@ export class HumanMotionController {
           (window as any).__dshCursorAPI.setStyle?.(arg.style, { fromHost: true });
           (window as any).__dshCursorAPI.setTakeoverHotkey?.(arg.hotkey);
           (window as any).__dshCursorAPI.setUnloadGuard?.(arg.unloadGuard);
+          (window as any).__dshCursorAPI.setViewportEmulation?.(arg.viewportEmulation);
+          (window as any).__dshCursorAPI.setProtocolGuardArmed?.(arg.protocolGuardArmed);
           (window as any).__dshCursorAPI.setTakeoverState?.(arg.takeoverMode, arg.roleLabel);
         }
       },
@@ -174,6 +184,8 @@ export class HumanMotionController {
           unloadGuard: this.unloadGuardEnabled,
           takeoverMode: this.takeoverMode,
           roleLabel: this.takeoverRole,
+          viewportEmulation: this.viewportEmulation,
+          protocolGuardArmed: this.protocolGuardArmed,
         },
         retries: 1,
       }
@@ -221,6 +233,57 @@ export class HumanMotionController {
       undefined,
       0
     );
+  }
+
+  public async setViewportEmulation(info: ViewportEmulationState | null): Promise<void> {
+    this.viewportEmulation = info && info.active ? { ...info } : null;
+    await this.ensureCursorHUD(false);
+    await safeEvaluate(
+      this.page,
+      (arg: ViewportEmulationState | null) => {
+        (window as any).__dshCursorAPI?.setViewportEmulation?.(arg);
+      },
+      undefined,
+      { arg: this.viewportEmulation, retries: 0 }
+    );
+  }
+
+  public getViewportEmulation(): ViewportEmulationState | null {
+    return this.viewportEmulation ? { ...this.viewportEmulation } : null;
+  }
+
+  public async setProtocolGuardArmed(on: boolean): Promise<void> {
+    this.protocolGuardArmed = Boolean(on);
+    await safeEvaluate(
+      this.page,
+      (flag: boolean) => {
+        (window as any).__dshCursorAPI?.setProtocolGuardArmed?.(flag);
+      },
+      undefined,
+      { arg: this.protocolGuardArmed, retries: 0 }
+    );
+  }
+
+  public async clearInterceptedProtocol(): Promise<void> {
+    await safeEvaluate(
+      this.page,
+      () => {
+        (window as any).__dshCursorAPI?.clearInterceptedProtocol?.();
+      },
+      undefined,
+      0
+    );
+  }
+
+  public async consumeInterceptedProtocol(): Promise<ProtocolInterceptInfo | null> {
+    return await safeEvaluate<ProtocolInterceptInfo | null>(
+      this.page,
+      () => {
+        return (window as any).__dshCursorAPI?.consumeInterceptedProtocol?.() ?? null;
+      },
+      null,
+      0
+    ).catch(() => null);
   }
 
   /**

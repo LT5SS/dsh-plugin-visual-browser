@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { MotionInspectResult, NavigationDiagnostic, Point2D, ScrollDiagnostic } from '../driver/types.js';
+import type { MotionInspectResult, NativeDialogRecord, NavigationDiagnostic, Point2D, ScrollDiagnostic } from '../driver/types.js';
 import type { TelemetryHealthReport } from './telemetry-collector.js';
 /** Returns true when a Playwright error stems from mid-evaluation navigation or frame detachment. */
 export declare function isNavigationRaceError(error: unknown): boolean;
@@ -139,6 +139,13 @@ export interface PageObservation {
     timestamp: string;
     screenshotPath: string;
     cursorPosition: Point2D;
+    viewport?: {
+        width: number;
+        height: number;
+        deviceScaleFactor: number;
+        emulated?: boolean;
+    };
+    dialogs?: NativeDialogRecord[];
     scroll: ScrollMetrics;
     domStats: DomTechStats;
     interactiveElements: InteractiveElementNode[];
@@ -163,10 +170,20 @@ export declare class PageSnapshotSampler {
     private outputDir;
     private stepCounter;
     private snapshotGen;
+    private refBaseOffset;
+    private highestRefAssigned;
     constructor(session: BrowserSession, outputDir: string);
     getOutputDir(): string;
     getNextStepNumber(): number;
     getSnapshotGen(): number;
+    /**
+     * Clears DOM ref attributes (defeating bfcache stale attributes) and advances snapshotGen.
+     * When bumpRefOffset is true (e.g. go_back/go_forward/reload), future ref IDs start past
+     * all previously issued numbers so stale #ref references strictly trigger REF_STALE.
+     */
+    invalidateRefs(opts?: {
+        bumpRefOffset?: boolean;
+    }): Promise<number>;
     captureSnapshot(tag?: string): Promise<PageObservation>;
     formatObservationForLLM(obs: PageObservation): string;
 }

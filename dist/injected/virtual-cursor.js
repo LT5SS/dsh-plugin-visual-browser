@@ -184,6 +184,8 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
         unloadGuard: Boolean(opts.unloadGuard),
         activeSession: Boolean(opts.activeSession),
         takeoverMode: opts.takeoverMode ?? '',
+        viewportEmulation: opts.viewportEmulation ?? null,
+        protocolGuardArmed: Boolean(opts.protocolGuardArmed),
     });
     return `
 (() => {
@@ -224,6 +226,12 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     if (window.__dshCursorAPI && window.__dshCursorAPI.setUnloadGuard) {
       window.__dshCursorAPI.setUnloadGuard(Boolean(INITIAL_OPTS.unloadGuard));
     }
+    if (window.__dshCursorAPI && window.__dshCursorAPI.setViewportEmulation && INITIAL_OPTS.viewportEmulation !== undefined) {
+      window.__dshCursorAPI.setViewportEmulation(INITIAL_OPTS.viewportEmulation);
+    }
+    if (window.__dshCursorAPI && window.__dshCursorAPI.setProtocolGuardArmed) {
+      window.__dshCursorAPI.setProtocolGuardArmed(Boolean(INITIAL_OPTS.protocolGuardArmed));
+    }
     return;
   }
   window.__dshVirtualCursorInstalled = true;
@@ -261,6 +269,8 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     takeoverHotkey: INITIAL_OPTS.takeoverHotkey || 'F8',
     takeoverPending: Boolean(window.__dshTakeoverRequested),
     panelPassThrough: false,
+    viewportEmulation: INITIAL_OPTS.viewportEmulation || null,
+    protocolGuardArmed: Boolean(INITIAL_OPTS.protocolGuardArmed),
     dragActive: false,
     dragOrigin: null,
     dragTarget: null,
@@ -310,9 +320,24 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
 
   if (!window.__dshVcResizeInstalled) {
     window.__dshVcResizeInstalled = true;
-    window.addEventListener('resize', () => {
+    const onViewportResize = () => {
       placeBadge(state.x, state.y);
-    });
+    };
+    window.addEventListener('resize', onViewportResize);
+    if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', onViewportResize);
+    }
+    const attachRootObserver = () => {
+      if (window.__dshVcRootResizeObserver || typeof ResizeObserver !== 'function') return;
+      if (!document.documentElement) return;
+      const ro = new ResizeObserver(onViewportResize);
+      ro.observe(document.documentElement);
+      window.__dshVcRootResizeObserver = ro;
+    };
+    attachRootObserver();
+    if (!window.__dshVcRootResizeObserver && document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', attachRootObserver, { once: true });
+    }
   }
 
   function isCenterTestMode() {
@@ -345,6 +370,47 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
         window.__dshRequestResume();
       }
     } catch {}
+  }
+
+  if (!window.__dshProtocolGuardInstalled) {
+    window.__dshProtocolGuardInstalled = true;
+    const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'about:', 'blob:', 'data:', 'file:']);
+    document.addEventListener(
+      'click',
+      (e) => {
+        try {
+          if (state.takeoverMode === 'paused') return;
+          if (state.takeoverMode !== 'running' && !state.protocolGuardArmed) return;
+          const targetEl = e.target;
+          const anchor = targetEl && targetEl.closest ? targetEl.closest('a[href]') : null;
+          if (!anchor) return;
+          const rawAttr = (anchor.getAttribute('href') || '').trim();
+          if (!rawAttr || rawAttr.startsWith('#') || rawAttr.startsWith('/') || rawAttr.startsWith('.')) return;
+          const explicitSchemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(rawAttr);
+          const resolvedHref = (anchor.href || rawAttr || '').trim();
+          let scheme = '';
+          if (explicitSchemeMatch) {
+            scheme = explicitSchemeMatch[1].toLowerCase() + ':';
+          } else {
+            try {
+              scheme = new URL(resolvedHref, window.location.href).protocol.toLowerCase();
+            } catch {
+              scheme = '';
+            }
+          }
+          if (!scheme || SAFE_PROTOCOLS.has(scheme)) return;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          window.__dshLastInterceptedProtocol = {
+            kind: scheme === 'javascript:' ? 'JS_URL' : 'EXTERNAL_PROTOCOL',
+            protocol: scheme,
+            href: rawAttr || resolvedHref,
+            ts: Date.now(),
+          };
+        } catch {}
+      },
+      true
+    );
   }
 
   if (!window.__dshTakeoverHotkeyInstalled) {
@@ -600,7 +666,15 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       const pausedHint = hotkey
         ? '（再按 ' + hotkey + ' 无效果，请点右侧或说「继续」）'
         : '（请点右侧或说「继续」）';
-      txt.textContent = '已暂停 · 等待人工接管' + pausedHint;
+      const emu = state.viewportEmulation;
+      let emuPrefix = '';
+      if (emu && emu.active && emu.width && emu.height) {
+        const dprNum = Number(emu.deviceScaleFactor || 1);
+        const dprText = Number.isInteger(dprNum) ? String(dprNum) : String(Number(dprNum.toFixed(2)));
+        const physText = emu.physicalWidth ? '（物理窗口 ' + Math.round(emu.physicalWidth) + 'px）' : '';
+        emuPrefix = ' · 仿真 ' + Math.round(emu.width) + '×' + Math.round(emu.height) + ' @' + dprText + 'x' + physText;
+      }
+      txt.textContent = '已暂停' + emuPrefix + ' · 等待人工接管' + pausedHint;
       btn.style.display = 'inline-block';
       btn.disabled = false;
       btn.textContent = '继续执行';
@@ -1067,6 +1141,21 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     setPanelPassThrough(on) {
       state.panelPassThrough = Boolean(on);
       renderTakeoverPanel();
+    },
+    setViewportEmulation(info) {
+      state.viewportEmulation = info && info.active ? { ...info } : null;
+      renderTakeoverPanel();
+    },
+    setProtocolGuardArmed(on) {
+      state.protocolGuardArmed = Boolean(on);
+    },
+    clearInterceptedProtocol() {
+      window.__dshLastInterceptedProtocol = null;
+    },
+    consumeInterceptedProtocol() {
+      const val = window.__dshLastInterceptedProtocol || null;
+      window.__dshLastInterceptedProtocol = null;
+      return val;
     },
     resetTakeoverRequest() {
       window.__dshTakeoverRequested = false;

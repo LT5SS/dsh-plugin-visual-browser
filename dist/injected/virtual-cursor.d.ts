@@ -1,4 +1,4 @@
-import type { VirtualCursorPreset, VirtualCursorStyleConfig } from '../driver/types.js';
+import type { ViewportEmulationState, VirtualCursorPreset, VirtualCursorStyleConfig } from '../driver/types.js';
 export declare const POINTER_SHAPE_SVG_PATHS: Record<'arrow' | 'crosshair' | 'dot' | 'star' | 'ring', string>;
 export declare function sanitizeCustomPointerImageUrl(url?: string): string;
 export type ResolvedVirtualCursorStyle = Required<Omit<VirtualCursorStyleConfig, 'preset'>> & {
@@ -13,5 +13,7 @@ export declare function buildVirtualCursorInitScript(initialStyle?: VirtualCurso
     unloadGuard?: boolean;
     activeSession?: boolean;
     takeoverMode?: 'running' | 'paused' | 'idle' | 'hidden';
+    viewportEmulation?: ViewportEmulationState | null;
+    protocolGuardArmed?: boolean;
 }): string;
 export declare const VIRTUAL_CURSOR_INIT_SCRIPT: string;

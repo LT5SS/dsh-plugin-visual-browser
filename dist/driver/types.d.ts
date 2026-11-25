@@ -6,8 +6,11 @@ export interface NavigationDiagnostic {
     final_url: string;
     retries?: number;
     recovered_from?: string;
+    blocked?: 'EXTERNAL_PROTOCOL' | 'JS_URL';
+    protocol?: string;
+    href?: string;
 }
-export type ActionBlockedReason = 'PLUGIN_UI_LAYER' | 'REF_STALE' | 'ELEMENT_NOT_FOUND' | 'ACTION_TIMEOUT';
+export type ActionBlockedReason = 'PLUGIN_UI_LAYER' | 'REF_STALE' | 'ELEMENT_NOT_FOUND' | 'ACTION_TIMEOUT' | 'EXTERNAL_PROTOCOL' | 'JS_URL' | 'RESERVED_HOTKEY' | 'PROMPT_REQUIRES_HUMAN';
 export interface ScrollDiagnostic {
     attempted: number;
     effective_dom_delta: number;
@@ -70,6 +73,54 @@ export interface BrowserWindowBounds {
 export interface ViewportSize {
     width: number;
     height: number;
+    deviceScaleFactor?: number;
+}
+export interface ViewportEmulationState {
+    active: boolean;
+    width: number;
+    height: number;
+    deviceScaleFactor: number;
+    physicalWidth?: number;
+    physicalHeight?: number;
+}
+export interface SetViewportOptions {
+    width?: number;
+    height?: number;
+    deviceScaleFactor?: number;
+    reset?: boolean;
+}
+export interface WaitForOptions {
+    selector?: string;
+    goneSelector?: string;
+    text?: string;
+    networkIdle?: boolean;
+    animationsSettled?: boolean;
+    timeoutMs?: number;
+}
+export interface WaitForResult {
+    ok: boolean;
+    timed_out: boolean;
+    aborted_by_takeover?: boolean;
+    elapsed_ms: number;
+    satisfied: string[];
+    pending: string[];
+}
+export interface NativeDialogRecord {
+    type: 'alert' | 'confirm' | 'prompt' | 'beforeunload';
+    message: string;
+    defaultValue?: string;
+    handled: 'accepted' | 'dismissed';
+    timestamp: string;
+}
+export interface ProtocolInterceptInfo {
+    kind: 'EXTERNAL_PROTOCOL' | 'JS_URL';
+    protocol: string;
+    href: string;
+    ts: number;
+}
+export interface NotTopmostResult {
+    checked: boolean;
+    clearedTopmost: boolean;
 }
 export type VirtualCursorShape = 'arrow' | 'crosshair' | 'dot' | 'star' | 'ring' | 'custom-svg' | 'custom-image';
 export type VirtualCursorPreset = 'cyber-neon' | 'comet-gold' | 'laser-dots' | 'stealth-minimal' | 'clean-none' | 'custom';
@@ -118,6 +169,8 @@ export interface BrowserSessionOptions {
     executablePath?: string;
     userDataDir?: string;
     viewport?: ViewportSize;
+    /** Explicit CDP device metrics override (only applied when set explicitly; never implicitly triggered by default viewport) */
+    viewportOverride?: ViewportSize;
     /**
      * Window presentation mode for local Chrome/Edge sessions:
      * - `'visible-background'` (default): visible window placed behind the active foreground window without stealing focus

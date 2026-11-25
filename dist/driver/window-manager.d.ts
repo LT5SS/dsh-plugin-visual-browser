@@ -1,4 +1,4 @@
-import type { BrowserSessionOptions, BrowserWindowBounds, BrowserWindowMode } from './types.js';
+import type { BrowserSessionOptions, BrowserWindowBounds, BrowserWindowMode, NotTopmostResult } from './types.js';
 /**
  * Resolves the effective window presentation mode in priority order:
  * 1. Explicit `opts.windowMode`
@@ -52,3 +52,9 @@ export declare function launchChromeNoActivateWin32(opts: {
  * Terminates a Win32-launched Chrome process tree and cleans up any ephemeral user-data-dir.
  */
 export declare function terminateLaunchedChrome(pid: number, userDataDir?: string, ephemeralProfile?: boolean): Promise<void>;
+/**
+ * Checks whether a Win32 HWND carries `WS_EX_TOPMOST` (0x00000008) and clears it via
+ * `SetWindowPos(HWND_NOTOPMOST)` without altering window size, position, or focus.
+ * Note: `SetWindowLong` clear is ineffective for topmost bit; `SetWindowPos` is required.
+ */
+export declare function ensureWindowNotTopmostWin32(hwnd: number): Promise<NotTopmostResult>;

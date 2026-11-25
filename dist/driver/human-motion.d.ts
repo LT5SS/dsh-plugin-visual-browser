@@ -1,5 +1,5 @@
 import type { Page } from 'playwright-core';
-import type { ActionBlockedReason, ClickActionResult, ClickHitTestResult, DragActionResult, MotionOptions, Point2D, VirtualCursorStyleConfig } from './types.js';
+import type { ActionBlockedReason, ClickActionResult, ClickHitTestResult, DragActionResult, MotionOptions, Point2D, ProtocolInterceptInfo, ViewportEmulationState, VirtualCursorStyleConfig } from './types.js';
 export type TakeoverControlMode = 'running' | 'paused' | 'idle' | 'hidden';
 export declare class HumanMotionController {
     private page;
@@ -11,6 +11,8 @@ export declare class HumanMotionController {
     private takeoverRole;
     private takeoverHotkey;
     private unloadGuardEnabled;
+    private viewportEmulation;
+    private protocolGuardArmed;
     constructor(page: Page, initialStyle?: VirtualCursorStyleConfig, opts?: {
         showTakeoverControl?: boolean;
         takeoverHotkey?: string;
@@ -31,6 +33,11 @@ export declare class HumanMotionController {
     setTakeoverHotkey(hotkey: string): Promise<void>;
     setTakeoverState(mode: TakeoverControlMode, roleLabel?: string): Promise<void>;
     resetTakeoverRequest(): Promise<void>;
+    setViewportEmulation(info: ViewportEmulationState | null): Promise<void>;
+    getViewportEmulation(): ViewportEmulationState | null;
+    setProtocolGuardArmed(on: boolean): Promise<void>;
+    clearInterceptedProtocol(): Promise<void>;
+    consumeInterceptedProtocol(): Promise<ProtocolInterceptInfo | null>;
     /**
      * Dynamically updates the virtual cursor & trail style (preset or custom colors/width/length/variant).
      */

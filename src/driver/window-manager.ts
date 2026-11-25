@@ -9,6 +9,7 @@ import type {
   BrowserSessionOptions,
   BrowserWindowBounds,
   BrowserWindowMode,
+  NotTopmostResult,
 } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -236,8 +237,23 @@ public static class DshNoActivateWin32 {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLong")] public static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")] public static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
   [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, out RECT pvParam, uint fWinIni);
   [DllImport("user32.dll")] public static extern IntPtr SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+  public static long GetExStyle(IntPtr hWnd) {
+    if (IntPtr.Size == 8) return GetWindowLongPtr64(hWnd, -20).ToInt64();
+    return (long)GetWindowLong32(hWnd, -20);
+  }
+
+  public static bool EnsureNotTopmost(IntPtr hWnd) {
+    if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return false;
+    long exStyle = GetExStyle(hWnd);
+    if ((exStyle & 0x00000008L) == 0) return false;
+    SetWindowPos(hWnd, new IntPtr(-2) /* HWND_NOTOPMOST */, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 /* SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE */);
+    return true;
+  }
 
   public static IntPtr FindMainChromeWindow(uint pid, int timeoutMs) {
     int waited = 0;
@@ -313,6 +329,7 @@ public static class DshNoActivateWin32 {
       if (GetForegroundWindow() == hwnd) {
         SetWindowPos(hwnd, insertAfter, x, y, w, h, 0x0010 /* SWP_NOACTIVATE */);
       }
+      EnsureNotTopmost(hwnd);
     }
 
     return new int[] { pid, (int)hwnd.ToInt64(), x, y, w, h };
@@ -414,5 +431,64 @@ export async function terminateLaunchedChrome(
     } catch {
       /* ignore file-lock race on immediate close */
     }
+  }
+}
+
+/**
+ * Checks whether a Win32 HWND carries `WS_EX_TOPMOST` (0x00000008) and clears it via
+ * `SetWindowPos(HWND_NOTOPMOST)` without altering window size, position, or focus.
+ * Note: `SetWindowLong` clear is ineffective for topmost bit; `SetWindowPos` is required.
+ */
+export async function ensureWindowNotTopmostWin32(hwnd: number): Promise<NotTopmostResult> {
+  if (process.platform !== 'win32' || !Number.isFinite(hwnd) || hwnd <= 0) {
+    return { checked: false, clearedTopmost: false };
+  }
+  const intHwnd = Math.trunc(hwnd);
+  const psScript = `
+$ErrorActionPreference = 'Stop'
+if (-not ([System.Management.Automation.PSTypeName]'DshNotTopmostWin32').Type) {
+  Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class DshNotTopmostWin32 {
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLong")] public static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")] public static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+  public static int CheckAndClear(long rawHwnd) {
+    IntPtr hWnd = new IntPtr(rawHwnd);
+    if (hWnd == IntPtr.Zero || !IsWindow(hWnd)) return -1;
+    long exStyle = IntPtr.Size == 8 ? GetWindowLongPtr64(hWnd, -20).ToInt64() : (long)GetWindowLong32(hWnd, -20);
+    if ((exStyle & 0x00000008L) == 0) return 0;
+    SetWindowPos(hWnd, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+    return 1;
+  }
+}
+"@
+}
+$rc = [DshNotTopmostWin32]::CheckAndClear(${intHwnd})
+Write-Output ("{""checked"":" + ($(if ($rc -ge 0) { 'true' } else { 'false' })) + ",""clearedTopmost"":" + ($(if ($rc -eq 1) { 'true' } else { 'false' })) + "}")
+`;
+  try {
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
+      { timeout: 8000, windowsHide: true }
+    );
+    const lines = stdout
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith('{') && l.endsWith('}'));
+    if (lines.length === 0) {
+      return { checked: false, clearedTopmost: false };
+    }
+    const parsed = JSON.parse(lines[lines.length - 1]) as NotTopmostResult;
+    return {
+      checked: Boolean(parsed.checked),
+      clearedTopmost: Boolean(parsed.clearedTopmost),
+    };
+  } catch {
+    return { checked: false, clearedTopmost: false };
   }
 }

@@ -38,6 +38,7 @@ import {
   extractVisualPaletteFromPng,
   findLocalBrowserExecutable,
   formatDesignBlock,
+  isValidSubagentDecision,
   loadPersistedSettings,
   normSplit,
   parseJsonDecision,
@@ -48,7 +49,9 @@ import {
   resolveSettingsFilePath,
   safeEvaluate,
   savePersistedSettings,
+  summarizeDecisionAction,
   type DshCordisContext,
+  type SubagentActionDecision,
 } from '../src/index.js';
 
 const MIME_MAP: Record<string, string> = {
@@ -4330,6 +4333,92 @@ async function main() {
       await v145Plugin.runner.closeAllSessions();
     }
     console.log('[Strict DSH 0.2 Contract] 5w Verified non-leaking pill capsule, clickable running button, paused_by=button & resumed_by=button!');
+
+    // 6a. v2.0.0: Zero-side-effect baseline + explicit set_viewport / DPR 2 + paused emulation retention + reset
+    let v200LlmCalls = 0;
+    const v200Host = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream() {
+            v200LlmCalls++;
+            if (v200LlmCalls === 1) {
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'set_viewport', width: 1440, height: 900, deviceScaleFactor: 2, reason: 'Inspect 1440px @2x' }) };
+            } else if (v200LlmCalls === 2) {
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'pause_for_takeover', blockReason: 'LOGIN_REQUIRED', message: 'Check paused emulation retention' }) };
+            } else {
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'V200_SET_VIEWPORT_OK' }) };
+            }
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const v200Plugin = apply(v200Host.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...v200Host.effectDisposers);
+    const v200RunDef = v200Host.registeredTools.get('browser_subagent_run')!;
+    const v200ResumeDef = v200Host.registeredTools.get('browser_subagent_resume')!;
+    try {
+      const pauseViewportRun: any = await v200RunDef.execute(
+        { url: srv.url, role: 'v2.0.0 Viewport', task_prompt: 'Verify set_viewport & paused retention', max_steps: 5 },
+        fakeExec
+      );
+      assert.equal(pauseViewportRun.status, 'PAUSED_FOR_TAKEOVER');
+      const pausedV200Sess = v200Plugin.runner.getPausedSession(pauseViewportRun.subagent_id)?.session;
+      assert.ok(pausedV200Sess);
+      const midPauseMetrics = await safeEvaluate(
+        pausedV200Sess.page,
+        () => ({
+          w: window.innerWidth,
+          h: window.innerHeight,
+          dpr: window.devicePixelRatio,
+          pill: document.getElementById('__dsh_vc_status_text__')?.textContent ?? '',
+        }),
+        { w: 0, h: 0, dpr: 0, pill: '' },
+        0
+      );
+      assert.equal(midPauseMetrics.w, 1440);
+      assert.equal(midPauseMetrics.h, 900);
+      assert.equal(midPauseMetrics.dpr, 2);
+      assert.ok(midPauseMetrics.pill.includes('仿真 1440×900 @2x'), `Unexpected paused pill: ${midPauseMetrics.pill}`);
+
+      const resumedV200: any = await v200ResumeDef.execute(
+        { subagent_id: pauseViewportRun.subagent_id, human_note: 'Done inspecting' },
+        fakeExec
+      );
+      assert.equal(resumedV200.status, 'COMPLETED');
+      assert.ok(resumedV200.subagent_report.includes('V200_SET_VIEWPORT_OK'));
+    } finally {
+      await v200Plugin.runner.closeAllSessions();
+    }
+    console.log('[Strict DSH 0.2 Contract] 6a Verified set_viewport(1440, 900, 2), paused emulation retention & capsule hint!');
+
+    // 6b. v2.0.0: Action schemas & decision validation for wait_for, press_key, select_option, go_back, go_forward, reload
+    const v200DiagActions: SubagentActionDecision[] = [
+      { type: 'set_viewport', width: 1440, height: 900, deviceScaleFactor: 1.5, reason: 'DPR 1.5' },
+      { type: 'wait_for', selector: 'h1', goneSelector: '.loader', animationsSettled: true, timeoutMs: 5000, reason: 'Wait ready' },
+      { type: 'press_key', key: 'Escape', repeat: 1, reason: 'Close modal' },
+      { type: 'select_option', target: '#sel', label: 'Option B', reason: 'Pick B' },
+      { type: 'go_back', reason: 'Back' },
+      { type: 'go_forward', reason: 'Forward' },
+      { type: 'reload', reason: 'Reload' },
+    ];
+    for (const act of v200DiagActions) {
+      assert.equal(isValidSubagentDecision(act), true, `Expected valid decision for ${act.type}`);
+      const summary = summarizeDecisionAction(act);
+      assert.equal(summary.type, act.type);
+    }
+    console.log('[Strict DSH 0.2 Contract] 6b Verified v2.0.0 action decision validation & diagnostic summarization!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

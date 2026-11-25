@@ -5,7 +5,7 @@ import { buildVirtualCursorInitScript } from '../injected/virtual-cursor.js';
 import { HumanMotionController } from './human-motion.js';
 import { isNavigationRaceError, safeEvaluate } from '../sampler/page-snapshot.js';
 import { TelemetryCollector } from '../sampler/telemetry-collector.js';
-import { launchChromeNoActivateWin32, resolveBrowserWindowMode, terminateLaunchedChrome, } from './window-manager.js';
+import { ensureWindowNotTopmostWin32, launchChromeNoActivateWin32, resolveBrowserWindowMode, terminateLaunchedChrome, } from './window-manager.js';
 const LOCAL_BROWSER_CANDIDATES = [
     process.env.DSH_BROWSER_EXECUTABLE,
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -17,6 +17,32 @@ const LOCAL_BROWSER_CANDIDATES = [
     '/usr/bin/google-chrome',
     '/usr/bin/chromium-browser',
 ].filter(Boolean);
+const ALLOWED_NAVIGATION_SCHEMES = new Set([
+    'http:',
+    'https:',
+    'about:',
+    'blob:',
+    'data:',
+    'file:',
+]);
+export function classifyUrlProtocol(rawUrl) {
+    const trimmed = String(rawUrl ?? '').trim();
+    if (!trimmed) {
+        return { allowed: true, protocol: '', href: trimmed };
+    }
+    const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(trimmed);
+    if (!match) {
+        return { allowed: true, protocol: '', href: trimmed };
+    }
+    const protocol = `${match[1].toLowerCase()}:`;
+    if (protocol === 'javascript:') {
+        return { allowed: false, blocked: 'JS_URL', protocol, href: trimmed };
+    }
+    if (!ALLOWED_NAVIGATION_SCHEMES.has(protocol)) {
+        return { allowed: false, blocked: 'EXTERNAL_PROTOCOL', protocol, href: trimmed };
+    }
+    return { allowed: true, protocol, href: trimmed };
+}
 export function isTransientNavigationError(error) {
     const message = String(error?.message ?? error);
     return /ERR_NETWORK_CHANGED|ERR_CONNECTION_RESET|ERR_CONNECTION_ABORTED|ERR_CONNECTION_CLOSED|ERR_TIMED_OUT/i.test(message);
@@ -54,6 +80,14 @@ export class BrowserSession {
     lastMainFrameDocUrl = '';
     disconnectListeners = new Set();
     resumeListeners = new Set();
+    cdpSession = null;
+    viewportEmulation = null;
+    physicalViewportSize = null;
+    dialogListenerAttached = false;
+    dialogHistory = [];
+    unreadDialogs = [];
+    pendingPromptDialog = null;
+    lastNotTopmostResult = { checked: false, clearedTopmost: false };
     constructor(opts = {}) {
         const resolvedWindowMode = resolveBrowserWindowMode(opts);
         this.resolvedWindowMode = resolvedWindowMode;
@@ -299,6 +333,10 @@ export class BrowserSession {
         }
         this.telemetry = new TelemetryCollector(this.page);
         this.lastMainFrameDocUrl = this.stripUrlHash(this.page.url());
+        this.attachDialogHandler();
+        if (this.options.viewportOverride) {
+            await this.setViewport(this.options.viewportOverride);
+        }
         this.page.on('framenavigated', (frame) => {
             try {
                 if (frame !== this.page.mainFrame())
@@ -323,8 +361,160 @@ export class BrowserSession {
         });
         return this;
     }
+    attachDialogHandler() {
+        if (this.dialogListenerAttached || !this.page)
+            return;
+        this.dialogListenerAttached = true;
+        this.page.on('dialog', (dialog) => {
+            void this.handleNativeDialog(dialog);
+        });
+    }
+    async handleNativeDialog(dialog) {
+        const rawType = dialog.type();
+        const type = rawType === 'alert' || rawType === 'confirm' || rawType === 'prompt' || rawType === 'beforeunload'
+            ? rawType
+            : 'alert';
+        const message = String(dialog.message?.() ?? '');
+        const defaultValue = typeof dialog.defaultValue === 'function' ? dialog.defaultValue() : undefined;
+        const timestamp = new Date().toISOString();
+        if (type === 'beforeunload') {
+            const shouldAccept = this.closingIntentionally ||
+                this.navigatingViaSession ||
+                !this.motion?.isUnloadGuardEnabled();
+            if (shouldAccept) {
+                await dialog.accept().catch(() => { });
+            }
+            else {
+                await dialog.dismiss().catch(() => { });
+            }
+            return;
+        }
+        if (type === 'prompt') {
+            await dialog.dismiss().catch(() => { });
+            const record = {
+                type: 'prompt',
+                message,
+                ...(defaultValue !== undefined ? { defaultValue } : {}),
+                handled: 'dismissed',
+                timestamp,
+            };
+            this.pushDialogRecord(record);
+            this.pendingPromptDialog = record;
+            return;
+        }
+        await dialog.accept().catch(() => { });
+        this.pushDialogRecord({
+            type,
+            message,
+            handled: 'accepted',
+            timestamp,
+        });
+    }
+    pushDialogRecord(record) {
+        this.dialogHistory.push(record);
+        if (this.dialogHistory.length > 50) {
+            this.dialogHistory.shift();
+        }
+        this.unreadDialogs.push(record);
+        if (this.unreadDialogs.length > 20) {
+            this.unreadDialogs.shift();
+        }
+    }
+    consumePendingDialogs() {
+        if (this.unreadDialogs.length === 0)
+            return [];
+        return this.unreadDialogs.splice(0, this.unreadDialogs.length);
+    }
+    consumePendingPromptDialog() {
+        const out = this.pendingPromptDialog;
+        this.pendingPromptDialog = null;
+        return out;
+    }
+    getDialogHistory() {
+        return [...this.dialogHistory];
+    }
+    async getOrCreateCdpSession() {
+        if (this.cdpSession)
+            return this.cdpSession;
+        this.cdpSession = await this.context.newCDPSession(this.page);
+        return this.cdpSession;
+    }
+    getViewportEmulation() {
+        return this.viewportEmulation ? { ...this.viewportEmulation } : null;
+    }
+    async setViewport(opts = {}) {
+        if (opts.reset) {
+            const cdp = await this.getOrCreateCdpSession();
+            await cdp.send('Emulation.clearDeviceMetricsOverride').catch(() => { });
+            this.viewportEmulation = null;
+            await this.motion?.setViewportEmulation(null).catch(() => { });
+            await this.page.waitForTimeout(80).catch(() => { });
+            return null;
+        }
+        if (!this.physicalViewportSize) {
+            const measured = await safeEvaluate(this.page, () => ({
+                width: Math.max(1, window.innerWidth || document.documentElement?.clientWidth || 754),
+                height: Math.max(1, window.innerHeight || document.documentElement?.clientHeight || 751),
+            }), { width: 754, height: 751 }, 0).catch(() => ({ width: 754, height: 751 }));
+            this.physicalViewportSize = measured;
+        }
+        const rawW = opts.width ?? this.viewportEmulation?.width ?? 1440;
+        const rawH = opts.height ?? this.viewportEmulation?.height ?? 900;
+        const rawDpr = opts.deviceScaleFactor ?? this.viewportEmulation?.deviceScaleFactor ?? 1;
+        const width = Math.max(320, Math.min(2560, Math.round(Number.isFinite(rawW) ? rawW : 1440)));
+        const height = Math.max(240, Math.min(1600, Math.round(Number.isFinite(rawH) ? rawH : 900)));
+        const dprClamped = Math.max(1, Math.min(2, Number.isFinite(rawDpr) ? rawDpr : 1));
+        const deviceScaleFactor = Number(dprClamped.toFixed(2));
+        const cdp = await this.getOrCreateCdpSession();
+        await cdp.send('Emulation.setDeviceMetricsOverride', {
+            width,
+            height,
+            deviceScaleFactor,
+            mobile: false,
+            screenWidth: width,
+            screenHeight: height,
+        });
+        const nextState = {
+            active: true,
+            width,
+            height,
+            deviceScaleFactor,
+            physicalWidth: this.physicalViewportSize.width,
+            physicalHeight: this.physicalViewportSize.height,
+        };
+        this.viewportEmulation = nextState;
+        await this.motion?.setViewportEmulation(nextState).catch(() => { });
+        await this.page.waitForTimeout(80).catch(() => { });
+        return { ...nextState };
+    }
+    async ensureNotTopmost() {
+        if (process.platform !== 'win32' ||
+            this.resolvedWindowMode === 'headless' ||
+            !this.launchedHwnd ||
+            this.launchedHwnd <= 0) {
+            this.lastNotTopmostResult = { checked: false, clearedTopmost: false };
+            return { ...this.lastNotTopmostResult };
+        }
+        this.lastNotTopmostResult = await ensureWindowNotTopmostWin32(this.launchedHwnd);
+        return { ...this.lastNotTopmostResult };
+    }
+    getLastNotTopmostResult() {
+        return { ...this.lastNotTopmostResult };
+    }
+    async getNavigationHistory() {
+        try {
+            const cdp = await this.getOrCreateCdpSession();
+            const res = (await cdp.send('Page.getNavigationHistory'));
+            if (res && typeof res.currentIndex === 'number' && Array.isArray(res.entries)) {
+                return res;
+            }
+            return null;
+        }
+        catch {
+            return null;
+        }
+    }
     async navigate(url, waitUntil = 'domcontentloaded', timeoutMs = 30000) {
-        this.telemetry.recordOrigin(url);
         const rawUrlBeforeGoto = (() => {
             try {
                 return this.page.url();
@@ -333,6 +523,19 @@ export class BrowserSession {
                 return '';
             }
         })();
+        const protoCheck = classifyUrlProtocol(url);
+        if (!protoCheck.allowed) {
+            return {
+                wait_until: waitUntil,
+                timed_out: false,
+                elapsed_ms: 0,
+                final_url: rawUrlBeforeGoto || 'about:blank',
+                blocked: protoCheck.blocked,
+                protocol: protoCheck.protocol,
+                href: protoCheck.href,
+            };
+        }
+        this.telemetry.recordOrigin(url);
         const curDoc = this.stripUrlHash(rawUrlBeforeGoto);
         const nextDoc = this.stripUrlHash(url);
         const effectiveTimeoutMs = Number.isFinite(timeoutMs)
@@ -426,7 +629,17 @@ export class BrowserSession {
         for (let attempt = 0; attempt <= retries; attempt++) {
             try {
                 await this.motion.ensureCursorHUD(false);
-                await this.page.screenshot({ path: outputPath, fullPage: false });
+                if (this.viewportEmulation?.active) {
+                    const cdp = await this.getOrCreateCdpSession();
+                    const res = (await cdp.send('Page.captureScreenshot', {
+                        format: 'png',
+                        fromSurface: true,
+                    }));
+                    fs.writeFileSync(outputPath, Buffer.from(res.data, 'base64'));
+                }
+                else {
+                    await this.page.screenshot({ path: outputPath, fullPage: false });
+                }
                 return outputPath;
             }
             catch (err) {
@@ -439,8 +652,36 @@ export class BrowserSession {
         }
         return outputPath;
     }
+    async captureClipBuffer(clip, opts = {}) {
+        const format = opts.format ?? 'png';
+        if (this.viewportEmulation?.active) {
+            const cdp = await this.getOrCreateCdpSession();
+            const res = (await cdp.send('Page.captureScreenshot', {
+                format,
+                ...(format === 'jpeg' ? { quality: opts.quality ?? 65 } : {}),
+                fromSurface: true,
+                clip: {
+                    x: clip.x,
+                    y: clip.y,
+                    width: clip.width,
+                    height: clip.height,
+                    scale: 1,
+                },
+            }));
+            return Buffer.from(res.data, 'base64');
+        }
+        return await this.page.screenshot({
+            clip,
+            type: format,
+            ...(format === 'jpeg' ? { quality: opts.quality ?? 65 } : {}),
+        });
+    }
     async close() {
         this.closingIntentionally = true;
+        if (this.cdpSession) {
+            await this.cdpSession.detach().catch(() => { });
+            this.cdpSession = null;
+        }
         if (this.isAlive()) {
             await this.motion?.setUnloadGuard(false).catch(() => { });
             if (this.motion && this.motion.getTakeoverMode() !== 'hidden') {

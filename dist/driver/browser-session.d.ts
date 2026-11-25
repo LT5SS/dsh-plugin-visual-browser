@@ -1,7 +1,17 @@
 import { type Browser, type BrowserContext, type Page } from 'playwright-core';
-import type { BrowserRuntimeMode, BrowserSessionOptions, BrowserWindowMode, NavigateWaitUntil, NavigationDiagnostic } from './types.js';
+import type { BrowserRuntimeMode, BrowserSessionOptions, BrowserWindowMode, NativeDialogRecord, NavigateWaitUntil, NavigationDiagnostic, NotTopmostResult, SetViewportOptions, ViewportEmulationState } from './types.js';
 import { HumanMotionController } from './human-motion.js';
 import { TelemetryCollector } from '../sampler/telemetry-collector.js';
+export declare function classifyUrlProtocol(rawUrl: string): {
+    allowed: true;
+    protocol: string;
+    href: string;
+} | {
+    allowed: false;
+    blocked: 'EXTERNAL_PROTOCOL' | 'JS_URL';
+    protocol: string;
+    href: string;
+};
 export declare function isTransientNavigationError(error: unknown): boolean;
 export declare function findLocalBrowserExecutable(): string;
 export declare class BrowserSession {
@@ -29,6 +39,14 @@ export declare class BrowserSession {
     private lastMainFrameDocUrl;
     private disconnectListeners;
     private resumeListeners;
+    private cdpSession;
+    private viewportEmulation;
+    private physicalViewportSize;
+    private dialogListenerAttached;
+    private dialogHistory;
+    private unreadDialogs;
+    private pendingPromptDialog;
+    private lastNotTopmostResult;
     constructor(opts?: BrowserSessionOptions);
     isAlive(): boolean;
     addDisconnectListener(listener: () => void): () => void;
@@ -40,7 +58,35 @@ export declare class BrowserSession {
     addResumeListener(listener: () => void): () => void;
     checkAndClearResumeRequested(): Promise<boolean>;
     start(): Promise<this>;
+    private attachDialogHandler;
+    private handleNativeDialog;
+    private pushDialogRecord;
+    consumePendingDialogs(): NativeDialogRecord[];
+    consumePendingPromptDialog(): NativeDialogRecord | null;
+    getDialogHistory(): NativeDialogRecord[];
+    private getOrCreateCdpSession;
+    getViewportEmulation(): ViewportEmulationState | null;
+    setViewport(opts?: SetViewportOptions): Promise<ViewportEmulationState | null>;
+    ensureNotTopmost(): Promise<NotTopmostResult>;
+    getLastNotTopmostResult(): NotTopmostResult;
+    getNavigationHistory(): Promise<{
+        currentIndex: number;
+        entries: Array<{
+            id: number;
+            url: string;
+            title: string;
+        }>;
+    } | null>;
     navigate(url: string, waitUntil?: NavigateWaitUntil, timeoutMs?: number): Promise<NavigationDiagnostic>;
     screenshot(outputPath: string, retries?: number): Promise<string>;
+    captureClipBuffer(clip: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    }, opts?: {
+        format?: 'png' | 'jpeg';
+        quality?: number;
+    }): Promise<Buffer>;
     close(): Promise<void>;
 }

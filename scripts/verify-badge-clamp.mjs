@@ -135,7 +135,7 @@ try {
   // Case 4: Resize to 500x400 -> push to corner AND verify resize re-clamp even from stale coords
   await measureAt(session.page, 748, 742, 'PRE-RESIZE');
   await session.page.setViewportSize({ width: 500, height: 400 });
-  await session.page.waitForTimeout(100);
+  await session.page.waitForTimeout(300);
   const c4Resize = await measureBadgeOnly(session.page);
   console.log('[Case 4a resize while at stale (748,742) -> 500x400]', JSON.stringify(c4Resize));
   assert.ok(c4Resize.badge.right <= 500 - 8, `Resize must clamp right <= 492, got ${c4Resize.badge.right}`);

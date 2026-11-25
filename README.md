@@ -6,7 +6,7 @@ DeepSeek Harness (`@deepseek-ai/dsh@0.2.x`) 的可视化浏览器子代理插件
 
 - **后台不抢焦点**：Windows 下以无焦点可见窗口运行并复用单窗口（也可切换为 `minimized` / `headless`），或通过 `DSH_WEBVIEW_CDP_URL` 接入外部桌面端 Webview。
 - **虚拟鼠标与人工接管**：三次贝塞尔移动轨迹、滚动/拖拽视觉指示与设置预览；支持按 `F8`（或点击页面右上角状态条）随时暂停接管并一键继续。
-- **子代理隔离执行**：只保留最近 3 张截图的滑动窗口以节省视觉 Token，提供紧凑 HUD（DOM、设计指标、控制台错误）及动效悬停探测，支持页面门禁挂起与原位恢复。
+- **多模态走查与护栏**：只保留最近 3 张截图的滑动窗口，提供紧凑 HUD（DOM、设计指标、`## Findings`、原生弹窗回显）及动效悬停探测；支持按需 `set_viewport` / DPR 放大、`wait_for` 条件等待、键盘与下拉选择、历史跳转与 `mailto:` / `javascript:` 协议拦截。
 - **原生接入 DSH 0.2.x**：通过 `dsh.bundle.patch`、`peerDependencies` 与 Cordis 二级注入复用宿主 `ctx.llm` / `ctx.attachments`，并支持持久化设置同步。
 
 ## 安装
