@@ -460,11 +460,12 @@ export class BrowserSession {
         }
         const rawW = opts.width ?? this.viewportEmulation?.width ?? 1440;
         const rawH = opts.height ?? this.viewportEmulation?.height ?? 900;
-        const rawDpr = opts.deviceScaleFactor ?? this.viewportEmulation?.deviceScaleFactor ?? 1;
+        const rawDpr = opts.deviceScaleFactor ?? this.viewportEmulation?.deviceScaleFactor ?? 1.5;
         const width = Math.max(320, Math.min(2560, Math.round(Number.isFinite(rawW) ? rawW : 1440)));
         const height = Math.max(240, Math.min(1600, Math.round(Number.isFinite(rawH) ? rawH : 900)));
-        const dprClamped = Math.max(1, Math.min(2, Number.isFinite(rawDpr) ? rawDpr : 1));
+        const dprClamped = Math.max(1, Math.min(2, Number.isFinite(rawDpr) ? rawDpr : 1.5));
         const deviceScaleFactor = Number(dprClamped.toFixed(2));
+        let fitScale = 1;
         const cdp = await this.getOrCreateCdpSession();
         await cdp.send('Emulation.setDeviceMetricsOverride', {
             width,
@@ -473,6 +474,7 @@ export class BrowserSession {
             mobile: false,
             screenWidth: width,
             screenHeight: height,
+            scale: fitScale,
         });
         const nextState = {
             active: true,

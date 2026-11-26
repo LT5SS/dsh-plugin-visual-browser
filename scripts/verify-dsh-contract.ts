@@ -4420,6 +4420,78 @@ async function main() {
     }
     console.log('[Strict DSH 0.2 Contract] 6b Verified v2.0.0 action decision validation & diagnostic summarization!');
 
+    // 6c. v2.0.1: Strict CSP (style-src 'none') CSSOM overlay + Chinese WAF challenge gate pause
+    const cspSrv = await new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+      const s = http.createServer((_req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Security-Policy': "default-src 'self'; style-src 'none';",
+        });
+        res.end('<!doctype html><html><head><title>请稍候...</title></head><body><div>正在验证您的请求，请稍候...</div></body></html>');
+      });
+      s.listen(0, '127.0.0.1', () => {
+        const addr = s.address() as net.AddressInfo;
+        resolve({ url: `http://127.0.0.1:${addr.port}/`, close: () => new Promise((r) => s.close(() => r())) });
+      });
+    });
+    const cspHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream() {
+            yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'SHOULD_PAUSE_ON_CHALLENGE' }) };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const cspPlugin = apply(cspHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      showTakeoverControl: true,
+      takeoverHotkey: 'F8',
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...cspHost.effectDisposers);
+    try {
+      const cspRunDef = cspHost.registeredTools.get('browser_subagent_run')!;
+      const cspRunVal: any = await cspRunDef.execute(
+        { url: cspSrv.url, role: 'v2.0.1 CSP Gate', task_prompt: 'Verify strict CSP & Chinese challenge pause', max_steps: 3 },
+        fakeExec
+      );
+      assert.equal(cspRunVal.status, 'PAUSED_FOR_TAKEOVER');
+      assert.equal(cspRunVal.approval_card?.reason, 'CAPTCHA_DETECTED');
+      const pausedCspSess = cspPlugin.runner.getPausedSession(cspRunVal.subagent_id)?.session;
+      assert.ok(pausedCspSess);
+      const cspCss = await safeEvaluate(
+        pausedCspSess.page,
+        () => {
+          const panel = document.getElementById('__dsh_vc_panel__');
+          const badge = document.getElementById('__dsh_vc_badge__');
+          return {
+            panelPos: panel ? getComputedStyle(panel).position : '',
+            panelBg: panel ? getComputedStyle(panel).backgroundColor : '',
+            badgePos: badge ? getComputedStyle(badge).position : '',
+            badgeBg: badge ? getComputedStyle(badge).backgroundColor : '',
+          };
+        },
+        { panelPos: '', panelBg: '', badgePos: '', badgeBg: '' },
+        0
+      );
+      assert.equal(cspCss.panelPos, 'fixed');
+      assert.notEqual(cspCss.panelBg, 'rgba(0, 0, 0, 0)');
+      assert.equal(cspCss.badgePos, 'absolute');
+      assert.notEqual(cspCss.badgeBg, 'rgba(0, 0, 0, 0)');
+    } finally {
+      await cspPlugin.runner.closeAllSessions();
+      await cspSrv.close();
+    }
+    console.log('[Strict DSH 0.2 Contract] 6c Verified strict CSP style-src none CSSOM rendering & Chinese challenge gate auto-pause!');
+
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {
     for (const d of allDisposers) d();

@@ -86,8 +86,16 @@ export async function detectPageGate(
     }
     if (
       title.includes('just a moment') ||
+      title.includes('attention required') ||
+      title.includes('请稍候') ||
+      title.includes('安全验证') ||
+      title.includes('人机验证') ||
       bodyText.includes('verify you are human') ||
-      bodyText.includes('请完成人机验证')
+      bodyText.includes('请完成人机验证') ||
+      bodyText.includes('正在验证您的请求') ||
+      bodyText.includes('checking your browser') ||
+      bodyText.includes('verifying your request') ||
+      bodyText.includes('enable javascript and cookies to continue')
     ) {
       return {
         detected: true,

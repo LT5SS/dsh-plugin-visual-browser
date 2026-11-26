@@ -116,6 +116,15 @@
 
 ---
 
+## v2.0.1 已交付（严格 CSP 免疫、仿真视口缩放入框 + 默认 DPR 1.5、中文挑战页自动接管）
+
+- **Bug #1 · 严格 CSP（`style-src 'none'`）免疫**：`src/injected/virtual-cursor.ts` 移除 `innerHTML` 内 `<style>` 与全部 HTML `style="..."` 属性，全面改用 JS CSSOM（`el.style.cssText`）赋值并保留全部布局重置保护；挑战页、银行与严格后台站点下胶囊状态条与虚拟光标徽标不再退化为白底纯文字，`consoleErrorsCount === 0`。
+- **Bug #2 · 默认 DPR `1.5` 与状态条物理窗可见夹紧**：基于 `BENCH-REPORT-v2.0.0.md` 实测结论，`set_viewport` 显式调用未传 `deviceScaleFactor` 时默认设为 `1.5`（未调用时仍 100% 保持物理窗体零副作用）；仿真继续使用 `mobile: false, scale: 1` 保持桌面指针命中与 CSS 坐标 100% 准确（实测 `scale < 1` 会破坏桌面模式 Blink 指针命中），同时将 `#__dsh_vc_panel__` 右缘夹紧到物理可见宽度（`physicalWidth - 14px`）以内，保证 `1440px` 仿真下右半屏可见窗仍能直接看到并点击「暂停并接管」/「继续执行」胶囊；`PageObservation.viewport.deviceScaleFactor` 规整至两位小数。
+- **Bug #3 · 中文挑战页自动接管**：`detectPageGate` 补全 `请稍候` / `安全验证` / `正在验证您的请求` / `checking your browser` 等中英文挑战页判据，命中即触发 `PAUSED_FOR_TAKEOVER`（`CAPTCHA_DETECTED`）。
+- **验证增强**：新增 `verify-v201.mjs` 与合同检查 `6c`（覆盖 `style-src 'none'` CSP、visible-background `fitScale` 点击精度与 `2160×1350` 输出、中文挑战页接管、以及断网可跑的 Benchmark A′ 4 竖条开屏 loader + 6000px 长页夹具）。
+
+---
+
 ## v2.0.0 已交付（显式视口/DPR、条件等待、原语补齐、Win32 置顶自愈、外协议与弹窗纳管）
 
 - **P0 · `set_viewport(width, height, deviceScaleFactor)` 与零副作用基线**：未显式调用或传覆盖参数时，100% 保留物理窗体与系统 DPR；显式调用时通过 CDP `Emulation.setDeviceMetricsOverride` 设置 `320..2560` × `240..1600`、`DPR 1..2`（默认 `1`），`reset: true` 调用 `clearDeviceMetricsOverride()` 复位；启用仿真时截图与局部裁切（含 `inspect_motion` 32×32）走 CDP `Page.captureScreenshot`，防止 Playwright 覆盖仿真状态；`paused` 人工接管期间保持仿真视口不复位，状态条补提示 `已暂停 · 仿真 <W>×<H> @<DPR>x（物理窗口 <physW>px）`。
@@ -128,8 +137,8 @@
 
 ---
 
-## 后续规划（v2.0.1 / v2.1.0）
+## 后续规划（v2.0.2 / v2.1.0）
 
-- **`v2.0.1`（只读深探针与局部放大通道）**：`inspect_region(x, y, radius, zoom)`（随用随消不占滑动窗 3 张历史名额）+ `inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`。
+- **`v2.0.2`（只读深探针与局部放大通道）**：`inspect_region(x, y, radius, zoom)`（随用随消不占滑动窗 3 张历史名额）+ `inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`。
 - **`v2.1.0`（会话层与复杂站点）**：`TabManager` 多标签追踪（不自动切换，HUD `[Tabs]` 提示）+ 有界批量动作 `actions[]` 与早停守卫 + 反循环检测（anti-stall）+ 同源 `iframe` `#ref`。
 - **长期红线（明确不做）**：不开放任意 `evaluate_probe` JS 执行；不在 LLM 思考期间冻结页面（`Emulation.setVirtualTimePolicy` / `Animation.setPlaybackRate(0)` 会破坏网络流与 rAF 并制造假死感）；不绕过登录/支付/CAPTCHA 门控；不从 WebGL canvas 帧缓冲读取像素/对象内容。

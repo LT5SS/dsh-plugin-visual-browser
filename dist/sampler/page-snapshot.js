@@ -1552,7 +1552,7 @@ export class PageSnapshotSampler {
             viewport: {
                 width: extracted.scroll.viewportWidth,
                 height: extracted.scroll.viewportHeight,
-                deviceScaleFactor: Number(extracted.dpr || emu?.deviceScaleFactor || 1),
+                deviceScaleFactor: Number(Number(extracted.dpr || emu?.deviceScaleFactor || 1).toFixed(2)),
                 ...(emu?.active ? { emulated: true } : {}),
             },
             ...(pendingDialogs.length > 0 ? { dialogs: pendingDialogs } : {}),

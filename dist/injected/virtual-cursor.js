@@ -322,6 +322,7 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
     window.__dshVcResizeInstalled = true;
     const onViewportResize = () => {
       placeBadge(state.x, state.y);
+      renderTakeoverPanel();
     };
     window.addEventListener('resize', onViewportResize);
     if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
@@ -460,49 +461,26 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       'font-family:ui-monospace,SFMono-Regular,Consolas,monospace'
     ].join(';');
 
+    const applyCss = (el, extra) => {
+      if (!el) return;
+      el.style.cssText =
+        'margin:0;padding:0;border:0;width:auto;height:auto;min-width:0;max-width:none;' +
+        'min-height:0;max-height:none;opacity:1;box-sizing:border-box;float:none;clear:none;' +
+        'vertical-align:baseline;line-height:normal;text-indent:0;text-transform:none;' +
+        'letter-spacing:normal;' +
+        extra;
+    };
+    const applySvgCss = (el, extra) => {
+      if (!el) return;
+      el.style.cssText =
+        'margin:0;padding:0;border:0;min-width:0;max-width:none;min-height:0;max-height:none;' +
+        'opacity:1;box-sizing:border-box;float:none;clear:none;vertical-align:baseline;' +
+        'overflow:visible;' +
+        extra;
+    };
+
     root.innerHTML = \`
-      <style id="__dsh_vc_style__">
-        #__dsh_vc_root__,
-        #__dsh_vc_root__ div,
-        #__dsh_vc_root__ span,
-        #__dsh_vc_root__ button,
-        #__dsh_vc_root__ img {
-          margin: 0;
-          padding: 0;
-          border: 0;
-          width: auto;
-          height: auto;
-          min-width: 0;
-          max-width: none;
-          min-height: 0;
-          max-height: none;
-          opacity: 1;
-          box-sizing: border-box;
-          float: none;
-          clear: none;
-          vertical-align: baseline;
-          line-height: normal;
-          text-indent: 0;
-          text-transform: none;
-          letter-spacing: normal;
-        }
-        #__dsh_vc_root__ svg {
-          margin: 0;
-          padding: 0;
-          border: 0;
-          min-width: 0;
-          max-width: none;
-          min-height: 0;
-          max-height: none;
-          opacity: 1;
-          box-sizing: border-box;
-          float: none;
-          clear: none;
-          vertical-align: baseline;
-          overflow: visible;
-        }
-      </style>
-      <svg id="__dsh_vc_svg__" style="position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;display:block;opacity:1;overflow:visible;pointer-events:none">
+      <svg id="__dsh_vc_svg__">
         <defs>
           <linearGradient id="__dsh_trail_grad__" x1="0%" y1="0%" x2="100%" y2="0%">
             <stop id="__dsh_grad_stop0__" offset="0%" stop-color="#ff3b28" stop-opacity="0.2"/>
@@ -513,38 +491,101 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
             <stop id="__dsh_drag_stop1__" offset="100%" stop-color="#ff3b28" stop-opacity="0.45"/>
           </linearGradient>
         </defs>
-        <path id="__dsh_vc_trail_glow__" fill="none" stroke="rgba(0,240,255,0.28)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"/>
-        <path id="__dsh_vc_trail__" fill="none" stroke="url(#__dsh_trail_grad__)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none"/>
-        <g id="__dsh_vc_dots__" style="pointer-events:none"></g>
-        <g id="__dsh_vc_scroll_pulse__" style="pointer-events:none"></g>
-        <g id="__dsh_vc_ripples__" style="pointer-events:none"></g>
+        <path id="__dsh_vc_trail_glow__" fill="none" stroke="rgba(0,240,255,0.28)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+        <path id="__dsh_vc_trail__" fill="none" stroke="url(#__dsh_trail_grad__)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+        <g id="__dsh_vc_dots__"></g>
+        <g id="__dsh_vc_scroll_pulse__"></g>
+        <g id="__dsh_vc_ripples__"></g>
       </svg>
-      <div id="__dsh_vc_panel__" style="position:fixed;top:14px;right:14px;width:auto;height:auto;max-width:calc(100vw - 16px);margin:0;box-sizing:border-box;display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #10b981;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);opacity:1;pointer-events:none;backdrop-filter:blur(8px);user-select:none">
-        <span id="__dsh_vc_status_dot__" style="width:8px;height:8px;margin:0;padding:0;border:0;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;flex-shrink:0;opacity:1;pointer-events:none"></span>
-        <span id="__dsh_vc_status_text__" style="min-width:0;width:auto;height:auto;margin:0;padding:0;border:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:1;pointer-events:none">DSH 待命 · 窗口保持打开（无任务）</span>
-        <button id="__dsh_vc_takeover_btn__" type="button" style="display:none;width:auto;height:auto;margin:0;border:0;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;opacity:1;pointer-events:none;white-space:nowrap;flex-shrink:0"></button>
+      <div id="__dsh_vc_panel__">
+        <span id="__dsh_vc_status_dot__"></span>
+        <span id="__dsh_vc_status_text__">DSH 待命 · 窗口保持打开（无任务）</span>
+        <button id="__dsh_vc_takeover_btn__" type="button"></button>
       </div>
-      <div id="__dsh_vc_pointer__" style="position:absolute;left:0;top:0;width:0;height:0;margin:0;padding:0;border:0;background:transparent;opacity:1;overflow:visible;box-sizing:border-box;transform:translate3d(120px,120px,0);transform-origin:0 0;will-change:transform;pointer-events:none">
-        <div id="__dsh_vc_ring__" style="position:absolute;left:-9px;top:-9px;width:18px;height:18px;margin:0;padding:0;box-sizing:border-box;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8);opacity:1;pointer-events:none"></div>
-        <svg id="__dsh_vc_arrow_svg__" width="28" height="28" viewBox="0 0 28 28" style="position:absolute;left:-3px;top:-3px;width:28px;height:28px;margin:0;padding:0;border:0;display:block;opacity:1;overflow:visible;box-sizing:border-box;transform-origin:3px 3px;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.65));pointer-events:none">
-          <path id="__dsh_vc_arrow_path__" d="M3 3 L11 24 L14.8 15.2 L23.5 11.5 Z" fill="#ff3b28" stroke="#ffffff" stroke-width="2" stroke-linejoin="round" fill-rule="evenodd" style="pointer-events:none"/>
+      <div id="__dsh_vc_pointer__">
+        <div id="__dsh_vc_ring__"></div>
+        <svg id="__dsh_vc_arrow_svg__" width="28" height="28" viewBox="0 0 28 28">
+          <path id="__dsh_vc_arrow_path__" d="M3 3 L11 24 L14.8 15.2 L23.5 11.5 Z" fill="#ff3b28" stroke="#ffffff" stroke-width="2" stroke-linejoin="round" fill-rule="evenodd"/>
         </svg>
-        <img id="__dsh_vc_custom_img__" alt="" style="position:absolute;left:-3px;top:-3px;width:28px;height:28px;margin:0;padding:0;border:0;object-fit:contain;display:none;opacity:1;box-sizing:border-box;pointer-events:none;transform-origin:top left;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.55))" />
-        <div id="__dsh_vc_scroll_ind__" style="position:absolute;left:-26px;top:-13px;width:18px;height:26px;margin:0;padding:0;box-sizing:border-box;display:none;flex-direction:column;align-items:center;justify-content:center;gap:1px;border-radius:6px;background:rgba(12,14,20,0.92);border:1.5px solid #00f0ff;color:#00f0ff;line-height:1;box-shadow:0 0 10px rgba(0,240,255,0.75);opacity:1;pointer-events:none"><span class="up" style="display:flex;align-items:center;justify-content:center;width:12px;height:9px;margin:0;padding:0;border:0;line-height:1;opacity:0.28;transform:scale(1);filter:none;transform-origin:center center;transition:opacity 120ms, transform 120ms;pointer-events:none"><svg width="10" height="7" viewBox="0 0 10 7" style="display:block;width:10px;height:7px;margin:0;padding:0;border:0;opacity:1;overflow:visible;pointer-events:none"><path d="M5 0.6 L9.4 6.4 L0.6 6.4 Z" fill="currentColor" style="pointer-events:none"/></svg></span><span class="down" style="display:flex;align-items:center;justify-content:center;width:12px;height:9px;margin:0;padding:0;border:0;line-height:1;opacity:0.28;transform:scale(1);filter:none;transform-origin:center center;transition:opacity 120ms, transform 120ms;pointer-events:none"><svg width="10" height="7" viewBox="0 0 10 7" style="display:block;width:10px;height:7px;margin:0;padding:0;border:0;opacity:1;overflow:visible;pointer-events:none"><path d="M0.6 0.6 L9.4 0.6 L5 6.4 Z" fill="currentColor" style="pointer-events:none"/></svg></span></div>
-        <div id="__dsh_vc_badge__" style="position:absolute;left:22px;top:18px;width:auto;height:auto;margin:0;padding:3px 9px;box-sizing:border-box;border-radius:999px;background:rgba(12,14,20,0.92);border:1.3px solid #00f0ff;color:#f5f8ff;font-size:10.5px;font-weight:700;line-height:1.3;letter-spacing:0.06em;white-space:nowrap;box-shadow:0 6px 16px rgba(0,0,0,0.45);opacity:1;pointer-events:none">
-          DSH · (120, 120) · READY
-        </div>
+        <img id="__dsh_vc_custom_img__" alt="" />
+        <div id="__dsh_vc_scroll_ind__"><span class="up"><svg width="10" height="7" viewBox="0 0 10 7"><path d="M5 0.6 L9.4 6.4 L0.6 6.4 Z" fill="currentColor"/></svg></span><span class="down"><svg width="10" height="7" viewBox="0 0 10 7"><path d="M0.6 0.6 L9.4 0.6 L5 6.4 Z" fill="currentColor"/></svg></span></div>
+        <div id="__dsh_vc_badge__">DSH · (120, 120) · READY</div>
       </div>
     \`;
 
     document.documentElement.appendChild(root);
+
+    applySvgCss(root.querySelector('#__dsh_vc_svg__'), 'position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none;');
+    applySvgCss(root.querySelector('#__dsh_vc_trail_glow__'), 'pointer-events:none;');
+    applySvgCss(root.querySelector('#__dsh_vc_trail__'), 'pointer-events:none;');
+    applySvgCss(root.querySelector('#__dsh_vc_dots__'), 'pointer-events:none;');
+    applySvgCss(root.querySelector('#__dsh_vc_scroll_pulse__'), 'pointer-events:none;');
+    applySvgCss(root.querySelector('#__dsh_vc_ripples__'), 'pointer-events:none;');
+
     const panelEl = root.querySelector('#__dsh_vc_panel__');
+    applyCss(
+      panelEl,
+      "position:fixed;top:14px;right:14px;max-width:calc(100vw - 16px);display:none;align-items:center;gap:10px;padding:7px 12px;border-radius:999px;background:rgba(12,14,20,0.9);border:1.5px solid #10b981;color:#f5f8ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:12px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,0.4);pointer-events:none;backdrop-filter:blur(8px);user-select:none;"
+    );
+    applyCss(
+      root.querySelector('#__dsh_vc_status_dot__'),
+      'display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;flex-shrink:0;pointer-events:none;'
+    );
+    applyCss(
+      root.querySelector('#__dsh_vc_status_text__'),
+      'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;pointer-events:none;'
+    );
+    const btn = root.querySelector('#__dsh_vc_takeover_btn__');
+    applyCss(
+      btn,
+      'display:none;border-radius:999px;padding:4px 11px;background:#ef4444;color:#ffffff;font-size:12px;font-weight:700;cursor:default;pointer-events:none;white-space:nowrap;flex-shrink:0;'
+    );
+
+    applyCss(
+      root.querySelector('#__dsh_vc_pointer__'),
+      'position:absolute;left:0;top:0;width:0;height:0;background:transparent;overflow:visible;transform:translate3d(120px,120px,0);transform-origin:0 0;will-change:transform;pointer-events:none;'
+    );
+    applyCss(
+      root.querySelector('#__dsh_vc_ring__'),
+      'position:absolute;left:-9px;top:-9px;width:18px;height:18px;border-radius:50%;border:2px solid #00f0ff;background:rgba(255,59,40,0.3);box-shadow:0 0 12px rgba(0,240,255,0.8);pointer-events:none;'
+    );
+    applySvgCss(
+      root.querySelector('#__dsh_vc_arrow_svg__'),
+      'position:absolute;left:-3px;top:-3px;width:28px;height:28px;display:block;transform-origin:3px 3px;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.65));pointer-events:none;'
+    );
+    applySvgCss(root.querySelector('#__dsh_vc_arrow_path__'), 'pointer-events:none;');
+    applyCss(
+      root.querySelector('#__dsh_vc_custom_img__'),
+      'position:absolute;left:-3px;top:-3px;width:28px;height:28px;object-fit:contain;display:none;pointer-events:none;transform-origin:top left;filter:drop-shadow(0 3px 6px rgba(0,0,0,0.55));'
+    );
+    const scrollIndEl = root.querySelector('#__dsh_vc_scroll_ind__');
+    applyCss(
+      scrollIndEl,
+      'position:absolute;left:-26px;top:-13px;width:18px;height:26px;display:none;flex-direction:column;align-items:center;justify-content:center;gap:1px;border-radius:6px;background:rgba(12,14,20,0.92);border:1.5px solid #00f0ff;color:#00f0ff;line-height:1;box-shadow:0 0 10px rgba(0,240,255,0.75);pointer-events:none;'
+    );
+    if (scrollIndEl) {
+      scrollIndEl.querySelectorAll('span').forEach((sp) => {
+        applyCss(
+          sp,
+          'display:flex;align-items:center;justify-content:center;width:12px;height:9px;line-height:1;opacity:0.28;transform:scale(1);filter:none;transform-origin:center center;transition:opacity 120ms, transform 120ms;pointer-events:none;'
+        );
+      });
+      scrollIndEl.querySelectorAll('svg').forEach((sEl) => {
+        applySvgCss(sEl, 'display:block;width:10px;height:7px;pointer-events:none;');
+      });
+      scrollIndEl.querySelectorAll('path').forEach((pEl) => {
+        applySvgCss(pEl, 'pointer-events:none;');
+      });
+    }
+    applyCss(
+      root.querySelector('#__dsh_vc_badge__'),
+      'position:absolute;left:22px;top:18px;padding:3px 9px;border-radius:999px;background:rgba(12,14,20,0.92);border:1.3px solid #00f0ff;color:#f5f8ff;font-size:10.5px;font-weight:700;line-height:1.3;letter-spacing:0.06em;white-space:nowrap;box-shadow:0 6px 16px rgba(0,0,0,0.45);pointer-events:none;'
+    );
     if (panelEl) {
       panelEl.addEventListener('click', (e) => {
         e.stopPropagation();
       });
     }
-    const btn = root.querySelector('#__dsh_vc_takeover_btn__');
     if (btn) {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -624,9 +665,18 @@ export function buildVirtualCursorInitScript(initialStyle = {}, opts = {}) {
       btn.style.cursor = 'pointer';
     } else {
       panel.style.top = '14px';
-      panel.style.right = '14px';
       panel.style.left = 'auto';
       panel.style.transform = 'none';
+      const emu = state.viewportEmulation;
+      const vw = window.innerWidth || (emu && emu.width) || 1440;
+      if (emu && emu.active && emu.physicalWidth && emu.physicalWidth > 0 && emu.physicalWidth < vw) {
+        const visibleW = Math.max(280, Math.min(vw, Math.round(emu.physicalWidth)));
+        panel.style.right = Math.max(14, vw - visibleW + 14) + 'px';
+        panel.style.maxWidth = Math.max(240, visibleW - 28) + 'px';
+      } else {
+        panel.style.right = '14px';
+        panel.style.maxWidth = 'calc(100vw - 16px)';
+      }
       panel.style.pointerEvents = state.panelPassThrough ? 'none' : 'auto';
     }
 
