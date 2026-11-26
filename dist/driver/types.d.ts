@@ -122,6 +122,80 @@ export interface NotTopmostResult {
     checked: boolean;
     clearedTopmost: boolean;
 }
+export interface RegionInspectResult {
+    ok: boolean;
+    blocked?: ActionBlockedReason;
+    hint?: string;
+    x: number;
+    y: number;
+    radius: number;
+    zoom: number;
+    effectiveScale: number;
+    width: number;
+    height: number;
+    bytes: number;
+    elapsedMs: number;
+    imagePath: string;
+    topElement?: string;
+    rect?: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    };
+    visibleText?: string;
+    avgColor?: string;
+}
+export interface StylesInspectResult {
+    ok: boolean;
+    target: string;
+    blocked?: ActionBlockedReason;
+    hint?: string;
+    tag?: string;
+    rect?: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    };
+    boxModel?: {
+        margin: string;
+        padding: string;
+        border: string;
+    };
+    computedStyle?: Record<string, string>;
+}
+export interface OutlineItem {
+    kind: 'landmark' | 'heading';
+    tag: string;
+    text: string;
+    y: number;
+    visible: boolean;
+}
+export interface OutlineExtractResult {
+    ok: boolean;
+    totalLandmarks: number;
+    totalHeadings: number;
+    headingsReason?: string;
+    items: OutlineItem[];
+    degraded?: boolean;
+    degradedReason?: string;
+}
+export interface MediaInspectResult {
+    ok: boolean;
+    counts: {
+        img: number;
+        video: number;
+        canvas: number;
+        svg: number;
+    };
+    items: Array<{
+        kind: 'img' | 'video' | 'canvas' | 'svg';
+        info: string;
+    }>;
+    degraded?: boolean;
+    degradedReason?: string;
+}
 export type VirtualCursorShape = 'arrow' | 'crosshair' | 'dot' | 'star' | 'ring' | 'custom-svg' | 'custom-image';
 export type VirtualCursorPreset = 'cyber-neon' | 'comet-gold' | 'laser-dots' | 'stealth-minimal' | 'clean-none' | 'custom';
 export type TrailVariant = 'dashed' | 'solid' | 'dots' | 'comet' | 'none';

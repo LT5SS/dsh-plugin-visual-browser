@@ -18,3 +18,7 @@ export declare function computePatchMeanPixelDiff(beforeBuf: Buffer, afterBuf: B
  * quantizes opaque pixels into 4-bit/channel RGB buckets, and returns up to `topN` distinct dominant `#rrggbb` colors.
  */
 export declare function extractVisualPaletteFromPng(pngBuf: Buffer, topN?: number): string[];
+/**
+ * Computes average RGB color across opaque pixels of a decoded PNG buffer, returning `#rrggbb` or null.
+ */
+export declare function computePngAvgColorHex(pngBuf: Buffer): string | null;

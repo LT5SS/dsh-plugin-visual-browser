@@ -1051,6 +1051,23 @@ export function createVisualBrowserTools(
               ...(info.midFrame ? { mid_frame: info.midFrame } : {}),
               ...(info.scroll ? { scroll: info.scroll } : {}),
               ...(info.motion ? { motion: info.motion } : {}),
+              ...(info.region
+                ? {
+                    region_probe: {
+                      x: info.region.x,
+                      y: info.region.y,
+                      radius: info.region.radius,
+                      zoom: info.region.zoom,
+                      effective_scale: info.region.effectiveScale,
+                      width: info.region.width,
+                      height: info.region.height,
+                      bytes: info.region.bytes,
+                      elapsed_ms: info.region.elapsedMs,
+                      ...(info.region.topElement ? { topElement: info.region.topElement } : {}),
+                      ...(info.region.avgColor ? { avgColor: info.region.avgColor } : {}),
+                    },
+                  }
+                : {}),
             };
             const existing = tracker.steps.find((s) => s.step === info.stepIndex);
             if (existing) {
@@ -1060,6 +1077,7 @@ export function createVisualBrowserTools(
               info.midFrame ||
               info.scroll ||
               info.motion ||
+              info.region ||
               !info.ok ||
               info.skipped
             ) {

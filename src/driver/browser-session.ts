@@ -431,6 +431,7 @@ export class BrowserSession {
       const shouldAccept =
         this.closingIntentionally ||
         this.navigatingViaSession ||
+        this.motion?.getTakeoverMode?.() === 'paused' ||
         !this.motion?.isUnloadGuardEnabled();
       if (shouldAccept) {
         await dialog.accept().catch(() => {});
@@ -732,18 +733,33 @@ export class BrowserSession {
 
   public async screenshot(outputPath: string, retries = 2): Promise<string> {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    const hidePanelForScreenshot = Boolean(
+      this.viewportEmulation?.active &&
+        this.viewportEmulation.physicalWidth &&
+        this.viewportEmulation.physicalWidth < this.viewportEmulation.width &&
+        this.motion.getTakeoverMode() !== 'paused'
+    );
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         await this.motion.ensureCursorHUD(false);
-        if (this.viewportEmulation?.active) {
-          const cdp = await this.getOrCreateCdpSession();
-          const res = (await cdp.send('Page.captureScreenshot', {
-            format: 'png',
-            fromSurface: true,
-          })) as { data: string };
-          fs.writeFileSync(outputPath, Buffer.from(res.data, 'base64'));
-        } else {
-          await this.page.screenshot({ path: outputPath, fullPage: false });
+        if (hidePanelForScreenshot) {
+          await this.motion.setPanelScreenshotHidden(true).catch(() => {});
+        }
+        try {
+          if (this.viewportEmulation?.active) {
+            const cdp = await this.getOrCreateCdpSession();
+            const res = (await cdp.send('Page.captureScreenshot', {
+              format: 'png',
+              fromSurface: true,
+            })) as { data: string };
+            fs.writeFileSync(outputPath, Buffer.from(res.data, 'base64'));
+          } else {
+            await this.page.screenshot({ path: outputPath, fullPage: false });
+          }
+        } finally {
+          if (hidePanelForScreenshot) {
+            await this.motion.setPanelScreenshotHidden(false).catch(() => {});
+          }
         }
         return outputPath;
       } catch (err) {
@@ -755,6 +771,28 @@ export class BrowserSession {
       }
     }
     return outputPath;
+  }
+
+  public async captureRegionPng(clip: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    scale: number;
+  }): Promise<Buffer> {
+    const cdp = await this.getOrCreateCdpSession();
+    const res = (await cdp.send('Page.captureScreenshot', {
+      format: 'png',
+      fromSurface: true,
+      clip: {
+        x: clip.x,
+        y: clip.y,
+        width: clip.width,
+        height: clip.height,
+        scale: clip.scale,
+      },
+    })) as { data: string };
+    return Buffer.from(res.data, 'base64');
   }
 
   public async captureClipBuffer(

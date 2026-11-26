@@ -2228,17 +2228,25 @@ async function main() {
       assert.equal(lossRes.runner.getPausedSessionCount(), 1);
       assert.ok(lossSessionCaptured);
 
-      // Guard must be active during PAUSED state
-      const pausedGuardActive = await safeEvaluate(
+      // Guard MUST be OFF during PAUSED state so the human user can close or navigate freely
+      const pausedGuardCheck = await safeEvaluate(
         lossSessionCaptured!.page,
-        () => Boolean((window as any).__dshCursorAPI?.isUnloadGuardActive?.()),
-        false,
+        () => {
+          const ev = new Event('beforeunload', { cancelable: true });
+          window.dispatchEvent(ev);
+          return {
+            active: Boolean((window as any).__dshCursorAPI?.isUnloadGuardActive?.()),
+            defaultPrevented: ev.defaultPrevented,
+          };
+        },
+        { active: true, defaultPrevented: true },
         0
       );
-      assert.equal(pausedGuardActive, true, 'Unload guard must be active while PAUSED_FOR_TAKEOVER');
+      assert.equal(pausedGuardCheck.active, false, 'Unload guard must be OFF while PAUSED_FOR_TAKEOVER');
+      assert.equal(pausedGuardCheck.defaultPrevented, false, 'beforeunload must NOT be prevented while paused');
+      assert.equal(lossSessionCaptured!.motion.isUnloadGuardEnabled(), false, 'motion.isUnloadGuardEnabled must be false while paused');
 
-      // Disable guard before test disconnects synthetic event and emit 'disconnected' on real browser EventEmitter
-      await lossSessionCaptured!.motion.setUnloadGuard(false);
+      // Emit 'disconnected' on real browser EventEmitter (no manual setUnloadGuard(false) needed while paused)
       (lossSessionCaptured!.browser as any).emit('disconnected');
 
       assert.equal(lossRes.runner.getPausedSessionCount(), 0, 'pausedSessions must clear on browser disconnected');
@@ -4491,6 +4499,113 @@ async function main() {
       await cspSrv.close();
     }
     console.log('[Strict DSH 0.2 Contract] 6c Verified strict CSP style-src none CSSOM rendering & Chinese challenge gate auto-pause!');
+
+    // 6d. v2.0.2: Ephemeral inspect_region 2-image lifecycle (image_count_sent: 1 -> 2 -> 1) & 4-tier fallback
+    let regCalls = 0;
+    const seenPromptImages: Array<{ call: number; imgs: number; text: string }> = [];
+    const regHost = createCordisStrictCtx({
+      validateSchemas: false,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream(options: any) {
+            regCalls++;
+            const parts: any[] = options?.messages?.[0]?.content ?? [];
+            const imgs = parts.filter((p) => p?.type === 'image').length;
+            const txt = parts
+              .filter((p) => p?.type === 'text')
+              .map((p) => String(p.text ?? ''))
+              .join('\n');
+            seenPromptImages.push({ call: regCalls, imgs, text: txt });
+            if (regCalls === 1) {
+              yield {
+                type: 'text-delta',
+                delta: JSON.stringify({
+                  type: 'inspect_region',
+                  target: { x: 180, y: 120 },
+                  radius: 100,
+                  zoom: 2,
+                  reason: 'Inspect region',
+                }),
+              };
+            } else if (regCalls === 2) {
+              // Simulate multi-image rejection on 2 images -> expect Tier 2 retry with 1 full-page image + REGION_TEXT_SUMMARY
+              if (imgs === 2) {
+                yield { type: 'error', error: 'multi-image count exceeded max=1' };
+                return;
+              }
+              yield {
+                type: 'text-delta',
+                delta: JSON.stringify({ type: 'scroll', deltaY: 120, reason: 'Step after region fallback' }),
+              };
+            } else if (regCalls === 3) {
+              yield {
+                type: 'text-delta',
+                delta: JSON.stringify({ type: 'scroll', deltaY: 120, reason: 'Step after region fallback' }),
+              };
+            } else {
+              yield {
+                type: 'text-delta',
+                delta: JSON.stringify({ type: 'complete', report: 'V202_EPHEMERAL_REGION_OK' }),
+              };
+            }
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const regPlugin = apply(regHost.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      showTakeoverControl: true,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...regHost.effectDisposers);
+    try {
+      const regRunDef = regHost.registeredTools.get('browser_subagent_run')!;
+      const regRunVal: any = await regRunDef.execute(
+        { url: srv.url, role: 'v2.0.2 Region QA', task_prompt: 'Inspect tiny region and verify fallback', max_steps: 5 },
+        fakeExec
+      );
+      assert.equal(regRunVal.status, 'COMPLETED');
+      assert.equal(seenPromptImages[0].imgs, 1);
+      assert.equal(seenPromptImages[1].imgs, 2);
+      assert.ok(seenPromptImages[1].text.includes('[ATTACHED_IMAGES: 2'));
+      assert.equal(seenPromptImages[2].imgs, 1);
+      assert.ok(seenPromptImages[2].text.includes('[REGION_TEXT_SUMMARY]'));
+      assert.equal(seenPromptImages[3].imgs, 1);
+      assert.ok(!seenPromptImages[3].text.includes('[ATTACHED_IMAGES: 2'));
+      const regDiag = JSON.parse(fs.readFileSync(regRunVal.diagnostics_path, 'utf8'));
+      const llmSteps = regDiag.planner_detail?.llm_steps ?? [];
+      assert.equal(llmSteps[0]?.image_count_sent, 1);
+      assert.ok(llmSteps[0]?.action?.region_probe);
+      assert.equal(llmSteps[1]?.image_count_sent, 1);
+      assert.equal(llmSteps[1]?.retried_single_image, true);
+      assert.equal(llmSteps[2]?.image_count_sent, 1);
+    } finally {
+      await regPlugin.runner.closeAllSessions();
+    }
+    console.log('[Strict DSH 0.2 Contract] 6d Verified ephemeral 2-image lifecycle, Tier-2 single-image+summary fallback & image_count_sent diagnostics!');
+
+    // 6e. v2.0.2: Probe action decision validation & flat inspect_region normalization
+    const flatRegionParsed = classifyJsonDecision(
+      JSON.stringify({ type: 'inspect_region', x: 240, y: 320, radius: 120, zoom: 2, reason: 'flat coords' })
+    );
+    assert.ok(flatRegionParsed.decision && flatRegionParsed.decision.type === 'inspect_region');
+    for (const act of [
+      { type: 'inspect_region', target: '#1', radius: 120, zoom: 2, reason: 'zoom' },
+      { type: 'inspect_dom', selector: '.hero', maxSamples: 3, reason: 'dom' },
+      { type: 'inspect_styles', target: '#1', properties: ['color', 'fontSize'], reason: 'styles' },
+      { type: 'extract_outline', maxItems: 15, reason: 'outline' },
+      { type: 'inspect_media', maxItems: 10, reason: 'media' },
+    ] as SubagentActionDecision[]) {
+      assert.equal(isValidSubagentDecision(act), true, `Expected valid decision for ${act.type}`);
+      assert.equal(summarizeDecisionAction(act).type, act.type);
+    }
+    console.log('[Strict DSH 0.2 Contract] 6e Verified v2.0.2 probe schemas, flat normalization & diagnostic summaries!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

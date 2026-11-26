@@ -36,6 +36,7 @@ export declare class HumanMotionController {
     setViewportEmulation(info: ViewportEmulationState | null): Promise<void>;
     getViewportEmulation(): ViewportEmulationState | null;
     setProtocolGuardArmed(on: boolean): Promise<void>;
+    setPanelScreenshotHidden(on: boolean): Promise<void>;
     clearInterceptedProtocol(): Promise<void>;
     consumeInterceptedProtocol(): Promise<ProtocolInterceptInfo | null>;
     /**

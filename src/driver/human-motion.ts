@@ -213,6 +213,9 @@ export class HumanMotionController {
     }
     this.takeoverMode = mode;
     this.showTakeoverControl = mode !== 'hidden';
+    if (mode === 'paused' || mode === 'idle') {
+      this.unloadGuardEnabled = false;
+    }
     await this.ensureCursorHUD(false);
     await safeEvaluate(
       this.page,
@@ -262,6 +265,17 @@ export class HumanMotionController {
       undefined,
       { arg: this.protocolGuardArmed, retries: 0 }
     );
+  }
+
+  public async setPanelScreenshotHidden(on: boolean): Promise<void> {
+    await safeEvaluate(
+      this.page,
+      (flag: boolean) => {
+        (window as any).__dshCursorAPI?.setPanelScreenshotHidden?.(flag);
+      },
+      undefined,
+      { arg: Boolean(on), retries: 0 }
+    ).catch(() => {});
   }
 
   public async clearInterceptedProtocol(): Promise<void> {

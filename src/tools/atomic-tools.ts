@@ -1,21 +1,136 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import type { BrowserSession } from '../driver/browser-session.js';
 import type {
   ActionBlockedReason,
+  MediaInspectResult,
   MotionInspectResult,
   MotionProbeState,
   NativeDialogRecord,
   NavigateWaitUntil,
   NavigationDiagnostic,
+  OutlineExtractResult,
+  OutlineItem,
   Point2D,
+  RegionInspectResult,
   ScrollDiagnostic,
   SetViewportOptions,
+  StylesInspectResult,
   VirtualCursorStyleConfig,
   WaitForOptions,
   WaitForResult,
 } from '../driver/types.js';
-import { PageSnapshotSampler, safeEvaluate, type PageObservation } from '../sampler/page-snapshot.js';
-import { computePatchMeanPixelDiff } from '../sampler/png-pixels.js';
+import { PageSnapshotSampler, normSplit, safeEvaluate, type PageObservation } from '../sampler/page-snapshot.js';
+import { computePatchMeanPixelDiff, computePngAvgColorHex, decodePngRgba } from '../sampler/png-pixels.js';
+
+export function formatRegionTextSummary(region: RegionInspectResult): string {
+  const parts = [
+    `center=(${region.x},${region.y}) r=${region.radius} zoom=${region.zoom}x (${region.width}x${region.height}px)`,
+    `topElement=${region.topElement ?? 'none'}`,
+  ];
+  if (region.rect) {
+    parts.push(
+      `rect={x:${region.rect.x},y:${region.rect.y},w:${region.rect.width},h:${region.rect.height}}`
+    );
+  }
+  if (region.avgColor) {
+    parts.push(`avgColor=${region.avgColor}`);
+  }
+  if (region.visibleText) {
+    parts.push(`visibleText=${JSON.stringify(region.visibleText.slice(0, 120))}`);
+  }
+  return parts.join(' | ');
+}
+
+const CURATED_STYLE_KEYS = [
+  'display',
+  'position',
+  'zIndex',
+  'width',
+  'height',
+  'color',
+  'backgroundColor',
+  'fontFamily',
+  'fontSize',
+  'fontWeight',
+  'lineHeight',
+  'letterSpacing',
+  'opacity',
+  'transform',
+  'overflow',
+  'visibility',
+  'pointerEvents',
+  'cursor',
+] as const;
+
+const STYLE_TRIM_DROP_ORDER = [
+  'cursor',
+  'pointerEvents',
+  'visibility',
+  'letterSpacing',
+  'lineHeight',
+  'fontWeight',
+  'zIndex',
+  'overflow',
+  'transform',
+  'opacity',
+  'fontFamily',
+  'fontSize',
+  'backgroundColor',
+  'color',
+] as const;
+
+export function formatStylesBlockWithinBudget(res: StylesInspectResult, maxChars = 1000): string {
+  const styles: Record<string, string> = { ...(res.computedStyle ?? {}) };
+  let box = res.boxModel ? { ...res.boxModel } : undefined;
+  const render = (): string => {
+    const lines = [
+      `### [Styles Probe] ${res.target}${res.tag ? ` <${res.tag}>` : ''}`,
+      ...(res.rect
+        ? [`- rect: x=${res.rect.x}, y=${res.rect.y}, w=${res.rect.width}, h=${res.rect.height}`]
+        : []),
+      ...(box ? [`- box: margin="${box.margin}" | padding="${box.padding}" | border="${box.border}"`] : []),
+    ];
+    for (const [k, v] of Object.entries(styles)) {
+      if (v !== undefined && v !== '') lines.push(`- ${k}: ${v}`);
+    }
+    return lines.join('\n');
+  };
+
+  let out = render();
+  if (out.length <= maxChars) return out;
+
+  // 1) Trim long transform / overflow values first
+  if (typeof styles.transform === 'string' && styles.transform.length > 40) {
+    styles.transform = styles.transform.slice(0, 39) + '…';
+  }
+  if (typeof styles.overflow === 'string' && (styles.overflow === 'visible' || styles.overflow.length > 24)) {
+    delete styles.overflow;
+  }
+  out = render();
+  if (out.length <= maxChars) return out;
+
+  // 2) Shorten fontFamily next
+  if (typeof styles.fontFamily === 'string' && styles.fontFamily.length > 42) {
+    styles.fontFamily = styles.fontFamily.slice(0, 41) + '…';
+  }
+  out = render();
+  if (out.length <= maxChars) return out;
+
+  // 3) Drop secondary style keys deterministically before touching box/rect
+  for (const dropKey of STYLE_TRIM_DROP_ORDER) {
+    if (dropKey in styles) {
+      delete styles[dropKey];
+      out = render();
+      if (out.length <= maxChars) return out;
+    }
+  }
+  if (box && out.length > maxChars) {
+    box = undefined;
+    out = render();
+  }
+  return out.length <= maxChars ? out : out.slice(0, maxChars - 1) + '…';
+}
 
 export function isReservedHotkey(key: string, takeoverHotkey = 'F8'): boolean {
   const tokens = String(key ?? '')
@@ -88,6 +203,7 @@ export interface AtomicToolResult {
   navigation?: NavigationDiagnostic;
   scroll?: ScrollDiagnostic;
   motion?: MotionInspectResult;
+  region?: RegionInspectResult;
   waitResult?: WaitForResult;
   no_history?: boolean;
   protocol?: string;
@@ -1114,7 +1230,8 @@ export class AtomicBrowserToolset {
    * Read-only DOM & computed style inspection query for the agent.
    * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
    */
-  public async inspectDom(selector: string): Promise<DomInspectResult> {
+  public async inspectDom(selector: string, maxSamples = 5): Promise<DomInspectResult> {
+    const safeLimit = Math.max(1, Math.min(10, Math.round(Number.isFinite(maxSamples) ? maxSamples : 5)));
     const fallback: DomInspectResult = {
       count: 0,
       samples: [],
@@ -1122,13 +1239,13 @@ export class AtomicBrowserToolset {
       degradedReason: 'inspectDom degraded: navigation race',
     };
 
-    return safeEvaluate<DomInspectResult, string>(
+    return safeEvaluate<DomInspectResult, { sel: string; limit: number }>(
       this.session.page,
-      (sel: string): DomInspectResult => {
-        const els = Array.from(document.querySelectorAll(sel));
+      (arg: { sel: string; limit: number }): DomInspectResult => {
+        const els = Array.from(document.querySelectorAll(arg.sel));
         return {
           count: els.length,
-          samples: els.slice(0, 5).map((el) => {
+          samples: els.slice(0, arg.limit).map((el) => {
             const cs = window.getComputedStyle(el);
             const rawHref = el.getAttribute('href')?.trim();
             const href = rawHref ? rawHref.slice(0, 200) : undefined;
@@ -1164,8 +1281,543 @@ export class AtomicBrowserToolset {
         };
       },
       fallback,
-      { arg: selector, retries: 2 }
+      { arg: { sel: selector, limit: safeLimit }, retries: 2 }
     );
+  }
+
+  public async inspectDomForAgent(selector: string, maxSamples = 5): Promise<AtomicToolResult> {
+    const domRes = await this.inspectDom(selector, maxSamples);
+    const lines: string[] = [
+      `### [DOM Probe] selector=${JSON.stringify(selector)} | count=${domRes.count}${domRes.degraded ? ' (degraded)' : ''}`,
+    ];
+    if (domRes.count === 0) {
+      lines.push('- matches: 0 (no matching DOM nodes found)');
+    } else {
+      for (let i = 0; i < domRes.samples.length; i++) {
+        const s = domRes.samples[i];
+        const extras: string[] = [];
+        if (s.classes) extras.push(`class="${s.classes.slice(0, 50)}"`);
+        if (s.href) extras.push(`href="${s.href}"`);
+        if (s.value !== undefined) extras.push(`value="${s.value}"`);
+        if (s.title) extras.push(`title="${s.title}"`);
+        if (s.alt) extras.push(`alt="${s.alt}"`);
+        const styleStr = `color=${s.computedStyle.color}; bg=${s.computedStyle.backgroundColor}; font=${s.computedStyle.fontSize} ${s.computedStyle.fontFamily.slice(0, 32)}`;
+        lines.push(
+          `- [${i}] <${s.tag}> ${JSON.stringify(s.text)}${extras.length ? ' ' + extras.join(' ') : ''} | ${styleStr}`
+        );
+      }
+    }
+    let block = lines.join('\n');
+    if (block.length > 1200) {
+      block = block.slice(0, 1199) + '…';
+    }
+    const observation = await this.sampler.captureSnapshot('inspect_dom');
+    return {
+      ok: true,
+      extraData: domRes,
+      action: `Inspected DOM selector "${selector}": count=${domRes.count}`,
+      observation,
+      llmSummary: `${block}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+    };
+  }
+
+  public async inspectRegion(opts: {
+    target?: string | Point2D;
+    x?: number;
+    y?: number;
+    radius?: number;
+    zoom?: number;
+  }): Promise<AtomicToolResult> {
+    const startedAt = Date.now();
+    const radius = Math.max(40, Math.min(360, Math.round(Number.isFinite(opts.radius) ? opts.radius! : 140)));
+    const zoom = Math.max(1.5, Math.min(3, Number(Number.isFinite(opts.zoom) ? opts.zoom! : 2)));
+
+    let rawPt: Point2D;
+    let resolvedSelector: string | null = null;
+    if (typeof opts.target === 'string') {
+      resolvedSelector = resolveTargetSelector(opts.target);
+      const probe = await this.session.motion.resolveTargetPoint(resolvedSelector, 1200);
+      if (!probe.ok) {
+        const observation = await this.sampler.captureSnapshot('inspect_region_refused');
+        const refusalJson = JSON.stringify({
+          ok: false,
+          blocked: probe.blocked,
+          target: opts.target,
+          hint: probe.hint,
+        });
+        return {
+          ok: false,
+          blocked: probe.blocked,
+          ref: opts.target,
+          hit: probe.hit,
+          hint: probe.hint,
+          action: `Inspect region refused on ${opts.target} (${probe.blocked})`,
+          observation,
+          llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+        };
+      }
+      rawPt = probe.point;
+    } else if (opts.target && typeof opts.target === 'object') {
+      rawPt = { x: Math.round(opts.target.x), y: Math.round(opts.target.y) };
+    } else {
+      rawPt = {
+        x: Math.round(Number.isFinite(opts.x) ? opts.x! : 360),
+        y: Math.round(Number.isFinite(opts.y) ? opts.y! : 240),
+      };
+    }
+
+    const domCtx = await safeEvaluate<
+      {
+        vw: number;
+        vh: number;
+        dpr: number;
+        cx: number;
+        cy: number;
+        topElement?: string;
+        rect?: { x: number; y: number; width: number; height: number };
+        visibleText?: string;
+      },
+      { sel: string | null; x: number; y: number }
+    >(
+      this.session.page,
+      (arg) => {
+        const vw = Math.max(1, window.innerWidth || 1440);
+        const vh = Math.max(1, window.innerHeight || 900);
+        const dpr = Number(window.devicePixelRatio || 1);
+        const cx = Math.max(0, Math.min(vw - 1, Math.round(arg.x)));
+        const cy = Math.max(0, Math.min(vh - 1, Math.round(arg.y)));
+        let el: Element | null = null;
+        if (arg.sel) {
+          el = document.querySelector(arg.sel);
+        } else {
+          const stack =
+            typeof document.elementsFromPoint === 'function' ? document.elementsFromPoint(cx, cy) : [];
+          for (let i = 0; i < stack.length; i++) {
+            if (!stack[i].closest('#__dsh_vc_root__')) {
+              el = stack[i];
+              break;
+            }
+          }
+          if (!el) {
+            const single = document.elementFromPoint(cx, cy);
+            if (single && !single.closest('#__dsh_vc_root__')) el = single;
+          }
+        }
+        let topElement: string | undefined;
+        let rect: { x: number; y: number; width: number; height: number } | undefined;
+        let visibleText: string | undefined;
+        if (el) {
+          const tag = el.tagName.toUpperCase();
+          if (el.id) topElement = `${tag}#${el.id}`;
+          else if (el.className && typeof el.className === 'string') {
+            const c = el.className.trim().split(/\s+/).find((k) => k && !k.startsWith('is-'));
+            topElement = c ? `${tag}.${c}` : tag;
+          } else {
+            topElement = tag;
+          }
+          const r = el.getBoundingClientRect();
+          rect = {
+            x: Math.round(r.left),
+            y: Math.round(r.top),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+          };
+          const rawTxt = ((el as HTMLElement).innerText || el.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (rawTxt) visibleText = rawTxt.slice(0, 140);
+        }
+        return { vw, vh, dpr, cx, cy, topElement, rect, visibleText };
+      },
+      { vw: 1440, vh: 900, dpr: 1, cx: rawPt.x, cy: rawPt.y },
+      { arg: { sel: resolvedSelector, x: rawPt.x, y: rawPt.y }, retries: 0 }
+    );
+
+    const clipX = Math.max(0, domCtx.cx - radius);
+    const clipY = Math.max(0, domCtx.cy - radius);
+    const clipRight = Math.min(domCtx.vw, domCtx.cx + radius);
+    const clipBottom = Math.min(domCtx.vh, domCtx.cy + radius);
+    const clipW = Math.max(20, clipRight - clipX);
+    const clipH = Math.max(20, clipBottom - clipY);
+    const maxCssEdge = Math.max(clipW, clipH);
+    const dprFactor = Math.max(1, domCtx.dpr || 1);
+    const effectiveScale = Math.max(
+      0.5,
+      Math.min(zoom, Number((1440 / Math.max(1, maxCssEdge * dprFactor)).toFixed(3)))
+    );
+
+    const regionFile = `step_${String(this.sampler.getNextStepNumber()).padStart(2, '0')}_region.png`;
+    const regionPath = path.join(this.sampler.getOutputDir(), regionFile);
+    fs.mkdirSync(path.dirname(regionPath), { recursive: true });
+
+    let pngBuf: Buffer;
+    const prevVis = await safeEvaluate<string | null>(
+      this.session.page,
+      () => {
+        const root = document.getElementById('__dsh_vc_root__') as HTMLElement | null;
+        if (!root) return null;
+        const prev = root.style.visibility;
+        root.style.visibility = 'hidden';
+        return prev;
+      },
+      null,
+      0
+    );
+    try {
+      pngBuf = await this.session.captureRegionPng({
+        x: clipX,
+        y: clipY,
+        width: clipW,
+        height: clipH,
+        scale: effectiveScale,
+      });
+    } finally {
+      if (prevVis !== null) {
+        await safeEvaluate(
+          this.session.page,
+          (v: string) => {
+            const root = document.getElementById('__dsh_vc_root__') as HTMLElement | null;
+            if (root) root.style.visibility = v;
+          },
+          undefined,
+          { arg: prevVis, retries: 0 }
+        ).catch(() => {});
+      }
+    }
+
+    fs.writeFileSync(regionPath, pngBuf);
+    const decoded = decodePngRgba(pngBuf);
+    const avgColor = computePngAvgColorHex(pngBuf) ?? undefined;
+    const cleanText = domCtx.visibleText ? normSplit(domCtx.visibleText).slice(0, 120) : undefined;
+    const elapsedMs = Math.max(0, Date.now() - startedAt);
+
+    const region: RegionInspectResult = {
+      ok: true,
+      x: domCtx.cx,
+      y: domCtx.cy,
+      radius,
+      zoom,
+      effectiveScale,
+      width: decoded?.width ?? Math.round(clipW * effectiveScale),
+      height: decoded?.height ?? Math.round(clipH * effectiveScale),
+      bytes: pngBuf.byteLength,
+      elapsedMs,
+      imagePath: regionPath,
+      ...(domCtx.topElement ? { topElement: domCtx.topElement } : {}),
+      ...(domCtx.rect ? { rect: domCtx.rect } : {}),
+      ...(cleanText ? { visibleText: cleanText } : {}),
+      ...(avgColor ? { avgColor } : {}),
+    };
+
+    const observation = await this.sampler.captureSnapshot('inspect_region');
+    const summaryLine = `[REGION_PROBE] ${formatRegionTextSummary(region)}`;
+    return {
+      ok: true,
+      at: { x: domCtx.cx, y: domCtx.cy },
+      region,
+      extraData: region,
+      action: `Inspected region (${domCtx.cx},${domCtx.cy}) r=${radius} zoom=${zoom}x -> ${region.width}x${region.height}px (${region.bytes}B)`,
+      observation,
+      llmSummary: `${summaryLine}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+    };
+  }
+
+  public async inspectStyles(target: string, properties?: string[]): Promise<AtomicToolResult> {
+    const selector = resolveTargetSelector(target);
+    const probe = await this.session.motion.resolveTargetPoint(selector, 1200);
+    if (!probe.ok) {
+      const observation = await this.sampler.captureSnapshot('inspect_styles_refused');
+      const refusalJson = JSON.stringify({
+        ok: false,
+        blocked: probe.blocked,
+        target,
+        hint: probe.hint,
+      });
+      return {
+        ok: false,
+        blocked: probe.blocked,
+        ref: target,
+        hit: probe.hit,
+        hint: probe.hint,
+        action: `Blocked inspect_styles (${target}) by ${probe.blocked}`,
+        observation,
+        llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+      };
+    }
+
+    const safeProps =
+      Array.isArray(properties) && properties.length > 0
+        ? properties
+            .map((p) => String(p).trim())
+            .filter((p) => /^[a-zA-Z][a-zA-Z0-9-]*$/.test(p))
+            .slice(0, 24)
+        : [...CURATED_STYLE_KEYS];
+
+    const res = await safeEvaluate<StylesInspectResult, { sel: string; targetLabel: string; props: string[] }>(
+      this.session.page,
+      (arg) => {
+        const el = document.querySelector(arg.sel);
+        if (!el) {
+          return {
+            ok: false,
+            target: arg.targetLabel,
+            blocked: 'ELEMENT_NOT_FOUND',
+            hint: 'Element detached before style extraction',
+          };
+        }
+        const cs = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        const computedStyle: Record<string, string> = {};
+        for (const prop of arg.props) {
+          const val = (cs as any)[prop] ?? cs.getPropertyValue(prop);
+          if (typeof val === 'string' && val.length > 0) {
+            computedStyle[prop] = val;
+          }
+        }
+        return {
+          ok: true,
+          target: arg.targetLabel,
+          tag: el.tagName.toLowerCase(),
+          rect: {
+            x: Math.round(r.left),
+            y: Math.round(r.top),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+          },
+          boxModel: {
+            margin: `${cs.marginTop} ${cs.marginRight} ${cs.marginBottom} ${cs.marginLeft}`,
+            padding: `${cs.paddingTop} ${cs.paddingRight} ${cs.paddingBottom} ${cs.paddingLeft}`,
+            border: `${cs.borderTopWidth} ${cs.borderRightWidth} ${cs.borderBottomWidth} ${cs.borderLeftWidth}`,
+          },
+          computedStyle,
+        };
+      },
+      { ok: false, target, blocked: 'ELEMENT_NOT_FOUND', hint: 'inspect_styles navigation race' },
+      { arg: { sel: selector, targetLabel: target, props: safeProps }, retries: 1 }
+    );
+
+    const observation = await this.sampler.captureSnapshot('inspect_styles');
+    if (!res.ok) {
+      const refusalJson = JSON.stringify({
+        ok: false,
+        blocked: res.blocked ?? 'ELEMENT_NOT_FOUND',
+        target,
+        hint: res.hint,
+      });
+      return {
+        ok: false,
+        blocked: res.blocked ?? 'ELEMENT_NOT_FOUND',
+        ref: target,
+        hint: res.hint,
+        observation,
+        action: `inspect_styles failed on ${target}`,
+        llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+      };
+    }
+
+    const stylesBlock = formatStylesBlockWithinBudget(res, 1000);
+    return {
+      ok: true,
+      ref: target,
+      extraData: res,
+      action: `Inspected styles on ${target} <${res.tag}>`,
+      observation,
+      llmSummary: `${stylesBlock}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+    };
+  }
+
+  public async extractOutline(maxItems = 25): Promise<AtomicToolResult> {
+    const safeMax = Math.max(1, Math.min(40, Math.round(Number.isFinite(maxItems) ? maxItems : 25)));
+    const raw = await safeEvaluate<
+      {
+        totalLandmarks: number;
+        totalHeadings: number;
+        hiddenOrClippedHeadings: number;
+        canvasCount: number;
+        items: OutlineItem[];
+      },
+      number
+    >(
+      this.session.page,
+      (limit) => {
+        const landmarkTags = new Set(['HEADER', 'NAV', 'MAIN', 'SECTION', 'ARTICLE', 'FOOTER']);
+        const headingTags = new Set(['H1', 'H2', 'H3', 'H4']);
+        const all = Array.from(
+          document.querySelectorAll('header,nav,main,section,article,footer,h1,h2,h3,h4')
+        ).filter((el) => !el.closest('#__dsh_vc_root__'));
+
+        let totalLandmarks = 0;
+        let totalHeadings = 0;
+        let hiddenOrClippedHeadings = 0;
+        const items: OutlineItem[] = [];
+
+        for (const el of all) {
+          const tag = el.tagName.toUpperCase();
+          const cs = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          const visible =
+            cs.display !== 'none' &&
+            cs.visibility !== 'hidden' &&
+            Number(cs.opacity) >= 0.05 &&
+            r.width >= 1 &&
+            r.height >= 1;
+          const isHeading = headingTags.has(tag);
+          if (isHeading) {
+            totalHeadings++;
+            if (!visible) hiddenOrClippedHeadings++;
+          } else if (landmarkTags.has(tag)) {
+            totalLandmarks++;
+          }
+
+          if (items.length < limit) {
+            const rawText = ((el as HTMLElement).innerText || el.textContent || '')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, isHeading ? 140 : 60);
+            const labelText = el.getAttribute('aria-label')?.trim() || rawText;
+            items.push({
+              kind: isHeading ? 'heading' : 'landmark',
+              tag: tag.toLowerCase(),
+              text: labelText,
+              y: Math.round(r.top + window.scrollY),
+              visible,
+            });
+          }
+        }
+
+        const canvasCount = document.querySelectorAll('canvas:not(#__dsh_vc_root__ canvas)').length;
+        return { totalLandmarks, totalHeadings, hiddenOrClippedHeadings, canvasCount, items };
+      },
+      { totalLandmarks: 0, totalHeadings: 0, hiddenOrClippedHeadings: 0, canvasCount: 0, items: [] },
+      { arg: safeMax, retries: 1 }
+    );
+
+    const normalizedItems: OutlineItem[] = raw.items.map((item) => ({
+      ...item,
+      text: (item.kind === 'heading' ? normSplit(item.text) : item.text).slice(0, 80),
+    }));
+    const visibleHeadingCount = normalizedItems.filter((i) => i.kind === 'heading' && i.visible && i.text).length;
+    const headingsReason =
+      visibleHeadingCount === 0
+        ? raw.canvasCount > 0 && raw.totalHeadings === 0
+          ? '标题可能在 <canvas> 内'
+          : raw.hiddenOrClippedHeadings > 0
+            ? '标题被裁切或隐藏'
+            : '无 h1-h4 标题'
+        : undefined;
+
+    const result: OutlineExtractResult = {
+      ok: true,
+      totalLandmarks: raw.totalLandmarks,
+      totalHeadings: raw.totalHeadings,
+      ...(headingsReason ? { headingsReason } : {}),
+      items: normalizedItems,
+    };
+
+    const lines: string[] = [
+      `### [Outline Probe] landmarks=${result.totalLandmarks} · headings=${result.totalHeadings}${headingsReason ? ` (${headingsReason})` : ''}`,
+    ];
+    for (const item of normalizedItems) {
+      const visFlag = item.visible ? '' : ' [hidden]';
+      const line = `- [${item.kind}] <${item.tag}> y=${item.y}${visFlag}: ${JSON.stringify(item.text)}`;
+      if (lines.join('\n').length + line.length + 1 > 1200) break;
+      lines.push(line);
+    }
+    const block = lines.join('\n').slice(0, 1200);
+    const observation = await this.sampler.captureSnapshot('extract_outline');
+    return {
+      ok: true,
+      extraData: result,
+      action: `Extracted outline: landmarks=${result.totalLandmarks}, headings=${result.totalHeadings}`,
+      observation,
+      llmSummary: `${block}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+    };
+  }
+
+  public async inspectMedia(maxItems = 12): Promise<AtomicToolResult> {
+    const safeMax = Math.max(1, Math.min(20, Math.round(Number.isFinite(maxItems) ? maxItems : 12)));
+    const result = await safeEvaluate<MediaInspectResult, number>(
+      this.session.page,
+      (limit) => {
+        const imgs = Array.from(document.querySelectorAll('img')).filter((el) => !el.closest('#__dsh_vc_root__'));
+        const videos = Array.from(document.querySelectorAll('video')).filter((el) => !el.closest('#__dsh_vc_root__'));
+        const canvases = Array.from(document.querySelectorAll('canvas')).filter((el) => !el.closest('#__dsh_vc_root__'));
+        const svgs = Array.from(document.querySelectorAll('svg')).filter((el) => !el.closest('#__dsh_vc_root__'));
+
+        const items: Array<{ kind: 'img' | 'video' | 'canvas' | 'svg'; info: string }> = [];
+        for (const el of canvases) {
+          if (items.length >= limit) break;
+          const r = el.getBoundingClientRect();
+          items.push({
+            kind: 'canvas',
+            info: `intrinsic=${el.width}x${el.height} css=${Math.round(r.width)}x${Math.round(r.height)}`,
+          });
+        }
+        for (const el of videos) {
+          if (items.length >= limit) break;
+          const dur = Number.isFinite(el.duration) ? `${el.duration.toFixed(1)}s` : 'live/na';
+          items.push({
+            kind: 'video',
+            info: `size=${el.videoWidth}x${el.videoHeight} readyState=${el.readyState} paused=${el.paused} duration=${dur}`,
+          });
+        }
+        for (const el of imgs) {
+          if (items.length >= limit) break;
+          const r = el.getBoundingClientRect();
+          const src = (el.getAttribute('src') || el.currentSrc || '').trim().slice(0, 80);
+          const alt = (el.getAttribute('alt') || '').trim().slice(0, 40);
+          items.push({
+            kind: 'img',
+            info: `natural=${el.naturalWidth}x${el.naturalHeight} css=${Math.round(r.width)}x${Math.round(r.height)} complete=${el.complete}${alt ? ` alt=${JSON.stringify(alt)}` : ''} src=${JSON.stringify(src)}`,
+          });
+        }
+        for (const el of svgs) {
+          if (items.length >= limit) break;
+          const r = el.getBoundingClientRect();
+          if (r.width < 24 && r.height < 24) continue;
+          items.push({
+            kind: 'svg',
+            info: `css=${Math.round(r.width)}x${Math.round(r.height)} children=${el.children.length}`,
+          });
+        }
+
+        return {
+          ok: true,
+          counts: {
+            img: imgs.length,
+            video: videos.length,
+            canvas: canvases.length,
+            svg: svgs.length,
+          },
+          items,
+        };
+      },
+      {
+        ok: true,
+        counts: { img: 0, video: 0, canvas: 0, svg: 0 },
+        items: [],
+        degraded: true,
+        degradedReason: 'inspectMedia degraded: navigation race',
+      },
+      { arg: safeMax, retries: 1 }
+    );
+
+    const header = `### [Media Probe] img=${result.counts.img} · video=${result.counts.video} · canvas=${result.counts.canvas} · svg=${result.counts.svg}`;
+    const lines: string[] = [header];
+    for (const item of result.items) {
+      const line = `- [${item.kind}] ${item.info}`;
+      if (lines.join('\n').length + line.length + 1 > 1200) break;
+      lines.push(line);
+    }
+    const block = lines.join('\n').slice(0, 1200);
+    const observation = await this.sampler.captureSnapshot('inspect_media');
+    return {
+      ok: true,
+      extraData: result,
+      action: `Inspected media: img=${result.counts.img}, video=${result.counts.video}, canvas=${result.counts.canvas}, svg=${result.counts.svg}`,
+      observation,
+      llmSummary: `${block}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+    };
   }
 
   public async setViewport(opts: SetViewportOptions): Promise<AtomicToolResult> {

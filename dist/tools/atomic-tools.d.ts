@@ -1,6 +1,8 @@
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { ActionBlockedReason, MotionInspectResult, NativeDialogRecord, NavigateWaitUntil, NavigationDiagnostic, Point2D, ScrollDiagnostic, SetViewportOptions, VirtualCursorStyleConfig, WaitForOptions, WaitForResult } from '../driver/types.js';
+import type { ActionBlockedReason, MotionInspectResult, NativeDialogRecord, NavigateWaitUntil, NavigationDiagnostic, Point2D, RegionInspectResult, ScrollDiagnostic, SetViewportOptions, StylesInspectResult, VirtualCursorStyleConfig, WaitForOptions, WaitForResult } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
+export declare function formatRegionTextSummary(region: RegionInspectResult): string;
+export declare function formatStylesBlockWithinBudget(res: StylesInspectResult, maxChars?: number): string;
 export declare function isReservedHotkey(key: string, takeoverHotkey?: string): boolean;
 export interface DomInspectSample {
     tag: string;
@@ -34,6 +36,7 @@ export interface AtomicToolResult {
     navigation?: NavigationDiagnostic;
     scroll?: ScrollDiagnostic;
     motion?: MotionInspectResult;
+    region?: RegionInspectResult;
     waitResult?: WaitForResult;
     no_history?: boolean;
     protocol?: string;
@@ -81,7 +84,18 @@ export declare class AtomicBrowserToolset {
      * Read-only DOM & computed style inspection query for the agent.
      * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
      */
-    inspectDom(selector: string): Promise<DomInspectResult>;
+    inspectDom(selector: string, maxSamples?: number): Promise<DomInspectResult>;
+    inspectDomForAgent(selector: string, maxSamples?: number): Promise<AtomicToolResult>;
+    inspectRegion(opts: {
+        target?: string | Point2D;
+        x?: number;
+        y?: number;
+        radius?: number;
+        zoom?: number;
+    }): Promise<AtomicToolResult>;
+    inspectStyles(target: string, properties?: string[]): Promise<AtomicToolResult>;
+    extractOutline(maxItems?: number): Promise<AtomicToolResult>;
+    inspectMedia(maxItems?: number): Promise<AtomicToolResult>;
     setViewport(opts: SetViewportOptions): Promise<AtomicToolResult>;
     waitFor(opts: WaitForOptions): Promise<AtomicToolResult>;
     pressKey(key: string, repeat?: number): Promise<AtomicToolResult>;

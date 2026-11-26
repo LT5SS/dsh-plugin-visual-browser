@@ -313,6 +313,7 @@ export function buildVirtualCursorInitScript(
     takeoverHotkey: INITIAL_OPTS.takeoverHotkey || 'F8',
     takeoverPending: Boolean(window.__dshTakeoverRequested),
     panelPassThrough: false,
+    panelScreenshotHidden: false,
     viewportEmulation: INITIAL_OPTS.viewportEmulation || null,
     protocolGuardArmed: Boolean(INITIAL_OPTS.protocolGuardArmed),
     dragActive: false,
@@ -724,7 +725,7 @@ export function buildVirtualCursorInitScript(
       panel.style.pointerEvents = state.panelPassThrough ? 'none' : 'auto';
     }
 
-    if (!centerTest && state.takeoverMode === 'hidden') {
+    if (!centerTest && (state.takeoverMode === 'hidden' || (state.panelScreenshotHidden && state.takeoverMode !== 'paused'))) {
       panel.style.display = 'none';
       panel.style.pointerEvents = 'none';
       btn.style.pointerEvents = 'none';
@@ -1226,6 +1227,9 @@ export function buildVirtualCursorInitScript(
         state.takeoverLabel = label;
       }
       if (mode !== 'running') state.takeoverPending = false;
+      if (mode === 'paused' || mode === 'idle') {
+        applyUnloadGuard(false);
+      }
       render();
     },
     setTakeoverHotkey(hotkey = 'F8') {
@@ -1234,6 +1238,10 @@ export function buildVirtualCursorInitScript(
     },
     setPanelPassThrough(on) {
       state.panelPassThrough = Boolean(on);
+      renderTakeoverPanel();
+    },
+    setPanelScreenshotHidden(on) {
+      state.panelScreenshotHidden = Boolean(on);
       renderTakeoverPanel();
     },
     setViewportEmulation(info) {

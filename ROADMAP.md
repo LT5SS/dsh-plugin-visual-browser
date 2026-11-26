@@ -116,6 +116,15 @@
 
 ---
 
+## v2.0.2 已交付（4+1 固定只读深探针与截图期胶囊隐藏）
+
+- **P0 · `inspect_region` 与随用随消 2 图槽位**：支持 `#ref` / 坐标 / 扁平 `{ x, y }` 局部 2× 放大裁切（物理边长硬上限 `1440px`），隐藏 `#__dsh_vc_root__` 并在 `try/finally` 严格恢复；`diagnostics.json` 每步记录 `image_count_sent`，局部图仅在紧随的 `t+1` 步作临时第 2 张图附着（含 `[ATTACHED_IMAGES: 2 ...]` 声明）并于 `t+2` 自动销毁（不占 `SlidingWindowHistory` 3 轮名额）；遇多图拒收按 4 档降级（`2 图` → `1 张整页图 + 局部文本摘要` → `仅整页图` → `纯文本`）。
+- **P1 · 4 个固定只读文本探针**：`inspect_dom`（兼容既有签名、显式 `count: 0`、密码脱敏）、`inspect_styles`（`REF_STALE`、`<=1000` 按优先级确定性裁剪）、`extract_outline`（复用 `normSplit` 保住 `collaborate` + 无标题 3 种原因码）、`inspect_media`（显式输出 `img`/`video`/`canvas`/`svg` 全计数含 `0`）。
+- **P1 · `paused` 态摘除 `beforeunload` 守卫**：接管暂停（`paused`）与空闲（`idle`）态立即关闭 `unloadGuard`（仅 `running` 态开启），确保用户点击窗口关闭按钮或手动跳转页面不会被残留的 `beforeunload` 守卫拦截。
+- **P2 · 仿真视口截图期隐藏状态条**：`1440×900` 仿真抓整页截图瞬间仅隐藏 `#__dsh_vc_panel__`、保留虚拟光标与徽标并在 `try/finally` 必恢复；`paused` 人工接管态绝不隐藏。
+
+---
+
 ## v2.0.1 已交付（严格 CSP 免疫、仿真视口缩放入框 + 默认 DPR 1.5、中文挑战页自动接管）
 
 - **Bug #1 · 严格 CSP（`style-src 'none'`）免疫**：`src/injected/virtual-cursor.ts` 移除 `innerHTML` 内 `<style>` 与全部 HTML `style="..."` 属性，全面改用 JS CSSOM（`el.style.cssText`）赋值并保留全部布局重置保护；挑战页、银行与严格后台站点下胶囊状态条与虚拟光标徽标不再退化为白底纯文字，`consoleErrorsCount === 0`。
@@ -137,8 +146,7 @@
 
 ---
 
-## 后续规划（v2.0.2 / v2.1.0）
+## 后续规划（v2.1.0）
 
-- **`v2.0.2`（只读深探针与局部放大通道）**：`inspect_region(x, y, radius, zoom)`（随用随消不占滑动窗 3 张历史名额）+ `inspect_dom`、`inspect_styles`、`extract_outline`、`inspect_media`。
 - **`v2.1.0`（会话层与复杂站点）**：`TabManager` 多标签追踪（不自动切换，HUD `[Tabs]` 提示）+ 有界批量动作 `actions[]` 与早停守卫 + 反循环检测（anti-stall）+ 同源 `iframe` `#ref`。
 - **长期红线（明确不做）**：不开放任意 `evaluate_probe` JS 执行；不在 LLM 思考期间冻结页面（`Emulation.setVirtualTimePolicy` / `Animation.setPlaybackRate(0)` 会破坏网络流与 rAF 并制造假死感）；不绕过登录/支付/CAPTCHA 门控；不从 WebGL canvas 帧缓冲读取像素/对象内容。

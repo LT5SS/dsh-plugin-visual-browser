@@ -143,6 +143,9 @@ export class HumanMotionController {
         }
         this.takeoverMode = mode;
         this.showTakeoverControl = mode !== 'hidden';
+        if (mode === 'paused' || mode === 'idle') {
+            this.unloadGuardEnabled = false;
+        }
         await this.ensureCursorHUD(false);
         await safeEvaluate(this.page, ({ m, role }) => {
             window.__dshCursorAPI?.setTakeoverState(m, role);
@@ -168,6 +171,11 @@ export class HumanMotionController {
         await safeEvaluate(this.page, (flag) => {
             window.__dshCursorAPI?.setProtocolGuardArmed?.(flag);
         }, undefined, { arg: this.protocolGuardArmed, retries: 0 });
+    }
+    async setPanelScreenshotHidden(on) {
+        await safeEvaluate(this.page, (flag) => {
+            window.__dshCursorAPI?.setPanelScreenshotHidden?.(flag);
+        }, undefined, { arg: Boolean(on), retries: 0 }).catch(() => { });
     }
     async clearInterceptedProtocol() {
         await safeEvaluate(this.page, () => {

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserSession } from '../driver/browser-session.js';
-import { AtomicBrowserToolset } from '../tools/atomic-tools.js';
+import { AtomicBrowserToolset, formatRegionTextSummary } from '../tools/atomic-tools.js';
 import { HostFactsTracker } from './host-facts.js';
 import { SlidingWindowHistory } from './sliding-context.js';
 import { FindingsLedger, MAX_FINDINGS_ENTRIES, MAX_FINDING_NOTE_CHARS, MAX_FINDINGS_TOTAL_CHARS, RECENT_FINDINGS_WINDOW, } from './findings.js';
@@ -25,6 +25,8 @@ Respond ONLY with a single valid JSON object matching one of these actions (any 
 - {"type":"type_text","target":"#5","text":"hello","pressEnter":true,"reason":"..."}
 - {"type":"scroll","deltaY":800,"reason":"..."}
 - {"type":"inspect_motion","target":"#3","reason":"..."} or {"type":"inspect_motion","target":{"x":640,"y":380},"reason":"..."} (read-only pointer-driven hover/transform/canvas-pixel probe without clicking; use {x,y} on <canvas> areas)
+- {"type":"inspect_region","target":{"x":640,"y":380},"radius":140,"zoom":2,"reason":"..."} (on-demand 2x local crop probe attached ONLY to the next step for tiny text/detail inspection)
+- {"type":"inspect_dom","selector":".hero h1","maxSamples":5,"reason":"..."} / {"type":"inspect_styles","target":"#3","reason":"..."} / {"type":"extract_outline","reason":"..."} / {"type":"inspect_media","reason":"..."} (fixed read-only DOM/CSS/outline/media probes)
 - {"type":"set_viewport","width":1440,"height":900,"deviceScaleFactor":1.5,"reason":"..."} or {"type":"set_viewport","reset":true,"reason":"..."} (override desktop viewport/DPR when layout/small text is unreadable)
 - {"type":"wait_for","selector":"h1","goneSelector":".loader","text":"...","animationsSettled":true,"timeoutMs":6000,"reason":"..."} (wait cleanly for SPA/loader readiness without failing on timeout)
 - {"type":"press_key","key":"Escape","reason":"..."} (keyboard key/combo like Escape, Enter, Tab, ArrowDown, Control+A; F8/Alt+F4 are reserved)
@@ -110,6 +112,42 @@ export function summarizeDecisionAction(decision) {
                 ...(typeof decision.target === 'string' && decision.target.startsWith('#')
                     ? { ref: decision.target }
                     : {}),
+                ...noteExtra,
+            };
+        case 'inspect_region':
+            return {
+                type: 'inspect_region',
+                ...(decision.target !== undefined ? { target: decision.target } : {}),
+                ...(decision.x !== undefined ? { x: decision.x } : {}),
+                ...(decision.y !== undefined ? { y: decision.y } : {}),
+                ...(decision.radius !== undefined ? { radius: decision.radius } : {}),
+                ...(decision.zoom !== undefined ? { zoom: decision.zoom } : {}),
+                ...noteExtra,
+            };
+        case 'inspect_dom':
+            return {
+                type: 'inspect_dom',
+                selector: decision.selector,
+                ...(decision.maxSamples !== undefined ? { maxSamples: decision.maxSamples } : {}),
+                ...noteExtra,
+            };
+        case 'inspect_styles':
+            return {
+                type: 'inspect_styles',
+                target: decision.target,
+                ...(decision.properties ? { properties: decision.properties.slice(0, 24) } : {}),
+                ...noteExtra,
+            };
+        case 'extract_outline':
+            return {
+                type: 'extract_outline',
+                ...(decision.maxItems !== undefined ? { maxItems: decision.maxItems } : {}),
+                ...noteExtra,
+            };
+        case 'inspect_media':
+            return {
+                type: 'inspect_media',
+                ...(decision.maxItems !== undefined ? { maxItems: decision.maxItems } : {}),
                 ...noteExtra,
             };
         case 'set_cursor_style':
@@ -200,6 +238,27 @@ function formatShortActionForFinding(decision, blocked) {
                 : typeof decision.target === 'string'
                     ? `inspect_motion ${decision.target}`
                     : 'inspect_motion';
+            break;
+        case 'inspect_region':
+            base = isPoint2D(decision.target)
+                ? `inspect_region (${Math.round(decision.target.x)},${Math.round(decision.target.y)})`
+                : typeof decision.x === 'number' && typeof decision.y === 'number'
+                    ? `inspect_region (${Math.round(decision.x)},${Math.round(decision.y)})`
+                    : typeof decision.target === 'string'
+                        ? `inspect_region ${decision.target}`
+                        : 'inspect_region';
+            break;
+        case 'inspect_dom':
+            base = `inspect_dom ${decision.selector.slice(0, 24)}`;
+            break;
+        case 'inspect_styles':
+            base = `inspect_styles ${decision.target}`;
+            break;
+        case 'extract_outline':
+            base = 'extract_outline';
+            break;
+        case 'inspect_media':
+            base = 'inspect_media';
             break;
         case 'set_cursor_style':
             base = 'set_cursor_style';
@@ -296,6 +355,38 @@ export function isValidSubagentDecision(value) {
             return (d.target !== undefined &&
                 d.target !== null &&
                 (typeof d.target === 'string' ? d.target.length > 0 : isPoint2D(d.target)));
+        case 'inspect_region': {
+            const targetOk = d.target !== undefined &&
+                d.target !== null &&
+                (typeof d.target === 'string' ? d.target.length > 0 : isPoint2D(d.target));
+            const flatOk = typeof d.x === 'number' &&
+                Number.isFinite(d.x) &&
+                typeof d.y === 'number' &&
+                Number.isFinite(d.y);
+            const radOk = d.radius === undefined ||
+                (typeof d.radius === 'number' && Number.isFinite(d.radius) && d.radius > 0);
+            const zoomOk = d.zoom === undefined ||
+                (typeof d.zoom === 'number' && Number.isFinite(d.zoom) && d.zoom >= 1 && d.zoom <= 4);
+            return (targetOk || flatOk) && radOk && zoomOk;
+        }
+        case 'inspect_dom': {
+            const selOk = typeof d.selector === 'string' && d.selector.trim().length > 0;
+            const limOk = d.maxSamples === undefined ||
+                (typeof d.maxSamples === 'number' && Number.isFinite(d.maxSamples) && d.maxSamples >= 1);
+            return selOk && limOk;
+        }
+        case 'inspect_styles': {
+            const targetOk = typeof d.target === 'string' && d.target.trim().length > 0;
+            const propsOk = d.properties === undefined ||
+                (Array.isArray(d.properties) && d.properties.every((p) => typeof p === 'string'));
+            return targetOk && propsOk;
+        }
+        case 'extract_outline':
+        case 'inspect_media': {
+            const limOk = d.maxItems === undefined ||
+                (typeof d.maxItems === 'number' && Number.isFinite(d.maxItems) && d.maxItems >= 1);
+            return limOk;
+        }
         case 'set_cursor_style':
             return d.style !== null && typeof d.style === 'object' && !Array.isArray(d.style);
         case 'set_viewport': {
@@ -418,7 +509,7 @@ export function classifyJsonDecision(rawText) {
     if (parsed &&
         typeof parsed === 'object' &&
         !Array.isArray(parsed) &&
-        parsed.type === 'inspect_motion' &&
+        (parsed.type === 'inspect_motion' || parsed.type === 'inspect_region') &&
         parsed.target === undefined &&
         typeof parsed.x === 'number' &&
         Number.isFinite(parsed.x) &&
@@ -606,8 +697,7 @@ export function createDshHostLlmPlanner(opts) {
         if (ctx.findingsBlock) {
             promptText += `\n${ctx.findingsBlock}\n`;
         }
-        const textBlock = { type: 'text', text: promptText };
-        // Attach latest screenshot via ctx.attachments if supported by host
+        // Attach latest screenshot & optional ephemeral inspect_region crop via ctx.attachments
         let imageBlock;
         const latestPath = ctx.latestObservation.screenshotPath;
         if (opts.attachments && typeof opts.attachments.saveImage === 'function' && fs.existsSync(latestPath)) {
@@ -623,6 +713,31 @@ export function createDshHostLlmPlanner(opts) {
                 // Fallback to text-only HUD if attachment admission fails
             }
         }
+        let regionImageBlock;
+        const epRegion = ctx.ephemeralRegion;
+        if (epRegion &&
+            epRegion.imagePath &&
+            imageBlock &&
+            opts.attachments &&
+            typeof opts.attachments.saveImage === 'function' &&
+            fs.existsSync(epRegion.imagePath)) {
+            try {
+                const regRef = await opts.attachments.saveImage({
+                    data: new Uint8Array(fs.readFileSync(epRegion.imagePath)),
+                    mediaType: 'image/png',
+                    name: path.basename(epRegion.imagePath),
+                });
+                regionImageBlock = { type: 'image', attachment: regRef };
+                promptText += `\n[ATTACHED_IMAGES: 2 — Image 1: full viewport; Image 2: inspect_region ${epRegion.zoom}x crop centered at (${epRegion.x},${epRegion.y}), size=${epRegion.width}x${epRegion.height}]\n`;
+            }
+            catch {
+                regionImageBlock = undefined;
+            }
+        }
+        const textBlock = { type: 'text', text: promptText };
+        const regionSummaryBlock = epRegion
+            ? { type: 'text', text: `\n[REGION_TEXT_SUMMARY] ${formatRegionTextSummary(epRegion)}\n` }
+            : undefined;
         const runStreamAttempt = async (blocks, attemptOpts) => {
             let fullText = '';
             let chunkCount = 0;
@@ -692,16 +807,22 @@ export function createDshHostLlmPlanner(opts) {
                 threw,
             };
         };
-        const initialBlocks = imageBlock ? [textBlock, imageBlock] : [textBlock];
+        let imageCountSent = regionImageBlock && imageBlock ? 2 : imageBlock ? 1 : 0;
+        const initialBlocks = imageCountSent === 2
+            ? [textBlock, imageBlock, regionImageBlock]
+            : imageCountSent === 1
+                ? [textBlock, imageBlock]
+                : [textBlock];
         const firstAttempt = await runStreamAttempt(initialBlocks);
         let attempt = firstAttempt;
         const firstParsed = classifyJsonDecision(attempt.fullText);
         let decision = firstParsed.decision;
         let retryParsed = firstParsed;
+        let retriedSingleImage = false;
         let retriedTextOnly = false;
         let retriedJsonSchema = false;
-        const isImageRejection = /image|vision|multimodal|attachment/i.test(attempt.streamError ?? '');
-        const isConfigError = !isImageRejection &&
+        const isImageErr = (errStr) => /image|vision|multimodal|attachment|many|count/i.test(errStr ?? '');
+        const isConfigError = !isImageErr(attempt.streamError) &&
             /NO_ADAPTER|NO_API_KEY|UNAUTHORIZED|MODEL_NOT_FOUND|INVALID_REQUEST|MissingSessionID/i.test(attempt.streamError ?? '');
         if (!decision &&
             !attempt.streamError &&
@@ -724,7 +845,11 @@ export function createDshHostLlmPlanner(opts) {
                 type: 'text',
                 text: retryInstruction,
             };
-            const retryBlocks = imageBlock ? [textBlock, correctionBlock, imageBlock] : [textBlock, correctionBlock];
+            const retryBlocks = imageCountSent === 2
+                ? [textBlock, correctionBlock, imageBlock, regionImageBlock]
+                : imageCountSent === 1
+                    ? [textBlock, correctionBlock, imageBlock]
+                    : [textBlock, correctionBlock];
             const retryAttempt = await runStreamAttempt(retryBlocks, { temperature: 0 });
             retryParsed = classifyJsonDecision(retryAttempt.fullText);
             attempt = {
@@ -740,11 +865,37 @@ export function createDshHostLlmPlanner(opts) {
             decision = retryParsed.decision;
         }
         else if (!decision &&
+            imageCountSent === 2 &&
+            imageBlock &&
+            !ctx.signal?.aborted &&
+            !isConfigError) {
+            // 4-tier Decision 1 fallback: Tier 2 sends 1 full-page image + region text summary
+            retriedSingleImage = true;
+            imageCountSent = 1;
+            const tier2Blocks = regionSummaryBlock
+                ? [textBlock, regionSummaryBlock, imageBlock]
+                : [textBlock, imageBlock];
+            attempt = await runStreamAttempt(tier2Blocks);
+            retryParsed = classifyJsonDecision(attempt.fullText);
+            decision = retryParsed.decision;
+            if (!decision && !ctx.signal?.aborted && !(!isImageErr(attempt.streamError) && isConfigError)) {
+                // Tier 4 fallback: text-only (with region text summary)
+                retriedTextOnly = true;
+                imageCountSent = 0;
+                const tier4Blocks = regionSummaryBlock ? [textBlock, regionSummaryBlock] : [textBlock];
+                attempt = await runStreamAttempt(tier4Blocks);
+                retryParsed = classifyJsonDecision(attempt.fullText);
+                decision = retryParsed.decision;
+            }
+        }
+        else if (!decision &&
             imageBlock &&
             !ctx.signal?.aborted &&
             !isConfigError) {
             retriedTextOnly = true;
-            attempt = await runStreamAttempt([textBlock]);
+            imageCountSent = 0;
+            const textOnlyBlocks = regionSummaryBlock ? [textBlock, regionSummaryBlock] : [textBlock];
+            attempt = await runStreamAttempt(textOnlyBlocks);
             retryParsed = classifyJsonDecision(attempt.fullText);
             decision = retryParsed.decision;
         }
@@ -759,6 +910,8 @@ export function createDshHostLlmPlanner(opts) {
             chunk_types: attempt.chunkTypes,
             ...(attempt.sampleUnrecognizedKeys ? { sample_unrecognized_keys: attempt.sampleUnrecognizedKeys } : {}),
             text_length: attempt.fullText.length,
+            image_count_sent: imageCountSent,
+            ...(retriedSingleImage ? { retried_single_image: true } : {}),
             ...(retriedTextOnly ? { retried_text_only: true } : {}),
             ...(retriedJsonSchema ? { retried_json_schema: true } : {}),
             ...(effectiveFinishReason ? { finish_reason: effectiveFinishReason } : {}),
@@ -826,6 +979,19 @@ export function createOpenAIVisionPlanner(opts) {
     const fallback = opts.fallbackPlanner ?? createBuiltinInspectorPlanner();
     return async (ctx) => {
         const messages = ctx.history.buildMultimodalMessages(SUBAGENT_SYSTEM_PROMPT, ctx.taskPrompt);
+        let imageCountSent = ctx.history
+            .getEntries()
+            .filter((e) => e.imageBase64 !== null).length;
+        if (ctx.ephemeralRegion?.imagePath && fs.existsSync(ctx.ephemeralRegion.imagePath) && messages[1]) {
+            const regB64 = fs.readFileSync(ctx.ephemeralRegion.imagePath).toString('base64');
+            const regionUrl = `data:image/png;base64,${regB64}`;
+            const notice = `\n[ATTACHED_IMAGES_EPHEMERAL: inspect_region ${ctx.ephemeralRegion.zoom}x crop centered at (${ctx.ephemeralRegion.x},${ctx.ephemeralRegion.y}), size=${ctx.ephemeralRegion.width}x${ctx.ephemeralRegion.height}]\n`;
+            if (Array.isArray(messages[1].content)) {
+                messages[1].content.push({ type: 'text', text: notice });
+                messages[1].content.push({ type: 'image_url', image_url: { url: regionUrl, detail: 'high' } });
+            }
+            imageCountSent += 1;
+        }
         if (ctx.findingsBlock && messages[1]) {
             if (Array.isArray(messages[1].content)) {
                 messages[1].content.push({ type: 'text', text: `\n${ctx.findingsBlock}\n` });
@@ -871,6 +1037,7 @@ export function createOpenAIVisionPlanner(opts) {
                     chunk_count: 0,
                     chunk_types: {},
                     text_length: 0,
+                    image_count_sent: imageCountSent,
                     stream_error: `HTTP ${res.status} ${errBody}`.trim().slice(0, 300),
                     fallback_reason: 'VISION_API_HTTP_ERROR',
                 }, fallback, ctx, opts.onStepDiagnostic);
@@ -887,6 +1054,7 @@ export function createOpenAIVisionPlanner(opts) {
                     chunk_count: 1,
                     chunk_types: { completion: 1 },
                     text_length: rawContent.length,
+                    image_count_sent: imageCountSent,
                     decision_parse: { ok: true, retried: false },
                     ...(usage ? { usage } : {}),
                     decision_source: 'llm',
@@ -902,6 +1070,7 @@ export function createOpenAIVisionPlanner(opts) {
                 chunk_count: 1,
                 chunk_types: { completion: 1 },
                 text_length: rawContent.length,
+                image_count_sent: imageCountSent,
                 ...(!empty
                     ? {
                         text_preview: rawContent.trim().slice(0, 200),
@@ -925,6 +1094,7 @@ export function createOpenAIVisionPlanner(opts) {
                 chunk_count: 0,
                 chunk_types: {},
                 text_length: 0,
+                image_count_sent: imageCountSent,
                 stream_error: String(err?.message ?? err).slice(0, 300),
                 fallback_reason: 'VISION_API_REQUEST_ERROR',
             }, fallback, ctx, opts.onStepDiagnostic);
@@ -1650,6 +1820,7 @@ export class BrowserSubagentRunner {
         const { subagentId, req, session, tools, hostFacts, history, findingsLedger, planner, maxSteps, isSharedSession, } = state;
         let latestObs = state.latestObs;
         let latestNavigation = state.latestNavigation;
+        let pendingRegion = state.pendingRegion ?? null;
         let keepSessionAlive = false;
         let consecutiveFailures = 0;
         let lastStaleTarget = null;
@@ -1664,7 +1835,7 @@ export class BrowserSubagentRunner {
             keepSessionAlive = true;
             this.detachSharedSessionForTakeover(session);
             this.watchSessionDisconnect(session);
-            await session.motion.setUnloadGuard(true).catch(() => { });
+            await session.motion.setUnloadGuard(false).catch(() => { });
             await session.motion.setTakeoverState('paused', req.role).catch(() => { });
             this.pausedSessions.set(subagentId, {
                 subagentId,
@@ -1678,6 +1849,7 @@ export class BrowserSubagentRunner {
                 nextStep,
                 maxSteps,
                 latestNavigation,
+                pendingRegion,
                 pausedAt,
                 pausedBy,
             });
@@ -1742,8 +1914,10 @@ export class BrowserSubagentRunner {
                     hostFacts,
                     findings: findingsLedger.getFindings(),
                     ...(findingsBlock ? { findingsBlock } : {}),
+                    ...(pendingRegion ? { ephemeralRegion: pendingRegion } : {}),
                     signal: req.signal,
                 });
+                pendingRegion = null;
                 req.signal?.throwIfAborted();
                 if (await session.checkHumanTakeoverRequested()) {
                     return await pauseNow(step, 'USER_TAKEOVER', session.page.url(), '用户在子代理决策期间点击了「暂停并接管」。子代理已立即暂停。');
@@ -1832,6 +2006,27 @@ export class BrowserSubagentRunner {
                     }
                     else if (decision.type === 'inspect_motion') {
                         actionResult = await tools.inspectMotion(decision.target);
+                    }
+                    else if (decision.type === 'inspect_region') {
+                        actionResult = await tools.inspectRegion({
+                            target: decision.target,
+                            x: decision.x,
+                            y: decision.y,
+                            radius: decision.radius,
+                            zoom: decision.zoom,
+                        });
+                    }
+                    else if (decision.type === 'inspect_dom') {
+                        actionResult = await tools.inspectDomForAgent(decision.selector, decision.maxSamples);
+                    }
+                    else if (decision.type === 'inspect_styles') {
+                        actionResult = await tools.inspectStyles(decision.target, decision.properties);
+                    }
+                    else if (decision.type === 'extract_outline') {
+                        actionResult = await tools.extractOutline(decision.maxItems);
+                    }
+                    else if (decision.type === 'inspect_media') {
+                        actionResult = await tools.inspectMedia(decision.maxItems);
                     }
                     else if (decision.type === 'set_viewport') {
                         actionResult = await tools.setViewport({
@@ -1952,7 +2147,11 @@ export class BrowserSubagentRunner {
                     ...(actionResult.midFrame ? { midFrame: actionResult.midFrame } : {}),
                     ...(actionResult.scroll ? { scroll: actionResult.scroll } : {}),
                     ...(actionResult.motion ? { motion: actionResult.motion } : {}),
+                    ...(actionResult.region ? { region: actionResult.region } : {}),
                 });
+                if (decision.type === 'inspect_region' && isSuccess && actionResult.region?.imagePath) {
+                    pendingRegion = actionResult.region;
+                }
                 hostFacts.recordStep(actionResult.observation.screenshotPath);
                 history.pushObservation(`${actionResult.action} — ${decision.reason}`, actionResult.observation, actionResult.llmSummary);
                 findingsLedger.record(step, actionResult.observation, formatShortActionForFinding(decision, actionResult.blocked), decision.note);

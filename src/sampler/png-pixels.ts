@@ -272,3 +272,29 @@ export function extractVisualPaletteFromPng(pngBuf: Buffer, topN = 3): string[] 
 
   return selected.map((s) => s.hex);
 }
+
+/**
+ * Computes average RGB color across opaque pixels of a decoded PNG buffer, returning `#rrggbb` or null.
+ */
+export function computePngAvgColorHex(pngBuf: Buffer): string | null {
+  const img = decodePngRgba(pngBuf);
+  if (!img || img.width <= 0 || img.height <= 0) return null;
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  let count = 0;
+  const total = img.width * img.height;
+  for (let i = 0; i < total; i++) {
+    const idx = i * 4;
+    if (img.data[idx + 3] < 128) continue;
+    sumR += img.data[idx];
+    sumG += img.data[idx + 1];
+    sumB += img.data[idx + 2];
+    count++;
+  }
+  if (count === 0) return null;
+  const r = Math.max(0, Math.min(255, Math.round(sumR / count)));
+  const g = Math.max(0, Math.min(255, Math.round(sumG / count)));
+  const b = Math.max(0, Math.min(255, Math.round(sumB / count)));
+  return '#' + r.toString(16).padStart(2, '0') + g.toString(16).padStart(2, '0') + b.toString(16).padStart(2, '0');
+}

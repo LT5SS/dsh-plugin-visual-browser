@@ -79,6 +79,13 @@ export declare class BrowserSession {
     } | null>;
     navigate(url: string, waitUntil?: NavigateWaitUntil, timeoutMs?: number): Promise<NavigationDiagnostic>;
     screenshot(outputPath: string, retries?: number): Promise<string>;
+    captureRegionPng(clip: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        scale: number;
+    }): Promise<Buffer>;
     captureClipBuffer(clip: {
         x: number;
         y: number;
