@@ -4,16 +4,27 @@ import path from 'node:path';
 import { BrowserSession } from '../driver/browser-session.js';
 import type {
   ActionBlockedReason,
+  ActionTraceEntry,
   BrowserSessionOptions,
+  ExtractFieldSpec,
+  ExtractedDataBundle,
   MotionInspectResult,
   NavigateWaitUntil,
   NavigationDiagnostic,
   Point2D,
   RegionInspectResult,
   ScrollDiagnostic,
+  StructuredExtractResult,
+  StructuredExtractSpec,
   VirtualCursorStyleConfig,
 } from '../driver/types.js';
-import { AtomicBrowserToolset, formatRegionTextSummary } from '../tools/atomic-tools.js';
+import {
+  AtomicBrowserToolset,
+  formatRegionTextSummary,
+  normalizeExtractSpec,
+  parseExtractFieldsSpec,
+  type AtomicToolResult,
+} from '../tools/atomic-tools.js';
 import { HostFactsTracker, type HostFactsData } from './host-facts.js';
 import { SlidingWindowHistory, type SlidingContextStats } from './sliding-context.js';
 import {
@@ -91,6 +102,15 @@ export type SubagentActionDecision =
     }
   | { type: 'extract_outline'; maxItems?: number; reason: string; note?: string }
   | { type: 'inspect_media'; maxItems?: number; reason: string; note?: string }
+  | {
+      type: 'extract_list';
+      itemSelector?: string;
+      fields?: Record<string, string | ExtractFieldSpec>;
+      maxItems?: number;
+      dedupeBy?: string;
+      reason: string;
+      note?: string;
+    }
   | { type: 'set_cursor_style'; style: VirtualCursorStyleConfig; reason: string; note?: string }
   | {
       type: 'set_viewport';
@@ -201,6 +221,10 @@ export interface SubagentTaskRequest {
   blockedOrigins?: string[];
   /** Automatically pause for human takeover if CAPTCHA, payment, or login gate appears (default: true) */
   pauseOnGate?: boolean;
+  /** Automatically pause when a visible unoccluded password login form appears (default: true) */
+  pauseOnLoginWall?: boolean;
+  /** Optional declarative read-only list extraction spec executed on extract_list / completion */
+  extractSpec?: StructuredExtractSpec;
   /** Keep a persistent visible window open after completion and reuse it across subsequent tasks */
   keepWindowOpen?: boolean;
   /** Cooperative cancellation signal from DSH ToolRunContext (exec.signal) */
@@ -242,6 +266,8 @@ export interface SubagentRunResult {
   hostFacts: HostFactsData;
   contextStats: SlidingContextStats;
   findings?: SubagentFinding[];
+  actionTrace?: ActionTraceEntry[];
+  extractedData?: ExtractedDataBundle;
   approvalCard?: DshApprovalCardPayload;
   navigation?: NavigationDiagnostic;
   pausedAt?: string;
@@ -265,6 +291,12 @@ interface PausedSubagentState {
   pendingRegion?: RegionInspectResult | null;
   pausedAt?: string;
   pausedBy?: TakeoverPauseSource;
+  lastPauseReason?: GateReason | 'ORIGIN_BLOCKED' | 'USER_TAKEOVER';
+  actionTrace?: ActionTraceEntry[];
+  extractedItems?: Array<Record<string, string | null>>;
+  extractedTruncated?: boolean;
+  extractedSelector?: string;
+  lastExtractedUrl?: string | null;
 }
 
 export const SUBAGENT_SYSTEM_PROMPT = `You are an isolated Visual Browser Subagent inside DeepSeek Harness (DSH).
@@ -285,6 +317,7 @@ Respond ONLY with a single valid JSON object matching one of these actions (any 
 - {"type":"inspect_motion","target":"#3","reason":"..."} or {"type":"inspect_motion","target":{"x":640,"y":380},"reason":"..."} (read-only pointer-driven hover/transform/canvas-pixel probe without clicking; use {x,y} on <canvas> areas)
 - {"type":"inspect_region","target":{"x":640,"y":380},"radius":140,"zoom":2,"reason":"..."} (on-demand 2x local crop probe attached ONLY to the next step for tiny text/detail inspection)
 - {"type":"inspect_dom","selector":".hero h1","maxSamples":5,"reason":"..."} / {"type":"inspect_styles","target":"#3","reason":"..."} / {"type":"extract_outline","reason":"..."} / {"type":"inspect_media","reason":"..."} (fixed read-only DOM/CSS/outline/media probes)
+- {"type":"extract_list","itemSelector":"div.item","fields":{"title":".video-title"},"maxItems":200,"dedupeBy":"href","reason":"..."} (read-only declarative list extraction; omit fields/selector when caller already configured extractSpec to accumulate current page items before pagination)
 - {"type":"set_viewport","width":1440,"height":900,"deviceScaleFactor":1.5,"reason":"..."} or {"type":"set_viewport","reset":true,"reason":"..."} (override desktop viewport/DPR when layout/small text is unreadable)
 - {"type":"wait_for","selector":"h1","goneSelector":".loader","text":"...","animationsSettled":true,"timeoutMs":6000,"reason":"..."} (wait cleanly for SPA/loader readiness without failing on timeout)
 - {"type":"press_key","key":"Escape","reason":"..."} (keyboard key/combo like Escape, Enter, Tab, ArrowDown, Control+A; F8/Alt+F4 are reserved)
@@ -453,6 +486,14 @@ export function summarizeDecisionAction(decision: SubagentActionDecision): Recor
         ...(decision.maxItems !== undefined ? { maxItems: decision.maxItems } : {}),
         ...noteExtra,
       };
+    case 'extract_list':
+      return {
+        type: 'extract_list',
+        ...(decision.itemSelector ? { itemSelector: decision.itemSelector } : {}),
+        ...(decision.maxItems !== undefined ? { maxItems: decision.maxItems } : {}),
+        ...(decision.dedupeBy ? { dedupeBy: decision.dedupeBy } : {}),
+        ...noteExtra,
+      };
     case 'set_cursor_style':
       return {
         type: 'set_cursor_style',
@@ -563,6 +604,9 @@ function formatShortActionForFinding(decision: SubagentActionDecision, blocked?:
       break;
     case 'inspect_media':
       base = 'inspect_media';
+      break;
+    case 'extract_list':
+      base = decision.itemSelector ? `extract_list ${decision.itemSelector.slice(0, 24)}` : 'extract_list';
       break;
     case 'set_cursor_style':
       base = 'set_cursor_style';
@@ -716,6 +760,18 @@ export function isValidSubagentDecision(value: unknown): value is SubagentAction
         d.maxItems === undefined ||
         (typeof d.maxItems === 'number' && Number.isFinite(d.maxItems) && d.maxItems >= 1);
       return limOk;
+    }
+    case 'extract_list': {
+      const selOk = d.itemSelector === undefined || (typeof d.itemSelector === 'string' && d.itemSelector.trim().length > 0);
+      const fieldsOk =
+        d.fields === undefined ||
+        (typeof d.fields === 'object' && d.fields !== null && !Array.isArray(d.fields)) ||
+        typeof d.fields === 'string';
+      const limOk =
+        d.maxItems === undefined ||
+        (typeof d.maxItems === 'number' && Number.isFinite(d.maxItems) && d.maxItems >= 1);
+      const dedupeOk = d.dedupeBy === undefined || typeof d.dedupeBy === 'string';
+      return selOk && fieldsOk && limOk && dedupeOk;
     }
     case 'set_cursor_style':
       return d.style !== null && typeof d.style === 'object' && !Array.isArray(d.style);
@@ -2139,9 +2195,30 @@ export class BrowserSubagentRunner {
       history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
       findingsLedger.record(0, initRes.observation, 'navigate');
 
+      const effectiveTaskReq: SubagentTaskRequest = req.extractSpec
+        ? {
+            ...req,
+            taskPrompt:
+              `${req.taskPrompt}\n\n[Structured Extraction Configured]: itemSelector=${JSON.stringify(req.extractSpec.itemSelector)}. ` +
+              `On completion, rows matching this selector are automatically extracted to structured JSON. ` +
+              `If paginating across multiple pages, run {"type":"extract_list","reason":"..."} on each page before clicking Next.`,
+          }
+        : req;
+
+      const initialTrace: ActionTraceEntry[] = [
+        {
+          step: 0,
+          action: 'navigate',
+          target: req.startUrl,
+          url: initRes.observation.domStats.url,
+          ok: initRes.ok !== false && !initRes.blocked,
+          ...(initRes.blocked ? { blocked: initRes.blocked } : {}),
+        },
+      ];
+
       return await this.executeLoop({
         subagentId,
-        req,
+        req: effectiveTaskReq,
         session,
         tools,
         hostFacts,
@@ -2153,6 +2230,11 @@ export class BrowserSubagentRunner {
         latestObs: initRes.observation,
         latestNavigation: initRes.navigation,
         isSharedSession: isShared,
+        actionTrace: initialTrace,
+        extractedItems: [],
+        extractedTruncated: false,
+        extractedSelector: req.extractSpec?.itemSelector,
+        lastExtractedUrl: null,
       });
     } catch (err) {
       await this.releaseReusableSession(
@@ -2169,7 +2251,7 @@ export class BrowserSubagentRunner {
     subagentId: string,
     userFollowupNote = 'Human takeover completed. Continue the task.',
     signal?: AbortSignal,
-    opts?: { trigger?: TakeoverResumeSource }
+    opts?: { trigger?: TakeoverResumeSource; pauseOnLoginWall?: boolean }
   ): Promise<SubagentRunResult> {
     signal?.throwIfAborted();
     const resumedBy: TakeoverResumeSource = opts?.trigger ?? 'tool';
@@ -2284,6 +2366,9 @@ export class BrowserSubagentRunner {
           navigation: paused.latestNavigation,
         });
 
+        if (opts?.pauseOnLoginWall !== undefined) {
+          req.pauseOnLoginWall = opts.pauseOnLoginWall;
+        }
         const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
         signal?.throwIfAborted();
         hostFacts.recordStep(postTakeoverObs.screenshotPath);
@@ -2293,6 +2378,26 @@ export class BrowserSubagentRunner {
           tools.sampler.formatObservationForLLM(postTakeoverObs)
         );
         findingsLedger.record(Math.max(0, nextStep - 1), postTakeoverObs, 'resume');
+        const actionTrace: ActionTraceEntry[] = [...(paused.actionTrace ?? [])];
+        actionTrace.push({
+          step: Math.max(0, nextStep - 1),
+          action: 'resume',
+          url: postTakeoverObs.domStats.url,
+          ok: true,
+        });
+
+        // Break LOGIN_REQUIRED infinite loop when user explicitly resumes on the same URL;
+        // CAPTCHA_DETECTED and PAYMENT_REQUIRED remain strictly enforced.
+        const suppressedLoginGateUrl =
+          paused.lastPauseReason === 'LOGIN_REQUIRED'
+            ? (() => {
+                try {
+                  return session.page.url().split('#')[0];
+                } catch {
+                  return null;
+                }
+              })()
+            : null;
 
         const loopRes = await this.executeLoop({
           subagentId,
@@ -2307,7 +2412,14 @@ export class BrowserSubagentRunner {
           maxSteps,
           latestObs: postTakeoverObs,
           latestNavigation: paused.latestNavigation,
+          pendingRegion: paused.pendingRegion,
           isSharedSession: false,
+          actionTrace,
+          extractedItems: paused.extractedItems ?? [],
+          extractedTruncated: paused.extractedTruncated ?? false,
+          extractedSelector: paused.extractedSelector ?? req.extractSpec?.itemSelector,
+          lastExtractedUrl: paused.lastExtractedUrl ?? null,
+          suppressedLoginGateUrl,
         });
         const finalRes: SubagentRunResult = {
           ...loopRes,
@@ -2364,7 +2476,11 @@ export class BrowserSubagentRunner {
   }
 
   private async executeLoop(
-    state: PausedSubagentState & { latestObs: PageObservation; isSharedSession: boolean }
+    state: PausedSubagentState & {
+      latestObs: PageObservation;
+      isSharedSession: boolean;
+      suppressedLoginGateUrl?: string | null;
+    }
   ): Promise<SubagentRunResult> {
     const {
       subagentId,
@@ -2385,6 +2501,138 @@ export class BrowserSubagentRunner {
     let consecutiveFailures = 0;
     let lastStaleTarget: string | null = null;
     let sameStaleCount = 0;
+    let suppressedLoginGateUrl: string | null = state.suppressedLoginGateUrl ?? null;
+    const actionTrace: ActionTraceEntry[] = [...(state.actionTrace ?? [])];
+    const extractedItems: Array<Record<string, string | null>> = [...(state.extractedItems ?? [])];
+    const seenDedupeKeys = new Set<string>();
+    const activeDedupeField = req.extractSpec?.dedupeBy;
+    if (activeDedupeField) {
+      for (const existingRow of extractedItems) {
+        const keyVal = existingRow?.[activeDedupeField];
+        if (typeof keyVal === 'string' && keyVal.trim()) {
+          seenDedupeKeys.add(keyVal.trim());
+        }
+      }
+    }
+    let extractedTruncated = Boolean(state.extractedTruncated);
+    let extractedSelector = state.extractedSelector ?? req.extractSpec?.itemSelector;
+    let lastExtractedUrl: string | null = state.lastExtractedUrl ?? null;
+
+    const getUrlNoHash = (): string => {
+      try {
+        return session.page.url().split('#')[0];
+      } catch {
+        return '';
+      }
+    };
+
+    const mergeExtractedBatch = (
+      res: StructuredExtractResult,
+      spec: StructuredExtractSpec
+    ): void => {
+      extractedSelector = spec.itemSelector;
+      lastExtractedUrl = getUrlNoHash() || res.url || lastExtractedUrl;
+      if (res.truncated) extractedTruncated = true;
+      const limit = Math.max(1, Math.min(1000, Math.round(spec.maxItems ?? req.extractSpec?.maxItems ?? 200)));
+      const dedupeKey = spec.dedupeBy ?? req.extractSpec?.dedupeBy;
+      for (const row of res.items) {
+        if (extractedItems.length >= limit) {
+          extractedTruncated = true;
+          break;
+        }
+        if (dedupeKey) {
+          const kv = row[dedupeKey];
+          const norm = typeof kv === 'string' ? kv.trim() : '';
+          if (norm) {
+            if (seenDedupeKeys.has(norm)) continue;
+            seenDedupeKeys.add(norm);
+          }
+        }
+        extractedItems.push(row);
+      }
+    };
+
+    const finalizeExtractedData = async (
+      runAutoFinal: boolean
+    ): Promise<ExtractedDataBundle | undefined> => {
+      if (runAutoFinal && req.extractSpec && session.isAlive()) {
+        const curNoHash = getUrlNoHash();
+        if (extractedItems.length === 0 || (curNoHash && curNoHash !== lastExtractedUrl)) {
+          try {
+            const autoRes = await tools.extractList(req.extractSpec);
+            mergeExtractedBatch(autoRes, req.extractSpec);
+          } catch {
+            // non-fatal finalize error
+          }
+        }
+      }
+      if (!req.extractSpec && !extractedSelector && extractedItems.length === 0) {
+        return undefined;
+      }
+      const selector = extractedSelector ?? req.extractSpec?.itemSelector ?? '';
+      let writtenPath: string | undefined;
+      try {
+        const subagentDir = path.join(req.artifactDir, subagentId);
+        const outFile = path.join(subagentDir, 'extracted.json');
+        await fs.promises.mkdir(subagentDir, { recursive: true });
+        await fs.promises.writeFile(
+          outFile,
+          JSON.stringify(
+            {
+              url: latestObs.domStats.url,
+              selector,
+              count: extractedItems.length,
+              truncated: extractedTruncated,
+              items: extractedItems,
+            },
+            null,
+            2
+          ),
+          'utf8'
+        );
+        writtenPath = outFile.replace(/\\/g, '/');
+      } catch {
+        writtenPath = undefined;
+      }
+      return {
+        selector,
+        count: extractedItems.length,
+        truncated: extractedTruncated,
+        ...(writtenPath ? { path: writtenPath } : {}),
+        items: extractedItems,
+      };
+    };
+
+    const recordTrace = (
+      stepNum: number,
+      dec: SubagentActionDecision,
+      ok: boolean,
+      blocked?: string,
+      skipped?: boolean
+    ) => {
+      const targetStr =
+        typeof (dec as any).target === 'string'
+          ? (dec as any).target
+          : typeof (dec as any).url === 'string'
+            ? (dec as any).url
+            : typeof (dec as any).selector === 'string'
+              ? (dec as any).selector
+              : typeof (dec as any).itemSelector === 'string'
+                ? (dec as any).itemSelector
+                : typeof (dec as any).x === 'number' && typeof (dec as any).y === 'number'
+                  ? `(${Math.round((dec as any).x)},${Math.round((dec as any).y)})`
+                  : undefined;
+      actionTrace.push({
+        step: stepNum,
+        action: dec.type,
+        ...(targetStr ? { target: targetStr } : {}),
+        url: latestObs.domStats.url,
+        ok,
+        ...(blocked ? { blocked } : {}),
+        ...(skipped ? { skipped: true } : {}),
+        ...(dec.note ? { note: dec.note.slice(0, MAX_FINDING_NOTE_CHARS) } : {}),
+      });
+    };
 
     const pauseNow = async (
       nextStep: number,
@@ -2419,6 +2667,12 @@ export class BrowserSubagentRunner {
         pendingRegion,
         pausedAt,
         pausedBy,
+        lastPauseReason: reason,
+        actionTrace: [...actionTrace],
+        extractedItems: [...extractedItems],
+        extractedTruncated,
+        extractedSelector,
+        lastExtractedUrl,
       });
       this.startResumeWatcher(subagentId, session);
       const card = buildApprovalCard({
@@ -2429,6 +2683,7 @@ export class BrowserSubagentRunner {
         screenshotPath: latestObs.screenshotPath,
         details,
       });
+      const extractedData = await finalizeExtractedData(false);
       const pausedRes: SubagentRunResult = {
         subagentId,
         role: req.role,
@@ -2438,6 +2693,8 @@ export class BrowserSubagentRunner {
         hostFacts: hostFacts.getFacts(),
         contextStats: history.getStats(),
         findings: findingsLedger.getFindings(),
+        actionTrace: [...actionTrace],
+        ...(extractedData ? { extractedData } : {}),
         approvalCard: card,
         pausedAt,
         pausedBy,
@@ -2473,8 +2730,15 @@ export class BrowserSubagentRunner {
           );
         }
 
+        const currentUrlNoHash = getUrlNoHash();
+        if (suppressedLoginGateUrl && suppressedLoginGateUrl !== currentUrlNoHash) {
+          suppressedLoginGateUrl = null;
+        }
         if (req.pauseOnGate ?? true) {
-          const gate = await detectPageGate(session.page);
+          const allowLoginWall =
+            req.pauseOnLoginWall !== false &&
+            !(suppressedLoginGateUrl !== null && suppressedLoginGateUrl === currentUrlNoHash);
+          const gate = await detectPageGate(session.page, { pauseOnLoginWall: allowLoginWall });
           if (gate.detected && gate.reason) {
             return await pauseNow(
               step,
@@ -2514,6 +2778,8 @@ export class BrowserSubagentRunner {
           if (decision.note) {
             findingsLedger.record(step, latestObs, 'complete', decision.note);
           }
+          recordTrace(step, decision, true);
+          const extractedData = await finalizeExtractedData(true);
           return {
             subagentId,
             role: req.role,
@@ -2523,6 +2789,8 @@ export class BrowserSubagentRunner {
             hostFacts: hostFacts.getFacts(),
             contextStats: history.getStats(),
             findings: findingsLedger.getFindings(),
+            actionTrace,
+            ...(extractedData ? { extractedData } : {}),
             ...(latestNavigation ? { navigation: latestNavigation } : {}),
           };
         }
@@ -2531,6 +2799,7 @@ export class BrowserSubagentRunner {
           if (decision.note) {
             findingsLedger.record(step, latestObs, 'pause_for_takeover', decision.note);
           }
+          recordTrace(step, decision, true);
           return await pauseNow(
             step + 1,
             decision.blockReason,
@@ -2550,6 +2819,7 @@ export class BrowserSubagentRunner {
               tools.sampler.formatObservationForLLM(snap)
             );
             findingsLedger.record(step, snap, 'navigate(blocked)', decision.note);
+            recordTrace(step, decision, false, 'ORIGIN_BLOCKED');
             latestObs = snap;
             continue;
           }
@@ -2570,6 +2840,7 @@ export class BrowserSubagentRunner {
             res.blocked ? `navigate(${res.blocked})` : 'navigate',
             decision.note
           );
+          recordTrace(step, decision, res.ok !== false && !res.blocked, res.blocked);
           latestObs = res.observation;
           if (res.blocked === 'PROMPT_REQUIRES_HUMAN') {
             return await pauseNow(
@@ -2593,6 +2864,7 @@ export class BrowserSubagentRunner {
         if (decision.type === 'set_cursor_style') {
           await tools.setCursorStyle(decision.style);
           findingsLedger.record(step, latestObs, 'set_cursor_style', decision.note);
+          recordTrace(step, decision, true);
           if (await session.checkHumanTakeoverRequested()) {
             return await pauseNow(
               step + 1,
@@ -2604,7 +2876,7 @@ export class BrowserSubagentRunner {
           continue;
         }
 
-        let actionResult: Awaited<ReturnType<AtomicBrowserToolset['click']>>;
+        let actionResult: AtomicToolResult & { extractResult?: StructuredExtractResult };
         try {
           if (decision.type === 'move_mouse') {
             actionResult = await tools.moveMouse(decision.points, decision.label ?? 'SUBAGENT SWEEP');
@@ -2645,6 +2917,23 @@ export class BrowserSubagentRunner {
             actionResult = await tools.extractOutline(decision.maxItems);
           } else if (decision.type === 'inspect_media') {
             actionResult = await tools.inspectMedia(decision.maxItems);
+          } else if (decision.type === 'extract_list') {
+            const mergedFields =
+              decision.fields !== undefined
+                ? parseExtractFieldsSpec(decision.fields)
+                : req.extractSpec?.fields
+                  ? parseExtractFieldsSpec(req.extractSpec.fields)
+                  : undefined;
+            const effSpec: StructuredExtractSpec = {
+              itemSelector: decision.itemSelector ?? req.extractSpec?.itemSelector ?? '',
+              ...(mergedFields ? { fields: mergedFields } : {}),
+              maxItems: decision.maxItems ?? req.extractSpec?.maxItems,
+              dedupeBy: decision.dedupeBy ?? req.extractSpec?.dedupeBy,
+            };
+            actionResult = await tools.extractListForAgent(effSpec);
+            if (actionResult.extractResult && actionResult.extractResult.ok) {
+              mergeExtractedBatch(actionResult.extractResult, effSpec);
+            }
           } else if (decision.type === 'set_viewport') {
             actionResult = await tools.setViewport({
               width: decision.width,
@@ -2765,6 +3054,7 @@ export class BrowserSubagentRunner {
           ...(actionResult.motion ? { motion: actionResult.motion } : {}),
           ...(actionResult.region ? { region: actionResult.region } : {}),
         });
+        recordTrace(step, decision, isSuccess, actionResult.blocked, actionResult.skipped);
 
         if (decision.type === 'inspect_region' && isSuccess && actionResult.region?.imagePath) {
           pendingRegion = actionResult.region;
@@ -2794,6 +3084,7 @@ export class BrowserSubagentRunner {
         }
 
         if (consecutiveFailures >= 3) {
+          const extractedData = await finalizeExtractedData(false);
           return {
             subagentId,
             role: req.role,
@@ -2804,6 +3095,8 @@ export class BrowserSubagentRunner {
             hostFacts: hostFacts.getFacts(),
             contextStats: history.getStats(),
             findings: findingsLedger.getFindings(),
+            actionTrace,
+            ...(extractedData ? { extractedData } : {}),
             ...(latestNavigation ? { navigation: latestNavigation } : {}),
           };
         }
@@ -2818,6 +3111,7 @@ export class BrowserSubagentRunner {
         }
       }
 
+      const extractedData = await finalizeExtractedData(true);
       return {
         subagentId,
         role: req.role,
@@ -2827,6 +3121,8 @@ export class BrowserSubagentRunner {
         hostFacts: hostFacts.getFacts(),
         contextStats: history.getStats(),
         findings: findingsLedger.getFindings(),
+        actionTrace,
+        ...(extractedData ? { extractedData } : {}),
         ...(latestNavigation ? { navigation: latestNavigation } : {}),
       };
     } finally {

@@ -89,6 +89,7 @@ export declare function resolveDefaultArtifactDir(configuredDir?: string, _ctx?:
  * rendered output so the model, UI, and DSH session logs can observe the active routing & fallback reason.
  */
 export declare function formatPlannerDiagnosticsLine(value: any): string;
+export declare function formatActionTraceAndExtractedFooter(value: any): string;
 /**
  * Resolves the provider/model route from plugin overrides or the active DSH tool execution context.
  */

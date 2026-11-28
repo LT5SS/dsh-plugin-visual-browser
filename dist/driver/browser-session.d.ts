@@ -36,6 +36,7 @@ export declare class BrowserSession {
     private styleBindingInstalled;
     private closingIntentionally;
     private navigatingViaSession;
+    private allowAgentUnload;
     private lastMainFrameDocUrl;
     private disconnectListeners;
     private resumeListeners;
@@ -95,5 +96,6 @@ export declare class BrowserSession {
         format?: 'png' | 'jpeg';
         quality?: number;
     }): Promise<Buffer>;
+    withAgentNavigationAllowed<T>(fn: () => Promise<T>): Promise<T>;
     close(): Promise<void>;
 }

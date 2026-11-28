@@ -77,6 +77,7 @@ export class BrowserSession {
     styleBindingInstalled = false;
     closingIntentionally = false;
     navigatingViaSession = false;
+    allowAgentUnload = false;
     lastMainFrameDocUrl = '';
     disconnectListeners = new Set();
     resumeListeners = new Set();
@@ -380,6 +381,7 @@ export class BrowserSession {
         if (type === 'beforeunload') {
             const shouldAccept = this.closingIntentionally ||
                 this.navigatingViaSession ||
+                this.allowAgentUnload ||
                 this.motion?.getTakeoverMode?.() === 'paused' ||
                 !this.motion?.isUnloadGuardEnabled();
             if (shouldAccept) {
@@ -707,6 +709,24 @@ export class BrowserSession {
             type: format,
             ...(format === 'jpeg' ? { quality: opts.quality ?? 65 } : {}),
         });
+    }
+    async withAgentNavigationAllowed(fn) {
+        const prev = this.allowAgentUnload;
+        this.allowAgentUnload = true;
+        if (!prev && this.motion?.isUnloadGuardEnabled() && this.isAlive()) {
+            await safeEvaluate(this.page, () => {
+                window.__dshCursorAPI?.setUnloadGuard?.(false);
+            }, undefined, 0).catch(() => { });
+        }
+        try {
+            return await fn();
+        }
+        finally {
+            this.allowAgentUnload = prev;
+            if (!prev && this.motion?.isUnloadGuardEnabled() && this.isAlive()) {
+                await this.motion.ensureCursorHUD(true).catch(() => { });
+            }
+        }
     }
     async close() {
         this.closingIntentionally = true;

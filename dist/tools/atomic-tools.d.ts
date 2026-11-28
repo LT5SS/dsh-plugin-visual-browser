@@ -1,6 +1,14 @@
 import type { BrowserSession } from '../driver/browser-session.js';
-import type { ActionBlockedReason, MotionInspectResult, NativeDialogRecord, NavigateWaitUntil, NavigationDiagnostic, Point2D, RegionInspectResult, ScrollDiagnostic, SetViewportOptions, StylesInspectResult, VirtualCursorStyleConfig, WaitForOptions, WaitForResult } from '../driver/types.js';
+import type { ActionBlockedReason, ExtractFieldSpec, MotionInspectResult, NativeDialogRecord, NavigateWaitUntil, NavigationDiagnostic, Point2D, RegionInspectResult, ScrollDiagnostic, SetViewportOptions, StructuredExtractResult, StructuredExtractSpec, StylesInspectResult, VirtualCursorStyleConfig, WaitForOptions, WaitForResult } from '../driver/types.js';
 import { PageSnapshotSampler, type PageObservation } from '../sampler/page-snapshot.js';
+export declare function parseExtractFieldsSpec(raw: unknown): Record<string, ExtractFieldSpec> | undefined;
+export declare function normalizeExtractSpec(raw: {
+    itemSelector?: unknown;
+    fields?: unknown;
+    maxItems?: unknown;
+    dedupeBy?: unknown;
+    includeEmpty?: unknown;
+}): StructuredExtractSpec | undefined;
 export declare function formatRegionTextSummary(region: RegionInspectResult): string;
 export declare function formatStylesBlockWithinBudget(res: StylesInspectResult, maxChars?: number): string;
 export declare function isReservedHotkey(key: string, takeoverHotkey?: string): boolean;
@@ -117,4 +125,12 @@ export declare class AtomicBrowserToolset {
         timeoutMs?: number;
     }): Promise<AtomicToolResult>;
     private runHistoryNav;
+    /**
+     * Read-only declarative list extraction using CSS selectors and an attribute whitelist.
+     * Never executes arbitrary user-supplied JS expressions; masks password values.
+     */
+    extractList(spec: StructuredExtractSpec): Promise<StructuredExtractResult>;
+    extractListForAgent(spec: StructuredExtractSpec): Promise<AtomicToolResult & {
+        extractResult?: StructuredExtractResult;
+    }>;
 }

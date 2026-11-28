@@ -106,6 +106,7 @@ export class BrowserSession {
   private styleBindingInstalled = false;
   private closingIntentionally = false;
   private navigatingViaSession = false;
+  private allowAgentUnload = false;
   private lastMainFrameDocUrl = '';
   private disconnectListeners = new Set<() => void>();
   private resumeListeners = new Set<() => void>();
@@ -431,6 +432,7 @@ export class BrowserSession {
       const shouldAccept =
         this.closingIntentionally ||
         this.navigatingViaSession ||
+        this.allowAgentUnload ||
         this.motion?.getTakeoverMode?.() === 'paused' ||
         !this.motion?.isUnloadGuardEnabled();
       if (shouldAccept) {
@@ -821,6 +823,29 @@ export class BrowserSession {
       type: format,
       ...(format === 'jpeg' ? { quality: opts.quality ?? 65 } : {}),
     });
+  }
+
+  public async withAgentNavigationAllowed<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.allowAgentUnload;
+    this.allowAgentUnload = true;
+    if (!prev && this.motion?.isUnloadGuardEnabled() && this.isAlive()) {
+      await safeEvaluate(
+        this.page,
+        () => {
+          (window as any).__dshCursorAPI?.setUnloadGuard?.(false);
+        },
+        undefined,
+        0
+      ).catch(() => {});
+    }
+    try {
+      return await fn();
+    } finally {
+      this.allowAgentUnload = prev;
+      if (!prev && this.motion?.isUnloadGuardEnabled() && this.isAlive()) {
+        await this.motion.ensureCursorHUD(true).catch(() => {});
+      }
+    }
   }
 
   public async close(): Promise<void> {

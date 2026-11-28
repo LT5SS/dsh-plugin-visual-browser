@@ -8,7 +8,7 @@ import { defineTool, } from '@deepseek-ai/dsh-tools';
 import { BrowserSession } from './driver/browser-session.js';
 import { resolveBrowserWindowMode } from './driver/window-manager.js';
 import { resolveCursorStyle } from './injected/virtual-cursor.js';
-import { AtomicBrowserToolset } from './tools/atomic-tools.js';
+import { AtomicBrowserToolset, normalizeExtractSpec } from './tools/atomic-tools.js';
 import { loadPersistedSettings, mergeCursorStyleConfig, resolveSettingsFilePath, savePersistedSettings, } from './settings-store.js';
 import { BrowserSubagentRunner, createBuiltinInspectorPlanner, createDshHostLlmPlanner, createOpenAIVisionPlanner, summarizeDecisionAction, } from './subagent/runner.js';
 export * from './driver/types.js';
@@ -325,6 +325,52 @@ export function formatPlannerDiagnosticsLine(value) {
             ? ` (initial ${d.initial_mode}${d.last_fallback_reason ? `, reason ${d.last_fallback_reason}` : ''}, fallbacks ${d.fallback_count ?? '?'})`
             : '') +
         ` | host services: llm ${hs.llm ? 'yes' : 'no'}, attachments ${hs.attachments ? 'yes' : 'no'}${route}`);
+}
+export function formatActionTraceAndExtractedFooter(value) {
+    let out = '';
+    const trace = Array.isArray(value?.action_trace) ? value.action_trace : [];
+    if (trace.length > 0) {
+        const lines = [`\n\n[ACTION_TRACE] (${trace.length} steps)`];
+        let totalLen = lines[0].length;
+        for (const item of trace) {
+            const targetPart = item?.target ? ` ${String(item.target).slice(0, 80)}` : '';
+            const statusPart = item?.ok === false ? ` [${item?.blocked || 'failed'}]` : '';
+            const line = `- step ${item?.step ?? '?'}: ${item?.action ?? '?'}${targetPart}${statusPart}`;
+            if (totalLen + line.length + 1 > 1180) {
+                lines.push(`- ... (${trace.length - (lines.length - 1)} more steps)`);
+                break;
+            }
+            lines.push(line);
+            totalLen += line.length + 1;
+        }
+        out += lines.join('\n');
+    }
+    if (typeof value?.extracted_count === 'number') {
+        const header = `\n\n[EXTRACTED_DATA] selector=${JSON.stringify(value.extracted_selector ?? '')}` +
+            ` | count=${value.extracted_count}` +
+            (value.extracted_truncated ? ' (truncated)' : '') +
+            (value.extracted_path ? ` | file=${value.extracted_path}` : '');
+        const items = Array.isArray(value.extracted_items) ? value.extracted_items : [];
+        const rawJson = JSON.stringify(items);
+        if (rawJson.length <= 5800) {
+            out += `${header}\n\`\`\`json\n${rawJson}\n\`\`\``;
+        }
+        else {
+            const previewItems = [];
+            let used = 2;
+            for (const row of items) {
+                const s = JSON.stringify(row);
+                if (used + s.length + 2 > 5400)
+                    break;
+                previewItems.push(row);
+                used += s.length + 2;
+            }
+            out +=
+                `${header}\n\`\`\`json\n${JSON.stringify(previewItems)}\n\`\`\`\n` +
+                    `... showing ${previewItems.length}/${items.length} items (full array saved at ${value.extracted_path ?? 'extracted.json'})`;
+        }
+    }
+    return out;
 }
 /**
  * Resolves the provider/model route from plugin overrides or the active DSH tool execution context.
@@ -658,7 +704,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             },
             window_mode: {
                 type: 'string',
-                description: 'Optional window presentation override ("visible-background", "minimized", or "headless")',
+                description: 'Optional window presentation override ("visible-background", "minimized", or "headless"). Note: on Cloudflare / JS-challenge protected sites, "visible-background" (desktop default) has significantly higher pass rate than "headless".',
                 enum: ['visible-background', 'minimized', 'headless'],
             },
             wait_until: {
@@ -682,6 +728,26 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 type: 'number',
                 description: 'Optional explicit DPR scale override (1..2; requires viewport override)',
             },
+            pause_on_login_wall: {
+                type: 'boolean',
+                description: 'Whether visible unoccluded password login forms auto-pause for human takeover (default: true). Set false for public catalog scraping on sites that render inline login forms.',
+            },
+            extract_selector: {
+                type: 'string',
+                description: 'Optional CSS selector for repeated list items (e.g. "div.item") to extract declaratively (read-only) into structured JSON on completion or pagination.',
+            },
+            extract_fields_json: {
+                type: 'string',
+                description: 'Optional JSON object mapping output field names to child selectors/read-only attrs, e.g. \'{"title":".video-title","href":{"selector":"a.box","attr":"href"}}\' (attrs: text, href, src, title, alt, value, attr:<name>).',
+            },
+            extract_max_items: {
+                type: 'integer',
+                description: 'Maximum structured items to collect across pages (1..1000, default: 200).',
+            },
+            extract_dedupe_by: {
+                type: 'string',
+                description: 'Optional field name (e.g. "href") used to deduplicate items across paginated extraction.',
+            },
         },
         output: {
             schema: {
@@ -698,7 +764,8 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 },
             },
             render(_args, value) {
-                const text = `${value?.host_facts_block ?? ''}\n\n${value?.subagent_report ?? ''}${formatPlannerDiagnosticsLine(value)}`;
+                const text = `${value?.host_facts_block ?? ''}\n\n${value?.subagent_report ?? ''}` +
+                    `${formatActionTraceAndExtractedFooter(value)}${formatPlannerDiagnosticsLine(value)}`;
                 return renderToolContent(text, value?.image_attachment);
             },
         },
@@ -774,6 +841,25 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                         : {}),
                 }
                 : undefined;
+            let parsedExtractSpec;
+            if (args.extract_selector !== undefined || args.extract_fields_json !== undefined) {
+                let fieldsArg = args.extract_fields_json;
+                if (typeof args.extract_fields_json === 'string' && args.extract_fields_json.trim()) {
+                    try {
+                        fieldsArg = JSON.parse(args.extract_fields_json);
+                    }
+                    catch {
+                        throw new Error('Invalid extract_fields_json: must be a valid JSON object string.');
+                    }
+                }
+                parsedExtractSpec = normalizeExtractSpec({
+                    itemSelector: args.extract_selector,
+                    fields: fieldsArg,
+                    maxItems: args.extract_max_items,
+                    dedupeBy: args.extract_dedupe_by,
+                });
+            }
+            const pauseOnLoginWall = args.pause_on_login_wall !== undefined ? Boolean(args.pause_on_login_wall) : undefined;
             try {
                 const res = await runner.runTask({
                     subagentId,
@@ -787,6 +873,8 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     maxRecentImages: config.maxRecentImages ?? 3,
                     allowedOrigins: config.allowedOrigins,
                     blockedOrigins: config.blockedOrigins,
+                    ...(pauseOnLoginWall !== undefined ? { pauseOnLoginWall } : {}),
+                    ...(parsedExtractSpec ? { extractSpec: parsedExtractSpec } : {}),
                     keepWindowOpen,
                     signal: exec?.signal,
                     sessionOptions: {
@@ -932,6 +1020,16 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                     approval_card: res.approvalCard ?? null,
                     sliding_window_stats: res.contextStats,
                     findings: res.findings ?? [],
+                    action_trace: res.actionTrace ?? [],
+                    ...(res.extractedData
+                        ? {
+                            extracted_selector: res.extractedData.selector,
+                            extracted_count: res.extractedData.count,
+                            extracted_truncated: res.extractedData.truncated,
+                            ...(res.extractedData.path ? { extracted_path: res.extractedData.path } : {}),
+                            extracted_items: res.extractedData.items,
+                        }
+                        : {}),
                     ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
                 });
             }
@@ -968,6 +1066,10 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 type: 'string',
                 description: 'Optional follow-up note or instructions after human takeover',
             },
+            pause_on_login_wall: {
+                type: 'boolean',
+                description: 'Optional override for visible password login-wall auto-pause upon resuming (never relaxes CAPTCHA or payment gates).',
+            },
         },
         output: {
             schema: {
@@ -992,12 +1094,13 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
             },
             render(_args, value) {
                 const body = value?.subagent_report ?? value?.hint ?? '';
-                const text = `${value?.host_facts_block ?? ''}\n\n${body}`;
+                const text = `${value?.host_facts_block ?? ''}\n\n${body}${formatActionTraceAndExtractedFooter(value)}`;
                 return renderToolContent(text, value?.image_attachment);
             },
         },
         async execute(args, exec) {
-            const res = await runner.resumeTask(String(args.subagent_id), args.user_note ? String(args.user_note) : undefined, exec?.signal);
+            const pauseOnLoginWall = args.pause_on_login_wall !== undefined ? Boolean(args.pause_on_login_wall) : undefined;
+            const res = await runner.resumeTask(String(args.subagent_id), args.user_note ? String(args.user_note) : undefined, exec?.signal, pauseOnLoginWall !== undefined ? { pauseOnLoginWall } : undefined);
             const imageAttachment = await tryRegisterImageAttachment(resolvedServices, ctx, res.hostFacts.latestScreenshot);
             return toLosslessJson({
                 status: res.status,
@@ -1009,6 +1112,16 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
                 approval_card: res.approvalCard ?? null,
                 sliding_window_stats: res.contextStats,
                 findings: res.findings ?? [],
+                action_trace: res.actionTrace ?? [],
+                ...(res.extractedData
+                    ? {
+                        extracted_selector: res.extractedData.selector,
+                        extracted_count: res.extractedData.count,
+                        extracted_truncated: res.extractedData.truncated,
+                        ...(res.extractedData.path ? { extracted_path: res.extractedData.path } : {}),
+                        extracted_items: res.extractedData.items,
+                    }
+                    : {}),
                 ...(imageAttachment ? { image_attachment: imageAttachment } : {}),
             });
         },
@@ -1145,7 +1258,7 @@ export function createVisualBrowserTools(ctx, config = {}, runner = new BrowserS
     // 4. browser_quick_snapshot
     const quickSnapshotTool = defineTool({
         name: 'browser_quick_snapshot',
-        description: 'Silently capture a single 3-in-1 multimodal snapshot (viewport screenshot + numbered interactive controls + DOM/tech/console health) of a URL in the background. Registers an ImageBlock via ctx.attachments when available so the main model can view the screenshot.',
+        description: 'Silently capture a single 3-in-1 multimodal snapshot of an already-accessible or static/local URL (registers an ImageBlock via ctx.attachments when available). Use browser_subagent_run instead for Cloudflare JS challenges, confirmation gates, interaction, or structured list extraction.',
         parameters: {
             url: {
                 type: 'string',

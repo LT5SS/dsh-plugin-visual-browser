@@ -312,3 +312,43 @@ export interface MotionOptions {
     keepSelection?: boolean;
     timeoutMs?: number;
 }
+export interface ActionTraceEntry {
+    step: number;
+    action: string;
+    target?: string;
+    url?: string;
+    ok: boolean;
+    blocked?: string;
+    skipped?: boolean;
+    note?: string;
+}
+export interface ExtractFieldSpec {
+    selector?: string;
+    attr?: string;
+    trim?: boolean;
+}
+export interface StructuredExtractSpec {
+    itemSelector: string;
+    fields?: Record<string, string | ExtractFieldSpec>;
+    maxItems?: number;
+    dedupeBy?: string;
+    includeEmpty?: boolean;
+}
+export interface StructuredExtractResult {
+    ok: boolean;
+    selector: string;
+    url: string;
+    matchedCount: number;
+    extractedCount: number;
+    items: Array<Record<string, string | null>>;
+    truncated: boolean;
+    degraded?: boolean;
+    degradedReason?: string;
+}
+export interface ExtractedDataBundle {
+    selector: string;
+    count: number;
+    truncated: boolean;
+    path?: string;
+    items: Array<Record<string, string | null>>;
+}

@@ -4607,6 +4607,91 @@ async function main() {
     }
     console.log('[Strict DSH 0.2 Contract] 6e Verified v2.0.2 probe schemas, flat normalization & diagnostic summaries!');
 
+    // 6f. v2.0.3: Tool schema parameters (pause_on_login_wall + extract_*), action_trace, structured extraction & sparse render safety
+    const v203Host = createCordisStrictCtx({
+      validateSchemas: true,
+      services: {
+        attachments: createAttachmentsStub(),
+        llm: {
+          async *stream(options: any) {
+            const txt = (options?.messages?.[0]?.content ?? [])
+              .filter((p: any) => p?.type === 'text')
+              .map((p: any) => String(p.text ?? ''))
+              .join('\n');
+            if (txt.includes('__hud-fixture.html') && !txt.includes('Resumed after human takeover')) {
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'SHOULD_PAUSE_ON_REAL_PW' }) };
+            } else {
+              yield { type: 'text-delta', delta: JSON.stringify({ type: 'complete', report: 'V203_CORDIS_E2E_OK' }) };
+            }
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          },
+        },
+      },
+    });
+    const v203Plugin = apply(v203Host.ctx, {
+      mode: 'auto',
+      windowMode: 'headless',
+      keepWindowOpen: false,
+      artifactDir,
+      hostProvider: 'opencode-go',
+      hostModel: 'deepseek-v4.1-flash',
+    });
+    allDisposers.push(...v203Host.effectDisposers);
+    try {
+      assert.equal(v203Host.registeredTools.size, 4);
+      const run203Def = v203Host.registeredTools.get('browser_subagent_run')!;
+      const resume203Def = v203Host.registeredTools.get('browser_subagent_resume')!;
+      const runProps = (run203Def.parameters as any)?.properties ?? {};
+      for (const k of ['pause_on_login_wall', 'extract_selector', 'extract_fields_json', 'extract_max_items', 'extract_dedupe_by']) {
+        assert.ok(runProps[k], `Expected parameter ${k} on browser_subagent_run`);
+      }
+      assert.ok((resume203Def.parameters as any)?.properties?.pause_on_login_wall);
+
+      // Pause on genuine unoccluded login wall (/ __hud-fixture.html has visible #pwd-box), then resume cleanly without loop!
+      const paused203: any = await run203Def.execute(
+        {
+          url: `${srv.url}__hud-fixture.html`,
+          role: 'v2.0.3 Gate+Extract QA',
+          task_prompt: 'Inspect fixture',
+          max_steps: 4,
+          extract_selector: 'p',
+          extract_fields_json: JSON.stringify({ text: 'self', link: { selector: 'a', attr: 'href' } }),
+          extract_max_items: 20,
+        },
+        fakeExec
+      );
+      assert.equal(paused203.status, 'PAUSED_FOR_TAKEOVER');
+      assert.ok(Array.isArray(paused203.action_trace));
+
+      const resumed203: any = await resume203Def.execute(
+        { subagent_id: paused203.subagent_id, user_note: 'Continue and extract paragraphs cleanly' },
+        fakeExec
+      );
+      assert.equal(resumed203.status, 'COMPLETED');
+      assert.ok(Array.isArray(resumed203.action_trace) && resumed203.action_trace.length >= 2);
+      assert.ok(resumed203.extracted_count >= 1, 'Expected auto-extracted items on resume completion');
+      assert.ok(resumed203.extracted_path && fs.existsSync(resumed203.extracted_path));
+      const renderedResumed = resume203Def.output.render({}, resumed203)[0].text;
+      assert.ok(renderedResumed.includes('[ACTION_TRACE]'));
+      assert.ok(renderedResumed.includes('[EXTRACTED_DATA]'));
+      assert.ok(!renderedResumed.includes('— planner:'), 'Resume render must still omit planner footer');
+
+      // 6g. extract_list SubagentActionDecision schema validation
+      const extractDecision: SubagentActionDecision = {
+        type: 'extract_list',
+        itemSelector: 'div.item',
+        fields: { title: '.video-title', href: { selector: 'a', attr: 'href' } },
+        maxItems: 50,
+        dedupeBy: 'href',
+        reason: 'Extract current page items',
+      };
+      assert.equal(isValidSubagentDecision(extractDecision), true);
+      assert.equal(summarizeDecisionAction(extractDecision).type, 'extract_list');
+    } finally {
+      await v203Plugin.runner.closeAllSessions();
+    }
+    console.log('[Strict DSH 0.2 Contract] 6f-6g Verified v2.0.3 schema params, LOGIN_REQUIRED resume loop-breaker, action_trace & declarative structured extraction!');
+
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {
     for (const d of allDisposers) d();

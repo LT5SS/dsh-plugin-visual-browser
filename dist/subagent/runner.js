@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserSession } from '../driver/browser-session.js';
-import { AtomicBrowserToolset, formatRegionTextSummary } from '../tools/atomic-tools.js';
+import { AtomicBrowserToolset, formatRegionTextSummary, parseExtractFieldsSpec, } from '../tools/atomic-tools.js';
 import { HostFactsTracker } from './host-facts.js';
 import { SlidingWindowHistory } from './sliding-context.js';
 import { FindingsLedger, MAX_FINDINGS_ENTRIES, MAX_FINDING_NOTE_CHARS, MAX_FINDINGS_TOTAL_CHARS, RECENT_FINDINGS_WINDOW, } from './findings.js';
@@ -27,6 +27,7 @@ Respond ONLY with a single valid JSON object matching one of these actions (any 
 - {"type":"inspect_motion","target":"#3","reason":"..."} or {"type":"inspect_motion","target":{"x":640,"y":380},"reason":"..."} (read-only pointer-driven hover/transform/canvas-pixel probe without clicking; use {x,y} on <canvas> areas)
 - {"type":"inspect_region","target":{"x":640,"y":380},"radius":140,"zoom":2,"reason":"..."} (on-demand 2x local crop probe attached ONLY to the next step for tiny text/detail inspection)
 - {"type":"inspect_dom","selector":".hero h1","maxSamples":5,"reason":"..."} / {"type":"inspect_styles","target":"#3","reason":"..."} / {"type":"extract_outline","reason":"..."} / {"type":"inspect_media","reason":"..."} (fixed read-only DOM/CSS/outline/media probes)
+- {"type":"extract_list","itemSelector":"div.item","fields":{"title":".video-title"},"maxItems":200,"dedupeBy":"href","reason":"..."} (read-only declarative list extraction; omit fields/selector when caller already configured extractSpec to accumulate current page items before pagination)
 - {"type":"set_viewport","width":1440,"height":900,"deviceScaleFactor":1.5,"reason":"..."} or {"type":"set_viewport","reset":true,"reason":"..."} (override desktop viewport/DPR when layout/small text is unreadable)
 - {"type":"wait_for","selector":"h1","goneSelector":".loader","text":"...","animationsSettled":true,"timeoutMs":6000,"reason":"..."} (wait cleanly for SPA/loader readiness without failing on timeout)
 - {"type":"press_key","key":"Escape","reason":"..."} (keyboard key/combo like Escape, Enter, Tab, ArrowDown, Control+A; F8/Alt+F4 are reserved)
@@ -150,6 +151,14 @@ export function summarizeDecisionAction(decision) {
                 ...(decision.maxItems !== undefined ? { maxItems: decision.maxItems } : {}),
                 ...noteExtra,
             };
+        case 'extract_list':
+            return {
+                type: 'extract_list',
+                ...(decision.itemSelector ? { itemSelector: decision.itemSelector } : {}),
+                ...(decision.maxItems !== undefined ? { maxItems: decision.maxItems } : {}),
+                ...(decision.dedupeBy ? { dedupeBy: decision.dedupeBy } : {}),
+                ...noteExtra,
+            };
         case 'set_cursor_style':
             return {
                 type: 'set_cursor_style',
@@ -259,6 +268,9 @@ function formatShortActionForFinding(decision, blocked) {
             break;
         case 'inspect_media':
             base = 'inspect_media';
+            break;
+        case 'extract_list':
+            base = decision.itemSelector ? `extract_list ${decision.itemSelector.slice(0, 24)}` : 'extract_list';
             break;
         case 'set_cursor_style':
             base = 'set_cursor_style';
@@ -386,6 +398,16 @@ export function isValidSubagentDecision(value) {
             const limOk = d.maxItems === undefined ||
                 (typeof d.maxItems === 'number' && Number.isFinite(d.maxItems) && d.maxItems >= 1);
             return limOk;
+        }
+        case 'extract_list': {
+            const selOk = d.itemSelector === undefined || (typeof d.itemSelector === 'string' && d.itemSelector.trim().length > 0);
+            const fieldsOk = d.fields === undefined ||
+                (typeof d.fields === 'object' && d.fields !== null && !Array.isArray(d.fields)) ||
+                typeof d.fields === 'string';
+            const limOk = d.maxItems === undefined ||
+                (typeof d.maxItems === 'number' && Number.isFinite(d.maxItems) && d.maxItems >= 1);
+            const dedupeOk = d.dedupeBy === undefined || typeof d.dedupeBy === 'string';
+            return selOk && fieldsOk && limOk && dedupeOk;
         }
         case 'set_cursor_style':
             return d.style !== null && typeof d.style === 'object' && !Array.isArray(d.style);
@@ -1643,9 +1665,27 @@ export class BrowserSubagentRunner {
             hostFacts.recordStep(initRes.observation.screenshotPath);
             history.pushObservation(initRes.action, initRes.observation, initRes.llmSummary);
             findingsLedger.record(0, initRes.observation, 'navigate');
+            const effectiveTaskReq = req.extractSpec
+                ? {
+                    ...req,
+                    taskPrompt: `${req.taskPrompt}\n\n[Structured Extraction Configured]: itemSelector=${JSON.stringify(req.extractSpec.itemSelector)}. ` +
+                        `On completion, rows matching this selector are automatically extracted to structured JSON. ` +
+                        `If paginating across multiple pages, run {"type":"extract_list","reason":"..."} on each page before clicking Next.`,
+                }
+                : req;
+            const initialTrace = [
+                {
+                    step: 0,
+                    action: 'navigate',
+                    target: req.startUrl,
+                    url: initRes.observation.domStats.url,
+                    ok: initRes.ok !== false && !initRes.blocked,
+                    ...(initRes.blocked ? { blocked: initRes.blocked } : {}),
+                },
+            ];
             return await this.executeLoop({
                 subagentId,
-                req,
+                req: effectiveTaskReq,
                 session,
                 tools,
                 hostFacts,
@@ -1657,6 +1697,11 @@ export class BrowserSubagentRunner {
                 latestObs: initRes.observation,
                 latestNavigation: initRes.navigation,
                 isSharedSession: isShared,
+                actionTrace: initialTrace,
+                extractedItems: [],
+                extractedTruncated: false,
+                extractedSelector: req.extractSpec?.itemSelector,
+                lastExtractedUrl: null,
             });
         }
         catch (err) {
@@ -1754,11 +1799,33 @@ export class BrowserSubagentRunner {
                     findings: findingsLedger.getFindings(),
                     navigation: paused.latestNavigation,
                 });
+                if (opts?.pauseOnLoginWall !== undefined) {
+                    req.pauseOnLoginWall = opts.pauseOnLoginWall;
+                }
                 const postTakeoverObs = await tools.sampler.captureSnapshot('resumed_after_takeover');
                 signal?.throwIfAborted();
                 hostFacts.recordStep(postTakeoverObs.screenshotPath);
                 history.pushObservation(`Resumed after human takeover (${userFollowupNote})`, postTakeoverObs, tools.sampler.formatObservationForLLM(postTakeoverObs));
                 findingsLedger.record(Math.max(0, nextStep - 1), postTakeoverObs, 'resume');
+                const actionTrace = [...(paused.actionTrace ?? [])];
+                actionTrace.push({
+                    step: Math.max(0, nextStep - 1),
+                    action: 'resume',
+                    url: postTakeoverObs.domStats.url,
+                    ok: true,
+                });
+                // Break LOGIN_REQUIRED infinite loop when user explicitly resumes on the same URL;
+                // CAPTCHA_DETECTED and PAYMENT_REQUIRED remain strictly enforced.
+                const suppressedLoginGateUrl = paused.lastPauseReason === 'LOGIN_REQUIRED'
+                    ? (() => {
+                        try {
+                            return session.page.url().split('#')[0];
+                        }
+                        catch {
+                            return null;
+                        }
+                    })()
+                    : null;
                 const loopRes = await this.executeLoop({
                     subagentId,
                     req,
@@ -1772,7 +1839,14 @@ export class BrowserSubagentRunner {
                     maxSteps,
                     latestObs: postTakeoverObs,
                     latestNavigation: paused.latestNavigation,
+                    pendingRegion: paused.pendingRegion,
                     isSharedSession: false,
+                    actionTrace,
+                    extractedItems: paused.extractedItems ?? [],
+                    extractedTruncated: paused.extractedTruncated ?? false,
+                    extractedSelector: paused.extractedSelector ?? req.extractSpec?.itemSelector,
+                    lastExtractedUrl: paused.lastExtractedUrl ?? null,
+                    suppressedLoginGateUrl,
                 });
                 const finalRes = {
                     ...loopRes,
@@ -1825,6 +1899,119 @@ export class BrowserSubagentRunner {
         let consecutiveFailures = 0;
         let lastStaleTarget = null;
         let sameStaleCount = 0;
+        let suppressedLoginGateUrl = state.suppressedLoginGateUrl ?? null;
+        const actionTrace = [...(state.actionTrace ?? [])];
+        const extractedItems = [...(state.extractedItems ?? [])];
+        const seenDedupeKeys = new Set();
+        const activeDedupeField = req.extractSpec?.dedupeBy;
+        if (activeDedupeField) {
+            for (const existingRow of extractedItems) {
+                const keyVal = existingRow?.[activeDedupeField];
+                if (typeof keyVal === 'string' && keyVal.trim()) {
+                    seenDedupeKeys.add(keyVal.trim());
+                }
+            }
+        }
+        let extractedTruncated = Boolean(state.extractedTruncated);
+        let extractedSelector = state.extractedSelector ?? req.extractSpec?.itemSelector;
+        let lastExtractedUrl = state.lastExtractedUrl ?? null;
+        const getUrlNoHash = () => {
+            try {
+                return session.page.url().split('#')[0];
+            }
+            catch {
+                return '';
+            }
+        };
+        const mergeExtractedBatch = (res, spec) => {
+            extractedSelector = spec.itemSelector;
+            lastExtractedUrl = getUrlNoHash() || res.url || lastExtractedUrl;
+            if (res.truncated)
+                extractedTruncated = true;
+            const limit = Math.max(1, Math.min(1000, Math.round(spec.maxItems ?? req.extractSpec?.maxItems ?? 200)));
+            const dedupeKey = spec.dedupeBy ?? req.extractSpec?.dedupeBy;
+            for (const row of res.items) {
+                if (extractedItems.length >= limit) {
+                    extractedTruncated = true;
+                    break;
+                }
+                if (dedupeKey) {
+                    const kv = row[dedupeKey];
+                    const norm = typeof kv === 'string' ? kv.trim() : '';
+                    if (norm) {
+                        if (seenDedupeKeys.has(norm))
+                            continue;
+                        seenDedupeKeys.add(norm);
+                    }
+                }
+                extractedItems.push(row);
+            }
+        };
+        const finalizeExtractedData = async (runAutoFinal) => {
+            if (runAutoFinal && req.extractSpec && session.isAlive()) {
+                const curNoHash = getUrlNoHash();
+                if (extractedItems.length === 0 || (curNoHash && curNoHash !== lastExtractedUrl)) {
+                    try {
+                        const autoRes = await tools.extractList(req.extractSpec);
+                        mergeExtractedBatch(autoRes, req.extractSpec);
+                    }
+                    catch {
+                        // non-fatal finalize error
+                    }
+                }
+            }
+            if (!req.extractSpec && !extractedSelector && extractedItems.length === 0) {
+                return undefined;
+            }
+            const selector = extractedSelector ?? req.extractSpec?.itemSelector ?? '';
+            let writtenPath;
+            try {
+                const subagentDir = path.join(req.artifactDir, subagentId);
+                const outFile = path.join(subagentDir, 'extracted.json');
+                await fs.promises.mkdir(subagentDir, { recursive: true });
+                await fs.promises.writeFile(outFile, JSON.stringify({
+                    url: latestObs.domStats.url,
+                    selector,
+                    count: extractedItems.length,
+                    truncated: extractedTruncated,
+                    items: extractedItems,
+                }, null, 2), 'utf8');
+                writtenPath = outFile.replace(/\\/g, '/');
+            }
+            catch {
+                writtenPath = undefined;
+            }
+            return {
+                selector,
+                count: extractedItems.length,
+                truncated: extractedTruncated,
+                ...(writtenPath ? { path: writtenPath } : {}),
+                items: extractedItems,
+            };
+        };
+        const recordTrace = (stepNum, dec, ok, blocked, skipped) => {
+            const targetStr = typeof dec.target === 'string'
+                ? dec.target
+                : typeof dec.url === 'string'
+                    ? dec.url
+                    : typeof dec.selector === 'string'
+                        ? dec.selector
+                        : typeof dec.itemSelector === 'string'
+                            ? dec.itemSelector
+                            : typeof dec.x === 'number' && typeof dec.y === 'number'
+                                ? `(${Math.round(dec.x)},${Math.round(dec.y)})`
+                                : undefined;
+            actionTrace.push({
+                step: stepNum,
+                action: dec.type,
+                ...(targetStr ? { target: targetStr } : {}),
+                url: latestObs.domStats.url,
+                ok,
+                ...(blocked ? { blocked } : {}),
+                ...(skipped ? { skipped: true } : {}),
+                ...(dec.note ? { note: dec.note.slice(0, MAX_FINDING_NOTE_CHARS) } : {}),
+            });
+        };
         const pauseNow = async (nextStep, reason, url, details) => {
             const pausedAt = new Date().toISOString();
             const pausedBy = reason === 'USER_TAKEOVER'
@@ -1852,6 +2039,12 @@ export class BrowserSubagentRunner {
                 pendingRegion,
                 pausedAt,
                 pausedBy,
+                lastPauseReason: reason,
+                actionTrace: [...actionTrace],
+                extractedItems: [...extractedItems],
+                extractedTruncated,
+                extractedSelector,
+                lastExtractedUrl,
             });
             this.startResumeWatcher(subagentId, session);
             const card = buildApprovalCard({
@@ -1862,6 +2055,7 @@ export class BrowserSubagentRunner {
                 screenshotPath: latestObs.screenshotPath,
                 details,
             });
+            const extractedData = await finalizeExtractedData(false);
             const pausedRes = {
                 subagentId,
                 role: req.role,
@@ -1871,6 +2065,8 @@ export class BrowserSubagentRunner {
                 hostFacts: hostFacts.getFacts(),
                 contextStats: history.getStats(),
                 findings: findingsLedger.getFindings(),
+                actionTrace: [...actionTrace],
+                ...(extractedData ? { extractedData } : {}),
                 approvalCard: card,
                 pausedAt,
                 pausedBy,
@@ -1898,8 +2094,14 @@ export class BrowserSubagentRunner {
                 if (await session.checkHumanTakeoverRequested()) {
                     return await pauseNow(step, 'USER_TAKEOVER', session.page.url(), '用户在浏览器窗口点击了「暂停并接管」。子代理已立即暂停，请完成人工操作后调用 browser_subagent_resume。');
                 }
+                const currentUrlNoHash = getUrlNoHash();
+                if (suppressedLoginGateUrl && suppressedLoginGateUrl !== currentUrlNoHash) {
+                    suppressedLoginGateUrl = null;
+                }
                 if (req.pauseOnGate ?? true) {
-                    const gate = await detectPageGate(session.page);
+                    const allowLoginWall = req.pauseOnLoginWall !== false &&
+                        !(suppressedLoginGateUrl !== null && suppressedLoginGateUrl === currentUrlNoHash);
+                    const gate = await detectPageGate(session.page, { pauseOnLoginWall: allowLoginWall });
                     if (gate.detected && gate.reason) {
                         return await pauseNow(step, gate.reason, gate.url, gate.details ?? 'Page gate detected. Waiting for human action.');
                     }
@@ -1926,6 +2128,8 @@ export class BrowserSubagentRunner {
                     if (decision.note) {
                         findingsLedger.record(step, latestObs, 'complete', decision.note);
                     }
+                    recordTrace(step, decision, true);
+                    const extractedData = await finalizeExtractedData(true);
                     return {
                         subagentId,
                         role: req.role,
@@ -1935,6 +2139,8 @@ export class BrowserSubagentRunner {
                         hostFacts: hostFacts.getFacts(),
                         contextStats: history.getStats(),
                         findings: findingsLedger.getFindings(),
+                        actionTrace,
+                        ...(extractedData ? { extractedData } : {}),
                         ...(latestNavigation ? { navigation: latestNavigation } : {}),
                     };
                 }
@@ -1942,6 +2148,7 @@ export class BrowserSubagentRunner {
                     if (decision.note) {
                         findingsLedger.record(step, latestObs, 'pause_for_takeover', decision.note);
                     }
+                    recordTrace(step, decision, true);
                     return await pauseNow(step + 1, decision.blockReason, session.page.url(), decision.message);
                 }
                 if (decision.type === 'navigate') {
@@ -1951,6 +2158,7 @@ export class BrowserSubagentRunner {
                         hostFacts.recordStep(snap.screenshotPath);
                         history.pushObservation(`BLOCKED navigation to ${decision.url} (origin policy)`, snap, tools.sampler.formatObservationForLLM(snap));
                         findingsLedger.record(step, snap, 'navigate(blocked)', decision.note);
+                        recordTrace(step, decision, false, 'ORIGIN_BLOCKED');
                         latestObs = snap;
                         continue;
                     }
@@ -1962,6 +2170,7 @@ export class BrowserSubagentRunner {
                     hostFacts.recordStep(res.observation.screenshotPath);
                     history.pushObservation(`${res.action} (${decision.reason})`, res.observation, res.llmSummary);
                     findingsLedger.record(step, res.observation, res.blocked ? `navigate(${res.blocked})` : 'navigate', decision.note);
+                    recordTrace(step, decision, res.ok !== false && !res.blocked, res.blocked);
                     latestObs = res.observation;
                     if (res.blocked === 'PROMPT_REQUIRES_HUMAN') {
                         return await pauseNow(step + 1, 'PROMPT_REQUIRES_HUMAN', session.page.url(), res.hint ?? '页面弹出 prompt() 输入框，请人工处理后继续。');
@@ -1974,6 +2183,7 @@ export class BrowserSubagentRunner {
                 if (decision.type === 'set_cursor_style') {
                     await tools.setCursorStyle(decision.style);
                     findingsLedger.record(step, latestObs, 'set_cursor_style', decision.note);
+                    recordTrace(step, decision, true);
                     if (await session.checkHumanTakeoverRequested()) {
                         return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在更新光标样式后点击了「暂停并接管」。');
                     }
@@ -2027,6 +2237,23 @@ export class BrowserSubagentRunner {
                     }
                     else if (decision.type === 'inspect_media') {
                         actionResult = await tools.inspectMedia(decision.maxItems);
+                    }
+                    else if (decision.type === 'extract_list') {
+                        const mergedFields = decision.fields !== undefined
+                            ? parseExtractFieldsSpec(decision.fields)
+                            : req.extractSpec?.fields
+                                ? parseExtractFieldsSpec(req.extractSpec.fields)
+                                : undefined;
+                        const effSpec = {
+                            itemSelector: decision.itemSelector ?? req.extractSpec?.itemSelector ?? '',
+                            ...(mergedFields ? { fields: mergedFields } : {}),
+                            maxItems: decision.maxItems ?? req.extractSpec?.maxItems,
+                            dedupeBy: decision.dedupeBy ?? req.extractSpec?.dedupeBy,
+                        };
+                        actionResult = await tools.extractListForAgent(effSpec);
+                        if (actionResult.extractResult && actionResult.extractResult.ok) {
+                            mergeExtractedBatch(actionResult.extractResult, effSpec);
+                        }
                     }
                     else if (decision.type === 'set_viewport') {
                         actionResult = await tools.setViewport({
@@ -2149,6 +2376,7 @@ export class BrowserSubagentRunner {
                     ...(actionResult.motion ? { motion: actionResult.motion } : {}),
                     ...(actionResult.region ? { region: actionResult.region } : {}),
                 });
+                recordTrace(step, decision, isSuccess, actionResult.blocked, actionResult.skipped);
                 if (decision.type === 'inspect_region' && isSuccess && actionResult.region?.imagePath) {
                     pendingRegion = actionResult.region;
                 }
@@ -2160,6 +2388,7 @@ export class BrowserSubagentRunner {
                     return await pauseNow(step + 1, 'PROMPT_REQUIRES_HUMAN', session.page.url(), actionResult.hint ?? '页面弹出 prompt() 输入框，请人工处理完成后调用 browser_subagent_resume。');
                 }
                 if (consecutiveFailures >= 3) {
+                    const extractedData = await finalizeExtractedData(false);
                     return {
                         subagentId,
                         role: req.role,
@@ -2170,6 +2399,8 @@ export class BrowserSubagentRunner {
                         hostFacts: hostFacts.getFacts(),
                         contextStats: history.getStats(),
                         findings: findingsLedger.getFindings(),
+                        actionTrace,
+                        ...(extractedData ? { extractedData } : {}),
                         ...(latestNavigation ? { navigation: latestNavigation } : {}),
                     };
                 }
@@ -2177,6 +2408,7 @@ export class BrowserSubagentRunner {
                     return await pauseNow(step + 1, 'USER_TAKEOVER', session.page.url(), '用户在执行动作期间点击了「暂停并接管」。请人工接管完成后调用 browser_subagent_resume。');
                 }
             }
+            const extractedData = await finalizeExtractedData(true);
             return {
                 subagentId,
                 role: req.role,
@@ -2186,6 +2418,8 @@ export class BrowserSubagentRunner {
                 hostFacts: hostFacts.getFacts(),
                 contextStats: history.getStats(),
                 findings: findingsLedger.getFindings(),
+                actionTrace,
+                ...(extractedData ? { extractedData } : {}),
                 ...(latestNavigation ? { navigation: latestNavigation } : {}),
             };
         }

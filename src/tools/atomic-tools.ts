@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { BrowserSession } from '../driver/browser-session.js';
 import type {
   ActionBlockedReason,
+  ExtractFieldSpec,
   MediaInspectResult,
   MotionInspectResult,
   MotionProbeState,
@@ -15,6 +16,8 @@ import type {
   RegionInspectResult,
   ScrollDiagnostic,
   SetViewportOptions,
+  StructuredExtractResult,
+  StructuredExtractSpec,
   StylesInspectResult,
   VirtualCursorStyleConfig,
   WaitForOptions,
@@ -22,6 +25,73 @@ import type {
 } from '../driver/types.js';
 import { PageSnapshotSampler, normSplit, safeEvaluate, type PageObservation } from '../sampler/page-snapshot.js';
 import { computePatchMeanPixelDiff, computePngAvgColorHex, decodePngRgba } from '../sampler/png-pixels.js';
+
+const EXTRACT_ATTR_BASE = new Set(['text', 'href', 'src', 'title', 'alt', 'value']);
+
+export function parseExtractFieldsSpec(raw: unknown): Record<string, ExtractFieldSpec> | undefined {
+  let obj: unknown = raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+    obj = JSON.parse(trimmed);
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return undefined;
+  const out: Record<string, ExtractFieldSpec> = {};
+  for (const [rawKey, rawVal] of Object.entries(obj as Record<string, unknown>)) {
+    const fieldName = String(rawKey).trim().slice(0, 48);
+    if (!fieldName) continue;
+    let selector = '';
+    let attr = 'text';
+    let trim = true;
+    if (typeof rawVal === 'string') {
+      selector = rawVal.trim().slice(0, 160);
+    } else if (rawVal && typeof rawVal === 'object' && !Array.isArray(rawVal)) {
+      const rec = rawVal as Record<string, unknown>;
+      if (typeof rec.selector === 'string') selector = rec.selector.trim().slice(0, 160);
+      if (typeof rec.attr === 'string') attr = rec.attr.trim().slice(0, 48);
+      if (typeof rec.trim === 'boolean') trim = rec.trim;
+    } else {
+      continue;
+    }
+    const normalizedAttr = attr.toLowerCase();
+    const validAttr =
+      EXTRACT_ATTR_BASE.has(normalizedAttr) ||
+      (/^attr:[a-z0-9_-]{1,40}$/i.test(attr) && !/^attr:on/i.test(attr));
+    if (!validAttr) continue;
+    out[fieldName] = {
+      ...(selector ? { selector } : {}),
+      attr: EXTRACT_ATTR_BASE.has(normalizedAttr) ? normalizedAttr : `attr:${attr.slice(5)}`,
+      trim,
+    };
+    if (Object.keys(out).length >= 24) break;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export function normalizeExtractSpec(raw: {
+  itemSelector?: unknown;
+  fields?: unknown;
+  maxItems?: unknown;
+  dedupeBy?: unknown;
+  includeEmpty?: unknown;
+}): StructuredExtractSpec | undefined {
+  if (typeof raw.itemSelector !== 'string' || !raw.itemSelector.trim()) return undefined;
+  const itemSelector = raw.itemSelector.trim().slice(0, 200);
+  const fields = raw.fields !== undefined ? parseExtractFieldsSpec(raw.fields) : undefined;
+  const rawMax = Number(raw.maxItems);
+  const maxItems = Number.isFinite(rawMax) ? Math.max(1, Math.min(1000, Math.round(rawMax))) : 200;
+  const dedupeBy =
+    typeof raw.dedupeBy === 'string' && raw.dedupeBy.trim()
+      ? raw.dedupeBy.trim().slice(0, 48)
+      : undefined;
+  return {
+    itemSelector,
+    ...(fields ? { fields } : {}),
+    maxItems,
+    ...(dedupeBy ? { dedupeBy } : {}),
+    ...(typeof raw.includeEmpty === 'boolean' ? { includeEmpty: raw.includeEmpty } : {}),
+  };
+}
 
 export function formatRegionTextSummary(region: RegionInspectResult): string {
   const parts = [
@@ -371,15 +441,27 @@ export class AtomicBrowserToolset {
     }
     await this.session.motion.clearInterceptedProtocol?.().catch(() => {});
 
-    const clickRes =
-      typeof target === 'string'
-        ? await this.session.motion.clickSelector(resolveTargetSelector(target), {
-            label: `CLICK ${target}`,
-            timeoutMs: opts?.timeoutMs,
-          })
-        : await this.session.motion.clickAt(target.x, target.y, {
-            label: `CLICK (${target.x},${target.y})`,
-          });
+    const { clickRes, intercepted } = await this.session.withAgentNavigationAllowed(async () => {
+      const cr =
+        typeof target === 'string'
+          ? await this.session.motion.clickSelector(resolveTargetSelector(target), {
+              label: `CLICK ${target}`,
+              timeoutMs: opts?.timeoutMs,
+            })
+          : await this.session.motion.clickAt(target.x, target.y, {
+              label: `CLICK (${target.x},${target.y})`,
+            });
+      if (!cr.ok && cr.blocked) {
+        return { clickRes: cr, intercepted: null as any };
+      }
+      const inter = await this.session.motion.consumeInterceptedProtocol?.().catch(() => null);
+      if (inter) {
+        return { clickRes: cr, intercepted: inter };
+      }
+      if (waitMs > 0) await this.session.page.waitForTimeout(waitMs);
+      await this.session.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      return { clickRes: cr, intercepted: null as any };
+    });
 
     if (!clickRes.ok && clickRes.blocked) {
       const targetLabel = typeof target === 'string' ? target : `(${target.x},${target.y})`;
@@ -426,7 +508,6 @@ export class AtomicBrowserToolset {
       };
     }
 
-    const intercepted = await this.session.motion.consumeInterceptedProtocol?.().catch(() => null);
     if (intercepted) {
       const observation = await this.sampler.captureSnapshot('click_protocol_blocked');
       const hint =
@@ -454,7 +535,6 @@ export class AtomicBrowserToolset {
       };
     }
 
-    if (waitMs > 0) await this.session.page.waitForTimeout(waitMs);
     const promptDialog = this.session.consumePendingPromptDialog?.();
     const observation = await this.sampler.captureSnapshot('click');
     if (promptDialog) {
@@ -515,11 +595,17 @@ export class AtomicBrowserToolset {
       };
     }
 
-    await this.session.page.keyboard.type(text, { delay: 35 });
     if (pressEnter) {
-      await this.session.page.keyboard.press('Enter');
+      await this.session.withAgentNavigationAllowed(async () => {
+        await this.session.page.keyboard.type(text, { delay: 35 });
+        await this.session.page.keyboard.press('Enter');
+        await this.session.page.waitForTimeout(200);
+        await this.session.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+      });
+    } else {
+      await this.session.page.keyboard.type(text, { delay: 35 });
+      await this.session.page.waitForTimeout(200);
     }
-    await this.session.page.waitForTimeout(200);
     const observation = await this.sampler.captureSnapshot('type_text');
     return {
       ok: true,
@@ -2064,13 +2150,16 @@ export class AtomicBrowserToolset {
     const normalizedKey = normalizePlaywrightKey(rawKey);
     const times = Math.max(1, Math.min(10, Math.round(Number.isFinite(repeat) ? repeat : 1)));
     this.session.consumePendingPromptDialog?.();
-    for (let i = 0; i < times; i++) {
-      await this.session.page.keyboard.press(normalizedKey);
-      if (i + 1 < times) {
-        await this.session.page.waitForTimeout(45);
+    await this.session.withAgentNavigationAllowed(async () => {
+      for (let i = 0; i < times; i++) {
+        await this.session.page.keyboard.press(normalizedKey);
+        if (i + 1 < times) {
+          await this.session.page.waitForTimeout(45);
+        }
       }
-    }
-    await this.session.page.waitForTimeout(180);
+      await this.session.page.waitForTimeout(180);
+      await this.session.page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
+    });
 
     const promptDialog = this.session.consumePendingPromptDialog?.();
     const observation = await this.sampler.captureSnapshot('press_key');
@@ -2137,7 +2226,11 @@ export class AtomicBrowserToolset {
       optionSpec = { index: Math.max(0, Math.round(opts.index)) };
     }
 
-    await loc.selectOption(optionSpec as any, { timeout: 3000 });
+    await this.session.withAgentNavigationAllowed(async () => {
+      await loc.selectOption(optionSpec as any, { timeout: 3000 });
+      await this.session.page.waitForTimeout(180);
+      await this.session.page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {});
+    });
     const selected = await safeEvaluate<{ selectedValue: string; selectedLabel: string }, string>(
       this.session.page,
       (sel: string) => {
@@ -2153,7 +2246,6 @@ export class AtomicBrowserToolset {
       { arg: selector, retries: 1 }
     ).catch(() => ({ selectedValue: '', selectedLabel: '' }));
 
-    await this.session.page.waitForTimeout(180);
     const promptDialog = this.session.consumePendingPromptDialog?.();
     const observation = await this.sampler.captureSnapshot('select_option');
     if (promptDialog) {
@@ -2251,24 +2343,27 @@ export class AtomicBrowserToolset {
       }
     })();
 
-    let response: unknown = null;
-    let timedOut = false;
-    try {
-      if (kind === 'back') {
-        response = await this.session.page.goBack({ waitUntil, timeout: timeoutMs });
-      } else if (kind === 'forward') {
-        response = await this.session.page.goForward({ waitUntil, timeout: timeoutMs });
-      } else {
-        response = await this.session.page.reload({ waitUntil, timeout: timeoutMs });
+    const { response, timedOut } = await this.session.withAgentNavigationAllowed(async () => {
+      let resp: unknown = null;
+      let to = false;
+      try {
+        if (kind === 'back') {
+          resp = await this.session.page.goBack({ waitUntil, timeout: timeoutMs });
+        } else if (kind === 'forward') {
+          resp = await this.session.page.goForward({ waitUntil, timeout: timeoutMs });
+        } else {
+          resp = await this.session.page.reload({ waitUntil, timeout: timeoutMs });
+        }
+      } catch (err: any) {
+        const msg = String(err?.message ?? err);
+        if (/Timeout/i.test(msg)) {
+          to = true;
+        } else {
+          throw err;
+        }
       }
-    } catch (err: any) {
-      const msg = String(err?.message ?? err);
-      if (/Timeout/i.test(msg)) {
-        timedOut = true;
-      } else {
-        throw err;
-      }
-    }
+      return { response: resp, timedOut: to };
+    });
 
     const afterUrl = (() => {
       try {
@@ -2328,6 +2423,215 @@ export class AtomicBrowserToolset {
       action: `${tag} -> ${navigation.final_url}`,
       observation,
       llmSummary: this.sampler.formatObservationForLLM(observation),
+    };
+  }
+
+  /**
+   * Read-only declarative list extraction using CSS selectors and an attribute whitelist.
+   * Never executes arbitrary user-supplied JS expressions; masks password values.
+   */
+  public async extractList(spec: StructuredExtractSpec): Promise<StructuredExtractResult> {
+    const itemSelector = String(spec.itemSelector ?? '').trim().slice(0, 200);
+    const currentUrl = (() => {
+      try {
+        return this.session.page.url();
+      } catch {
+        return '';
+      }
+    })();
+    if (!itemSelector) {
+      return {
+        ok: false,
+        selector: '',
+        url: currentUrl,
+        matchedCount: 0,
+        extractedCount: 0,
+        items: [],
+        truncated: false,
+        degraded: true,
+        degradedReason: 'EMPTY_SELECTOR',
+      };
+    }
+
+    const normalizedFields = parseExtractFieldsSpec(spec.fields);
+    const maxItems = Math.max(
+      1,
+      Math.min(1000, Math.round(Number.isFinite(Number(spec.maxItems)) ? Number(spec.maxItems) : 200))
+    );
+    const includeEmpty = Boolean(spec.includeEmpty);
+    const fallback: StructuredExtractResult = {
+      ok: false,
+      selector: itemSelector,
+      url: currentUrl,
+      matchedCount: 0,
+      extractedCount: 0,
+      items: [],
+      truncated: false,
+      degraded: true,
+      degradedReason: 'extractList degraded: navigation race',
+    };
+
+    return safeEvaluate<
+      StructuredExtractResult,
+      {
+        sel: string;
+        fields: Record<string, ExtractFieldSpec> | null;
+        limit: number;
+        includeEmpty: boolean;
+      }
+    >(
+      this.session.page,
+      (arg): StructuredExtractResult => {
+        const url = location.href;
+        let nodes: Element[] = [];
+        try {
+          nodes = Array.from(document.querySelectorAll(arg.sel));
+        } catch (err: any) {
+          return {
+            ok: false,
+            selector: arg.sel,
+            url,
+            matchedCount: 0,
+            extractedCount: 0,
+            items: [],
+            truncated: false,
+            degraded: true,
+            degradedReason: `INVALID_SELECTOR: ${String(err?.message ?? err).slice(0, 120)}`,
+          };
+        }
+
+        const items: Array<Record<string, string | null>> = [];
+        const fieldSpecs: Array<[string, { selector?: string; attr?: string; trim?: boolean }]> = arg.fields
+          ? Object.entries(arg.fields)
+          : [
+              ['text', { attr: 'text', trim: true }],
+              ['href', { attr: 'href', trim: true }],
+              ['src', { attr: 'src', trim: true }],
+            ];
+
+        for (const el of nodes.slice(0, arg.limit)) {
+          const row: Record<string, string | null> = {};
+          for (const [fieldKey, fSpec] of fieldSpecs) {
+            let val: string | null = null;
+            let target: Element | null = el;
+            if (fSpec.selector && fSpec.selector !== 'self') {
+              try {
+                target = el.querySelector(fSpec.selector);
+              } catch {
+                target = null;
+              }
+            }
+            if (target) {
+              const attr = (fSpec.attr || 'text').toLowerCase();
+              const shouldTrim = fSpec.trim !== false;
+              if (attr === 'text') {
+                const rawText = ((target as HTMLElement).innerText || target.textContent || '');
+                const clean = shouldTrim ? rawText.replace(/\s+/g, ' ').trim() : rawText;
+                val = clean ? clean.slice(0, 600) : null;
+              } else if (attr === 'href' || attr === 'src') {
+                const rawRef =
+                  attr === 'href'
+                    ? target.getAttribute('href') || target.querySelector('a[href]')?.getAttribute('href') || null
+                    : target.getAttribute('src') || target.getAttribute('data-src');
+                if (rawRef) {
+                  const trimmedRef = rawRef.trim();
+                  if (trimmedRef && !/^javascript:/i.test(trimmedRef)) {
+                    try {
+                      val = new URL(trimmedRef, url).href;
+                    } catch {
+                      val = trimmedRef.slice(0, 300);
+                    }
+                  }
+                }
+              } else if (attr === 'value') {
+                if (target instanceof HTMLInputElement && target.type === 'password') {
+                  val = '[REDACTED]';
+                } else if ('value' in target && typeof (target as HTMLInputElement).value === 'string') {
+                  const v = (target as HTMLInputElement).value;
+                  val = v ? (shouldTrim ? v.trim() : v).slice(0, 300) : null;
+                }
+              } else {
+                const attrName =
+                  attr === 'title' || attr === 'alt'
+                    ? attr
+                    : attr.startsWith('attr:')
+                      ? attr.slice(5)
+                      : '';
+                if (attrName) {
+                  if (
+                    attrName.toLowerCase() === 'value' &&
+                    target instanceof HTMLInputElement &&
+                    target.type === 'password'
+                  ) {
+                    val = '[REDACTED]';
+                  } else {
+                    const rawAttr = target.getAttribute(attrName);
+                    if (rawAttr !== null) {
+                      const cleanAttr = shouldTrim ? rawAttr.replace(/\s+/g, ' ').trim() : rawAttr;
+                      val = cleanAttr ? cleanAttr.slice(0, 300) : null;
+                    }
+                  }
+                }
+              }
+            }
+            if (arg.fields || fieldKey === 'text' || val !== null) {
+              row[fieldKey] = val;
+            }
+          }
+          const hasValue = Object.values(row).some((v) => v !== null && v !== '');
+          if (hasValue || arg.includeEmpty) {
+            items.push(row);
+          }
+        }
+
+        return {
+          ok: true,
+          selector: arg.sel,
+          url,
+          matchedCount: nodes.length,
+          extractedCount: items.length,
+          items,
+          truncated: nodes.length > arg.limit,
+        };
+      },
+      fallback,
+      {
+        arg: {
+          sel: itemSelector,
+          fields: normalizedFields ?? null,
+          limit: maxItems,
+          includeEmpty,
+        },
+        retries: 2,
+      }
+    );
+  }
+
+  public async extractListForAgent(
+    spec: StructuredExtractSpec
+  ): Promise<AtomicToolResult & { extractResult?: StructuredExtractResult }> {
+    const res = await this.extractList(spec);
+    const lines: string[] = [
+      `### [Extract List] selector=${JSON.stringify(res.selector)} | matched=${res.matchedCount} | extracted=${res.extractedCount}${res.truncated ? ' (truncated)' : ''}${res.degraded ? ` (${res.degradedReason ?? 'degraded'})` : ''}`,
+    ];
+    if (res.items.length === 0) {
+      lines.push('- items: [] (count=0)');
+    } else {
+      for (let i = 0; i < Math.min(3, res.items.length); i++) {
+        lines.push(`- [${i}] ${JSON.stringify(res.items[i]).slice(0, 260)}`);
+      }
+      if (res.items.length > 3) {
+        lines.push(`- ... (${res.items.length - 3} more items buffered cleanly)`);
+      }
+    }
+    const header = lines.join('\n').slice(0, 1200);
+    const observation = await this.sampler.captureSnapshot('extract_list');
+    return {
+      ok: res.ok,
+      extractResult: res,
+      action: `Extracted ${res.extractedCount}/${res.matchedCount} rows matching ${res.selector}`,
+      observation,
+      llmSummary: `${header}\n\n${this.sampler.formatObservationForLLM(observation)}`,
     };
   }
 }

@@ -79,18 +79,67 @@ export async function detectPageGate(page, opts = {}) {
                 };
             }
         }
-        // 3. Optional Login Wall detection
+        // 3. Optional Login Wall detection (ancestor chain, viewport intersection & top-layer occlusion aware;
+        //    kept inline without named nested functions so tsx/esbuild never injects __name helpers in browser eval)
         if (checkLogin) {
-            const pwdInput = document.querySelector('input[type="password"]:not([disabled]), [data-dsh-gate="login"]');
-            if (pwdInput) {
-                const style = window.getComputedStyle(pwdInput);
-                if (style.display !== 'none' && style.visibility !== 'hidden') {
-                    return {
-                        detected: true,
-                        reason: 'LOGIN_REQUIRED',
-                        details: 'Visible login / password authentication gate detected on page.',
-                    };
+            const candidates = Array.from(document.querySelectorAll('input[type="password"]:not([disabled]), [data-dsh-gate="login"]'));
+            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            for (const cand of candidates) {
+                let visible = true;
+                let cur = cand;
+                while (cur && cur.nodeType === 1) {
+                    if (cur.hasAttribute('hidden') ||
+                        cur.getAttribute('aria-hidden') === 'true' ||
+                        cur.inert === true) {
+                        visible = false;
+                        break;
+                    }
+                    const cs = window.getComputedStyle(cur);
+                    if (cs.display === 'none' ||
+                        cs.visibility === 'hidden' ||
+                        cs.visibility === 'collapse' ||
+                        parseFloat(cs.opacity || '1') <= 0.01) {
+                        visible = false;
+                        break;
+                    }
+                    cur = cur.parentElement;
                 }
+                if (!visible)
+                    continue;
+                if (cand.getClientRects().length === 0)
+                    continue;
+                const rect = cand.getBoundingClientRect();
+                if (rect.width < 4 || rect.height < 4)
+                    continue;
+                if (vw <= 0 || vh <= 0)
+                    continue;
+                if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= vh || rect.left >= vw)
+                    continue;
+                if (!cand.hasAttribute('data-dsh-gate')) {
+                    const visLeft = Math.max(0, rect.left);
+                    const visRight = Math.min(vw - 1, rect.right);
+                    const visTop = Math.max(0, rect.top);
+                    const visBottom = Math.min(vh - 1, rect.bottom);
+                    if (visRight <= visLeft || visBottom <= visTop)
+                        continue;
+                    const cx = Math.min(vw - 1, Math.max(0, (visLeft + visRight) / 2));
+                    const cy = Math.min(vh - 1, Math.max(0, (visTop + visBottom) / 2));
+                    const hit = document.elementFromPoint(cx, cy);
+                    if (hit) {
+                        const elForm = cand.closest('form');
+                        const sameForm = Boolean(elForm && hit.closest('form') === elForm);
+                        const labelForCand = hit.tagName === 'LABEL' && hit.control === cand;
+                        if (hit !== cand && !cand.contains(hit) && !hit.contains(cand) && !sameForm && !labelForCand) {
+                            continue;
+                        }
+                    }
+                }
+                return {
+                    detected: true,
+                    reason: 'LOGIN_REQUIRED',
+                    details: 'Visible login / password authentication gate detected on page.',
+                };
             }
         }
         return { detected: false };

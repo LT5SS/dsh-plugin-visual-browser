@@ -116,6 +116,16 @@
 
 ---
 
+## v2.0.3 已交付（年龄门误报 / Resume 破循环修复与结构化抽取闭环）
+
+- **P0 · `takeover.ts` 严格密码框可见性与遮挡校验**：改用 `querySelectorAll` 逐一验证祖先链可见性（`display`/`visibility`/`opacity`/`hidden`/`aria-hidden`/`inert`）、几何尺寸与视口交集及 `elementFromPoint()` 顶层遮挡，彻底消除未打开弹窗 `.modal` 或年龄门遮罩下藏 `<input type="password">` 导致的误挂起。
+- **P0 · `LOGIN_REQUIRED` 恢复破死循环与 `pause_on_login_wall`**：`resumeTask()` 恢复 `LOGIN_REQUIRED` 会话时抑制同 URL 重复抢停，确保子代理读取 `user_note` 并推进交互（离开该 URL 自动恢复检测；`CAPTCHA_DETECTED` 与 `PAYMENT_REQUIRED` 永不放松）；新增 `pause_on_login_wall?: boolean` 开关。
+- **P0 · 修复 `unloadGuard` 误拦截子代理链接点击导航**：`BrowserSession.withAgentNavigationAllowed()` 在子代理执行 `click` / `type_text(pressEnter)` / `press_key` / `select_option` / 历史导航期间临时放行 `beforeunload` 并等待 `domcontentloaded`，操作结束后立即重挂守卫，既防止窗口被误关，又不再吞掉 `<a href>` 点击跳页。
+- **P1 · 结构化 `action_trace` 与声明式只读列表抽取**：`browser_subagent_run` / `browser_subagent_resume` 返回结构化 `action_trace`；新增 `extract_selector` / `extract_fields_json` / `extract_max_items` / `extract_dedupe_by` 与子代理动作 `extract_list`，支持跨页去重累积、绝对 URL 归一化、`[REDACTED]` 密码脱敏与 `<subagentId>/extracted.json` 落盘，并在 `output.render()` 结构化输出 `[ACTION_TRACE]` 与 `[EXTRACTED_DATA]`。
+- **P1 · 工具边界明确**：在 `window_mode` 与 `browser_quick_snapshot` 参数/描述中写明 Cloudflare JS 挑战应使用 `visible-background` + `browser_subagent_run`。
+
+---
+
 ## v2.0.2 已交付（4+1 固定只读深探针与截图期胶囊隐藏）
 
 - **P0 · `inspect_region` 与随用随消 2 图槽位**：支持 `#ref` / 坐标 / 扁平 `{ x, y }` 局部 2× 放大裁切（物理边长硬上限 `1440px`），隐藏 `#__dsh_vc_root__` 并在 `try/finally` 严格恢复；`diagnostics.json` 每步记录 `image_count_sent`，局部图仅在紧随的 `t+1` 步作临时第 2 张图附着（含 `[ATTACHED_IMAGES: 2 ...]` 声明）并于 `t+2` 自动销毁（不占 `SlidingWindowHistory` 3 轮名额）；遇多图拒收按 4 档降级（`2 图` → `1 张整页图 + 局部文本摘要` → `仅整页图` → `纯文本`）。
