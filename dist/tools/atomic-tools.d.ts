@@ -22,11 +22,17 @@ export interface DomInspectSample {
     alt?: string;
     computedStyle: Record<string, string>;
 }
-export interface DomInspectResult {
+export interface DomInspectCoreResult {
     count: number;
     samples: DomInspectSample[];
+    topElement?: string;
     degraded?: boolean;
     degradedReason?: string;
+}
+export interface DomInspectResult extends DomInspectCoreResult {
+    ok: boolean;
+    llmSummary: string;
+    extraData: DomInspectCoreResult;
 }
 export interface AtomicToolResult {
     action: string;
@@ -91,6 +97,7 @@ export declare class AtomicBrowserToolset {
     /**
      * Read-only DOM & computed style inspection query for the agent.
      * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
+     * Unified shape: returns legacy `count`/`samples` alongside `{ ok, llmSummary, extraData }`.
      */
     inspectDom(selector: string, maxSamples?: number): Promise<DomInspectResult>;
     inspectDomForAgent(selector: string, maxSamples?: number): Promise<AtomicToolResult>;

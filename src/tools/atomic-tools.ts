@@ -133,29 +133,37 @@ const CURATED_STYLE_KEYS = [
   'cursor',
 ] as const;
 
-const STYLE_TRIM_DROP_ORDER = [
+const STYLE_TRIM_PRIORITY_LOW_FIRST = [
   'cursor',
   'pointerEvents',
-  'visibility',
-  'letterSpacing',
-  'lineHeight',
-  'fontWeight',
-  'zIndex',
   'overflow',
   'transform',
+  'lineHeight',
+  'letterSpacing',
+  'visibility',
   'opacity',
-  'fontFamily',
-  'fontSize',
+  'fontWeight',
+  'zIndex',
+  'width',
+  'height',
+] as const;
+
+const STYLE_TRIM_GUARANTEED_FALLBACK = [
   'backgroundColor',
   'color',
+  'fontSize',
+  'fontFamily',
+  'position',
+  'display',
 ] as const;
 
 export function formatStylesBlockWithinBudget(res: StylesInspectResult, maxChars = 1000): string {
   const styles: Record<string, string> = { ...(res.computedStyle ?? {}) };
   let box = res.boxModel ? { ...res.boxModel } : undefined;
   const render = (): string => {
+    const headerSuffix = res.topElement ? ` (${res.topElement})` : res.tag ? ` <${res.tag}>` : '';
     const lines = [
-      `### [Styles Probe] ${res.target}${res.tag ? ` <${res.tag}>` : ''}`,
+      `### [Styles Probe] ${res.target}${headerSuffix}`,
       ...(res.rect
         ? [`- rect: x=${res.rect.x}, y=${res.rect.y}, w=${res.rect.width}, h=${res.rect.height}`]
         : []),
@@ -170,34 +178,42 @@ export function formatStylesBlockWithinBudget(res: StylesInspectResult, maxChars
   let out = render();
   if (out.length <= maxChars) return out;
 
-  // 1) Trim long transform / overflow values first
-  if (typeof styles.transform === 'string' && styles.transform.length > 40) {
-    styles.transform = styles.transform.slice(0, 39) + '…';
-  }
-  if (typeof styles.overflow === 'string' && (styles.overflow === 'visible' || styles.overflow.length > 24)) {
-    delete styles.overflow;
-  }
-  out = render();
-  if (out.length <= maxChars) return out;
-
-  // 2) Shorten fontFamily next
-  if (typeof styles.fontFamily === 'string' && styles.fontFamily.length > 42) {
-    styles.fontFamily = styles.fontFamily.slice(0, 41) + '…';
-  }
-  out = render();
-  if (out.length <= maxChars) return out;
-
-  // 3) Drop secondary style keys deterministically before touching box/rect
-  for (const dropKey of STYLE_TRIM_DROP_ORDER) {
+  // 1) Drop low-priority & verbose keys first (cursor, pointerEvents, overflow, transform, lineHeight, letterSpacing, ...)
+  for (const dropKey of STYLE_TRIM_PRIORITY_LOW_FIRST) {
     if (dropKey in styles) {
       delete styles[dropKey];
       out = render();
       if (out.length <= maxChars) return out;
     }
   }
+
+  // 2) Shorten fontFamily to first 2 family names only when still over budget
+  if (typeof styles.fontFamily === 'string' && styles.fontFamily.length > 0) {
+    const firstTwo = styles.fontFamily
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 2)
+      .join(', ');
+    styles.fontFamily = firstTwo.length > 48 ? firstTwo.slice(0, 47) + '…' : firstTwo;
+    out = render();
+    if (out.length <= maxChars) return out;
+  }
+
+  // 3) Drop boxModel before ever touching core font/color/layout guarantees
   if (box && out.length > maxChars) {
     box = undefined;
     out = render();
+    if (out.length <= maxChars) return out;
+  }
+
+  // 4) Last-resort cleanup only for tiny custom budgets
+  for (const dropKey of STYLE_TRIM_GUARANTEED_FALLBACK) {
+    if (dropKey in styles) {
+      delete styles[dropKey];
+      out = render();
+      if (out.length <= maxChars) return out;
+    }
   }
   return out.length <= maxChars ? out : out.slice(0, maxChars - 1) + '…';
 }
@@ -250,11 +266,44 @@ export interface DomInspectSample {
   computedStyle: Record<string, string>;
 }
 
-export interface DomInspectResult {
+export interface DomInspectCoreResult {
   count: number;
   samples: DomInspectSample[];
+  topElement?: string;
   degraded?: boolean;
   degradedReason?: string;
+}
+
+export interface DomInspectResult extends DomInspectCoreResult {
+  ok: boolean;
+  llmSummary: string;
+  extraData: DomInspectCoreResult;
+}
+
+function formatDomProbeBlock(selector: string, domRes: DomInspectCoreResult, maxChars = 1200): string {
+  const lines: string[] = [
+    `### [DOM Probe] selector=${JSON.stringify(selector)} | count=${domRes.count}${domRes.topElement ? ` | topElement=${domRes.topElement}` : ''}${domRes.degraded ? ` (${domRes.degradedReason ?? 'degraded'})` : ''}`,
+  ];
+  if (domRes.count === 0) {
+    lines.push('- matches: 0 (no matching DOM nodes found)');
+  } else {
+    for (let i = 0; i < domRes.samples.length; i++) {
+      const s = domRes.samples[i];
+      const extras: string[] = [];
+      if (s.classes) extras.push(`class="${s.classes.slice(0, 40)}"`);
+      if (s.href) extras.push(`href="${s.href.slice(0, 80)}"`);
+      if (s.value !== undefined) extras.push(`value="${s.value}"`);
+      if (s.title) extras.push(`title="${s.title.slice(0, 40)}"`);
+      if (s.alt) extras.push(`alt="${s.alt.slice(0, 40)}"`);
+      const fontShort = s.computedStyle.fontFamily.split(',')[0]?.trim() || s.computedStyle.fontFamily;
+      const styleStr = `color=${s.computedStyle.color}; bg=${s.computedStyle.backgroundColor}; font=${s.computedStyle.fontSize} ${fontShort.slice(0, 28)}`;
+      const line = `- [${i}] <${s.tag}> ${JSON.stringify(s.text.slice(0, 60))}${extras.length ? ' ' + extras.join(' ') : ''} | ${styleStr}`;
+      if (lines.join('\n').length + line.length + 1 > maxChars) break;
+      lines.push(line);
+    }
+  }
+  const out = lines.join('\n');
+  return out.length <= maxChars ? out : out.slice(0, maxChars - 1) + '…';
 }
 
 export interface AtomicToolResult {
@@ -1315,22 +1364,33 @@ export class AtomicBrowserToolset {
   /**
    * Read-only DOM & computed style inspection query for the agent.
    * Uses `safeEvaluate()` to tolerate navigation races and expose link/input attributes.
+   * Unified shape: returns legacy `count`/`samples` alongside `{ ok, llmSummary, extraData }`.
    */
   public async inspectDom(selector: string, maxSamples = 5): Promise<DomInspectResult> {
     const safeLimit = Math.max(1, Math.min(10, Math.round(Number.isFinite(maxSamples) ? maxSamples : 5)));
-    const fallback: DomInspectResult = {
+    const fallbackCore: DomInspectCoreResult = {
       count: 0,
       samples: [],
       degraded: true,
       degradedReason: 'inspectDom degraded: navigation race',
     };
 
-    return safeEvaluate<DomInspectResult, { sel: string; limit: number }>(
+    const core = await safeEvaluate<DomInspectCoreResult, { sel: string; limit: number }>(
       this.session.page,
-      (arg: { sel: string; limit: number }): DomInspectResult => {
+      (arg: { sel: string; limit: number }): DomInspectCoreResult => {
         const els = Array.from(document.querySelectorAll(arg.sel));
+        let topElement: string | undefined;
+        if (els[0]) {
+          const first = els[0];
+          const cls =
+            typeof first.className === 'string' && first.className.trim()
+              ? `.${first.className.trim().split(/\s+/)[0]}`
+              : '';
+          topElement = `${first.tagName}${first.id ? `#${first.id}` : cls}`;
+        }
         return {
           count: els.length,
+          ...(topElement ? { topElement } : {}),
           samples: els.slice(0, arg.limit).map((el) => {
             const cs = window.getComputedStyle(el);
             const rawHref = el.getAttribute('href')?.trim();
@@ -1366,44 +1426,28 @@ export class AtomicBrowserToolset {
           }),
         };
       },
-      fallback,
+      fallbackCore,
       { arg: { sel: selector, limit: safeLimit }, retries: 2 }
     );
+
+    const llmSummary = formatDomProbeBlock(selector, core, 1200);
+    return {
+      ...core,
+      ok: !core.degraded,
+      llmSummary,
+      extraData: core,
+    };
   }
 
   public async inspectDomForAgent(selector: string, maxSamples = 5): Promise<AtomicToolResult> {
     const domRes = await this.inspectDom(selector, maxSamples);
-    const lines: string[] = [
-      `### [DOM Probe] selector=${JSON.stringify(selector)} | count=${domRes.count}${domRes.degraded ? ' (degraded)' : ''}`,
-    ];
-    if (domRes.count === 0) {
-      lines.push('- matches: 0 (no matching DOM nodes found)');
-    } else {
-      for (let i = 0; i < domRes.samples.length; i++) {
-        const s = domRes.samples[i];
-        const extras: string[] = [];
-        if (s.classes) extras.push(`class="${s.classes.slice(0, 50)}"`);
-        if (s.href) extras.push(`href="${s.href}"`);
-        if (s.value !== undefined) extras.push(`value="${s.value}"`);
-        if (s.title) extras.push(`title="${s.title}"`);
-        if (s.alt) extras.push(`alt="${s.alt}"`);
-        const styleStr = `color=${s.computedStyle.color}; bg=${s.computedStyle.backgroundColor}; font=${s.computedStyle.fontSize} ${s.computedStyle.fontFamily.slice(0, 32)}`;
-        lines.push(
-          `- [${i}] <${s.tag}> ${JSON.stringify(s.text)}${extras.length ? ' ' + extras.join(' ') : ''} | ${styleStr}`
-        );
-      }
-    }
-    let block = lines.join('\n');
-    if (block.length > 1200) {
-      block = block.slice(0, 1199) + '…';
-    }
     const observation = await this.sampler.captureSnapshot('inspect_dom');
     return {
-      ok: true,
-      extraData: domRes,
+      ok: domRes.ok,
+      extraData: domRes.extraData,
       action: `Inspected DOM selector "${selector}": count=${domRes.count}`,
       observation,
-      llmSummary: `${block}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+      llmSummary: domRes.llmSummary,
     };
   }
 
@@ -1625,9 +1669,10 @@ export class AtomicBrowserToolset {
         ref: target,
         hit: probe.hit,
         hint: probe.hint,
+        extraData: { ok: false, blocked: probe.blocked, target, hint: probe.hint },
         action: `Blocked inspect_styles (${target}) by ${probe.blocked}`,
         observation,
-        llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+        llmSummary: `[ACTION_REFUSED] ${refusalJson}`.slice(0, 1000),
       };
     }
 
@@ -1660,10 +1705,16 @@ export class AtomicBrowserToolset {
             computedStyle[prop] = val;
           }
         }
+        const cls =
+          typeof (el as HTMLElement).className === 'string' && (el as HTMLElement).className.trim()
+            ? `.${(el as HTMLElement).className.trim().split(/\s+/)[0]}`
+            : '';
+        const topElement = `${el.tagName}${el.id ? `#${el.id}` : cls}`;
         return {
           ok: true,
           target: arg.targetLabel,
           tag: el.tagName.toLowerCase(),
+          topElement,
           rect: {
             x: Math.round(r.left),
             y: Math.round(r.top),
@@ -1695,9 +1746,10 @@ export class AtomicBrowserToolset {
         blocked: res.blocked ?? 'ELEMENT_NOT_FOUND',
         ref: target,
         hint: res.hint,
+        extraData: res,
         observation,
         action: `inspect_styles failed on ${target}`,
-        llmSummary: `[ACTION_REFUSED] ${refusalJson}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+        llmSummary: `[ACTION_REFUSED] ${refusalJson}`.slice(0, 1000),
       };
     }
 
@@ -1708,18 +1760,20 @@ export class AtomicBrowserToolset {
       extraData: res,
       action: `Inspected styles on ${target} <${res.tag}>`,
       observation,
-      llmSummary: `${stylesBlock}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+      llmSummary: stylesBlock,
     };
   }
 
-  public async extractOutline(maxItems = 25): Promise<AtomicToolResult> {
-    const safeMax = Math.max(1, Math.min(40, Math.round(Number.isFinite(maxItems) ? maxItems : 25)));
+  public async extractOutline(maxItems = 12): Promise<AtomicToolResult> {
+    const safeMax = Math.max(1, Math.min(40, Math.round(Number.isFinite(maxItems) ? maxItems : 12)));
     const raw = await safeEvaluate<
       {
         totalLandmarks: number;
+        landmarkCounts: Record<string, number>;
         totalHeadings: number;
         hiddenOrClippedHeadings: number;
         canvasCount: number;
+        topElement?: string;
         items: OutlineItem[];
       },
       number
@@ -1733,12 +1787,23 @@ export class AtomicBrowserToolset {
         ).filter((el) => !el.closest('#__dsh_vc_root__'));
 
         let totalLandmarks = 0;
+        const landmarkCounts: Record<string, number> = {};
         let totalHeadings = 0;
         let hiddenOrClippedHeadings = 0;
+        let firstVisibleTop: string | undefined;
+        let firstHeadingTop: string | undefined;
         const items: OutlineItem[] = [];
 
         for (const el of all) {
           const tag = el.tagName.toUpperCase();
+          if (landmarkTags.has(tag)) {
+            totalLandmarks++;
+            const lowTag = tag.toLowerCase();
+            landmarkCounts[lowTag] = (landmarkCounts[lowTag] ?? 0) + 1;
+            continue;
+          }
+          if (!headingTags.has(tag)) continue;
+
           const cs = window.getComputedStyle(el);
           const r = el.getBoundingClientRect();
           const visible =
@@ -1747,22 +1812,25 @@ export class AtomicBrowserToolset {
             Number(cs.opacity) >= 0.05 &&
             r.width >= 1 &&
             r.height >= 1;
-          const isHeading = headingTags.has(tag);
-          if (isHeading) {
-            totalHeadings++;
-            if (!visible) hiddenOrClippedHeadings++;
-          } else if (landmarkTags.has(tag)) {
-            totalLandmarks++;
-          }
+          totalHeadings++;
+          if (!visible) hiddenOrClippedHeadings++;
+
+          const cls =
+            typeof (el as HTMLElement).className === 'string' && (el as HTMLElement).className.trim()
+              ? `.${(el as HTMLElement).className.trim().split(/\s+/)[0]}`
+              : '';
+          const elemDesc = `${el.tagName}${el.id ? `#${el.id}` : cls}`;
+          if (!firstHeadingTop) firstHeadingTop = elemDesc;
+          if (visible && !firstVisibleTop) firstVisibleTop = elemDesc;
 
           if (items.length < limit) {
             const rawText = ((el as HTMLElement).innerText || el.textContent || '')
               .replace(/\s+/g, ' ')
               .trim()
-              .slice(0, isHeading ? 140 : 60);
+              .slice(0, 140);
             const labelText = el.getAttribute('aria-label')?.trim() || rawText;
             items.push({
-              kind: isHeading ? 'heading' : 'landmark',
+              kind: 'heading',
               tag: tag.toLowerCase(),
               text: labelText,
               y: Math.round(r.top + window.scrollY),
@@ -1772,17 +1840,32 @@ export class AtomicBrowserToolset {
         }
 
         const canvasCount = document.querySelectorAll('canvas:not(#__dsh_vc_root__ canvas)').length;
-        return { totalLandmarks, totalHeadings, hiddenOrClippedHeadings, canvasCount, items };
+        return {
+          totalLandmarks,
+          landmarkCounts,
+          totalHeadings,
+          hiddenOrClippedHeadings,
+          canvasCount,
+          topElement: firstVisibleTop ?? firstHeadingTop,
+          items,
+        };
       },
-      { totalLandmarks: 0, totalHeadings: 0, hiddenOrClippedHeadings: 0, canvasCount: 0, items: [] },
+      {
+        totalLandmarks: 0,
+        landmarkCounts: {},
+        totalHeadings: 0,
+        hiddenOrClippedHeadings: 0,
+        canvasCount: 0,
+        items: [],
+      },
       { arg: safeMax, retries: 1 }
     );
 
     const normalizedItems: OutlineItem[] = raw.items.map((item) => ({
       ...item,
-      text: (item.kind === 'heading' ? normSplit(item.text) : item.text).slice(0, 80),
+      text: normSplit(item.text).slice(0, 80),
     }));
-    const visibleHeadingCount = normalizedItems.filter((i) => i.kind === 'heading' && i.visible && i.text).length;
+    const visibleHeadingCount = normalizedItems.filter((i) => i.visible && i.text).length;
     const headingsReason =
       visibleHeadingCount === 0
         ? raw.canvasCount > 0 && raw.totalHeadings === 0
@@ -1795,17 +1878,21 @@ export class AtomicBrowserToolset {
     const result: OutlineExtractResult = {
       ok: true,
       totalLandmarks: raw.totalLandmarks,
+      landmarkCounts: raw.landmarkCounts,
       totalHeadings: raw.totalHeadings,
       ...(headingsReason ? { headingsReason } : {}),
+      ...(raw.topElement ? { topElement: raw.topElement } : {}),
       items: normalizedItems,
     };
 
+    const landmarkParts = Object.entries(raw.landmarkCounts ?? {}).map(([k, v]) => `${k}×${v}`);
+    const landmarkLine = landmarkParts.length > 0 ? landmarkParts.join(' ') : '0';
     const lines: string[] = [
-      `### [Outline Probe] landmarks=${result.totalLandmarks} · headings=${result.totalHeadings}${headingsReason ? ` (${headingsReason})` : ''}`,
+      `### [Outline Probe] headings=${result.totalHeadings}${headingsReason ? ` (${headingsReason})` : ''}${result.topElement ? ` | top=${result.topElement}` : ''} | landmarks: ${landmarkLine}`,
     ];
     for (const item of normalizedItems) {
       const visFlag = item.visible ? '' : ' [hidden]';
-      const line = `- [${item.kind}] <${item.tag}> y=${item.y}${visFlag}: ${JSON.stringify(item.text)}`;
+      const line = `- <${item.tag}> y=${item.y}${visFlag}: ${JSON.stringify(item.text.slice(0, 40))}`;
       if (lines.join('\n').length + line.length + 1 > 1200) break;
       lines.push(line);
     }
@@ -1816,12 +1903,12 @@ export class AtomicBrowserToolset {
       extraData: result,
       action: `Extracted outline: landmarks=${result.totalLandmarks}, headings=${result.totalHeadings}`,
       observation,
-      llmSummary: `${block}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+      llmSummary: block,
     };
   }
 
-  public async inspectMedia(maxItems = 12): Promise<AtomicToolResult> {
-    const safeMax = Math.max(1, Math.min(20, Math.round(Number.isFinite(maxItems) ? maxItems : 12)));
+  public async inspectMedia(maxItems = 6): Promise<AtomicToolResult> {
+    const safeMax = Math.max(1, Math.min(20, Math.round(Number.isFinite(maxItems) ? maxItems : 6)));
     const result = await safeEvaluate<MediaInspectResult, number>(
       this.session.page,
       (limit) => {
@@ -1829,6 +1916,17 @@ export class AtomicBrowserToolset {
         const videos = Array.from(document.querySelectorAll('video')).filter((el) => !el.closest('#__dsh_vc_root__'));
         const canvases = Array.from(document.querySelectorAll('canvas')).filter((el) => !el.closest('#__dsh_vc_root__'));
         const svgs = Array.from(document.querySelectorAll('svg')).filter((el) => !el.closest('#__dsh_vc_root__'));
+
+        const firstEl = canvases[0] || videos[0] || imgs[0] || null;
+        let topElement: string | undefined;
+        if (firstEl) {
+          const cls =
+            typeof (firstEl as HTMLElement).className === 'string' &&
+            (firstEl as HTMLElement).className.trim()
+              ? `.${(firstEl as HTMLElement).className.trim().split(/\s+/)[0]}`
+              : '';
+          topElement = `${firstEl.tagName}${firstEl.id ? `#${firstEl.id}` : cls}`;
+        }
 
         const items: Array<{ kind: 'img' | 'video' | 'canvas' | 'svg'; info: string }> = [];
         for (const el of canvases) {
@@ -1844,31 +1942,24 @@ export class AtomicBrowserToolset {
           const dur = Number.isFinite(el.duration) ? `${el.duration.toFixed(1)}s` : 'live/na';
           items.push({
             kind: 'video',
-            info: `size=${el.videoWidth}x${el.videoHeight} readyState=${el.readyState} paused=${el.paused} duration=${dur}`,
+            info: `${el.paused ? 'paused' : 'playing'} ${el.videoWidth}x${el.videoHeight}${el.paused ? ` dur=${dur}` : ''}`,
           });
         }
         for (const el of imgs) {
           if (items.length >= limit) break;
           const r = el.getBoundingClientRect();
-          const src = (el.getAttribute('src') || el.currentSrc || '').trim().slice(0, 80);
-          const alt = (el.getAttribute('alt') || '').trim().slice(0, 40);
+          const rawSrc = (el.getAttribute('src') || el.currentSrc || '').trim();
+          const srcTail = rawSrc.length > 24 ? rawSrc.slice(-24) : rawSrc;
+          const alt = (el.getAttribute('alt') || '').trim().slice(0, 20);
           items.push({
             kind: 'img',
-            info: `natural=${el.naturalWidth}x${el.naturalHeight} css=${Math.round(r.width)}x${Math.round(r.height)} complete=${el.complete}${alt ? ` alt=${JSON.stringify(alt)}` : ''} src=${JSON.stringify(src)}`,
-          });
-        }
-        for (const el of svgs) {
-          if (items.length >= limit) break;
-          const r = el.getBoundingClientRect();
-          if (r.width < 24 && r.height < 24) continue;
-          items.push({
-            kind: 'svg',
-            info: `css=${Math.round(r.width)}x${Math.round(r.height)} children=${el.children.length}`,
+            info: `${Math.round(r.width)}x${Math.round(r.height)}${alt ? ` alt=${JSON.stringify(alt)}` : ''}${srcTail ? ` src=${JSON.stringify(srcTail)}` : ''}`,
           });
         }
 
         return {
           ok: true,
+          ...(topElement ? { topElement } : {}),
           counts: {
             img: imgs.length,
             video: videos.length,
@@ -1888,7 +1979,7 @@ export class AtomicBrowserToolset {
       { arg: safeMax, retries: 1 }
     );
 
-    const header = `### [Media Probe] img=${result.counts.img} · video=${result.counts.video} · canvas=${result.counts.canvas} · svg=${result.counts.svg}`;
+    const header = `### [Media Probe] img=${result.counts.img} · video=${result.counts.video} · canvas=${result.counts.canvas} · svg=${result.counts.svg}${result.topElement ? ` | top=${result.topElement}` : ''}`;
     const lines: string[] = [header];
     for (const item of result.items) {
       const line = `- [${item.kind}] ${item.info}`;
@@ -1902,7 +1993,7 @@ export class AtomicBrowserToolset {
       extraData: result,
       action: `Inspected media: img=${result.counts.img}, video=${result.counts.video}, canvas=${result.counts.canvas}, svg=${result.counts.svg}`,
       observation,
-      llmSummary: `${block}\n\n${this.sampler.formatObservationForLLM(observation)}`,
+      llmSummary: block,
     };
   }
 

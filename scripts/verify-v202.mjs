@@ -49,6 +49,18 @@ function startFixtureServer() {
         res.end('<!doctype html><html><head><title>Password Probe</title></head><body><input id="secret-pw" type="password" value="TOP_SECRET_PASS_999" /></body></html>');
         return;
       }
+      if (reqPath === '/budget-stress') {
+        const navLinks = Array.from({ length: 14 }, (_, i) => `<section><h2>Section Heading Item ${i + 1} with Descriptive Copy</h2><p>Copy ${i}</p></section>`).join('');
+        const svgs = Array.from({ length: 24 }, () => '<svg width="48" height="48" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>').join('');
+        const imgs = Array.from({ length: 8 }, (_, i) => `<img src="/assets/very/long/cdn/path/gallery-image-asset-${i}.png" alt="Gallery photo item number ${i} extra text" width="320" height="200" />`).join('');
+        res.end(`<!doctype html>
+<html><head><title>Budget Stress Fixture</title></head><body>
+  <header><nav>Main Nav</nav></header>
+  <main><h1>Primary Showcase</h1>${navLinks}${svgs}${imgs}<canvas width="1440" height="900" style="width:720px;height:450px;"></canvas><video width="640" height="360"></video></main>
+  <footer>Footer Landmark</footer>
+</body></html>`);
+        return;
+      }
 
       res.end(`<!doctype html>
 <html>
@@ -141,15 +153,24 @@ async function testRegionAndProbes(srv, outDir) {
 
     const okStyle = await tools.inspectStyles('#complex-style');
     assert.equal(okStyle.ok, true);
-    const styleHeaderPart = okStyle.llmSummary.split('\n\n### [Step')[0];
-    assert.ok(styleHeaderPart.length <= 1000, `Expected <=1000 chars, got ${styleHeaderPart.length}`);
-    assert.ok(styleHeaderPart.includes('- rect:') && styleHeaderPart.includes('- box:'));
+    assert.ok(okStyle.extraData?.topElement?.includes('complex-style'), 'inspect_styles must populate topElement');
+    assert.ok(okStyle.llmSummary.length <= 1000, `Full inspect_styles llmSummary ${okStyle.llmSummary.length} exceeded 1000`);
+    assert.ok(!okStyle.llmSummary.includes('### [Step'), 'inspect_styles must NOT append redundant full-page HUD');
+    assert.ok(
+      okStyle.llmSummary.includes('- rect:') &&
+        okStyle.llmSummary.includes('fontFamily:') &&
+        okStyle.llmSummary.includes('fontSize:') &&
+        okStyle.llmSummary.includes('color:') &&
+        okStyle.llmSummary.includes('backgroundColor:'),
+      'inspect_styles must keep guaranteed design properties'
+    );
 
     // Deterministic worst-case budget stress check
     const stressed = formatStylesBlockWithinBudget({
       ok: true,
       target: '#stress',
       tag: 'div',
+      topElement: 'DIV#stress',
       rect: { x: 1, y: 2, width: 300, height: 400 },
       boxModel: { margin: '10px 20px', padding: '12px 18px', border: '2px solid' },
       computedStyle: {
@@ -160,7 +181,7 @@ async function testRegionAndProbes(srv, outDir) {
         height: '400px',
         color: 'rgb(15, 23, 42)',
         backgroundColor: 'rgb(226, 232, 240)',
-        fontFamily: 'VeryLongFontName'.repeat(12),
+        fontFamily: 'VeryLongPrimaryFont, FallbackTwo, FallbackThree, ExtraLongFontFour, ExtraLongFontFive, sans-serif',
         fontSize: '16px',
         fontWeight: '700',
         lineHeight: '24px',
@@ -172,25 +193,40 @@ async function testRegionAndProbes(srv, outDir) {
         pointerEvents: 'auto',
         cursor: 'pointer',
       },
-    }, 520);
-    assert.ok(stressed.length <= 520, `Stressed styles length ${stressed.length} exceeded 520`);
-    assert.ok(stressed.includes('- rect:') && stressed.includes('- display: block'));
+    }, 320);
+    assert.ok(stressed.length <= 320, `Stressed styles length ${stressed.length} exceeded 320`);
+    assert.ok(
+      stressed.includes('- rect:') &&
+        stressed.includes('- display: block') &&
+        stressed.includes('fontFamily: VeryLongPrimaryFont, FallbackTwo') &&
+        !stressed.includes('FallbackThree'),
+      `Expected deterministic drop priority + 2-font truncation, got:\n${stressed}`
+    );
+
+    // Unified inspectDom() shape & <=1200 budget check
+    const rawDom = await tools.inspectDom('#tiny-footer', 5);
+    assert.equal(rawDom.ok, true);
+    assert.equal(rawDom.count, 1);
+    assert.ok(typeof rawDom.llmSummary === 'string' && rawDom.llmSummary.length <= 1200);
+    assert.ok(rawDom.extraData && rawDom.extraData.topElement?.includes('tiny-footer'));
 
     // 4. extract_outline: normSplit preserves "collaborate" & 3 empty reason codes
-    const outline = await tools.extractOutline(25);
+    const outline = await tools.extractOutline();
     assert.equal(outline.ok, true);
+    assert.ok(outline.llmSummary.length <= 1200, `extract_outline llmSummary ${outline.llmSummary.length} exceeded 1200`);
     assert.ok(outline.llmSummary.includes('collaborate'), 'extract_outline must preserve "collaborate"');
+    assert.ok(outline.extraData?.topElement, 'extract_outline must populate topElement');
 
     await tools.navigate(`${srv.url}/canvas-no-headings`, 100);
-    const outCanvas = await tools.extractOutline(25);
+    const outCanvas = await tools.extractOutline();
     assert.equal(outCanvas.extraData?.headingsReason, '标题可能在 <canvas> 内');
 
     await tools.navigate(`${srv.url}/hidden-headings`, 100);
-    const outHidden = await tools.extractOutline(25);
+    const outHidden = await tools.extractOutline();
     assert.equal(outHidden.extraData?.headingsReason, '标题被裁切或隐藏');
 
     await tools.navigate(`${srv.url}/no-headings`, 100);
-    const outNone = await tools.extractOutline(25);
+    const outNone = await tools.extractOutline();
     assert.equal(outNone.extraData?.headingsReason, '无 h1-h4 标题');
 
     // Password input value masking verified on isolated /password-probe route (keeps / clean of login gate)
@@ -198,16 +234,34 @@ async function testRegionAndProbes(srv, outDir) {
     const domPw = await tools.inspectDomForAgent('#secret-pw', 5);
     assert.equal(domPw.ok, true);
     assert.equal(domPw.extraData?.count, 1);
+    assert.ok(domPw.llmSummary.length <= 1200);
     assert.ok(!domPw.llmSummary.includes('TOP_SECRET_PASS_999'), 'Password input value must stay masked');
 
-    // 5. inspect_media: explicit img/video/canvas/svg counts including video=0
+    // 5. inspect_media: explicit img/video/canvas/svg counts including video=0 & <=1200 budget
     await tools.navigate(srv.url, 150);
-    const media = await tools.inspectMedia(12);
+    const media = await tools.inspectMedia();
     assert.equal(media.ok, true);
+    assert.ok(media.llmSummary.length <= 1200, `inspect_media llmSummary ${media.llmSummary.length} exceeded 1200`);
     assert.equal(media.extraData?.counts?.video, 0);
     assert.equal(media.extraData?.counts?.canvas, 1);
     assert.equal(media.extraData?.counts?.img, 1);
     assert.ok(media.llmSummary.includes('video=0'), 'inspect_media must explicitly print video=0');
+
+    // 6. TASK-v2.0.2a budget stress page: many landmarks, >=12 headings, 24 svgs, 8 imgs, 1 canvas, 1 video
+    await tools.navigate(`${srv.url}/budget-stress`, 150);
+    const stressOutline = await tools.extractOutline();
+    assert.equal(stressOutline.ok, true);
+    assert.ok(stressOutline.llmSummary.length <= 1200, `Stress outline ${stressOutline.llmSummary.length} exceeded 1200`);
+    assert.ok(stressOutline.llmSummary.includes('landmarks: '), 'Landmarks must collapse to count summary');
+    const headingMatches = stressOutline.llmSummary.match(/^- <h[1-4]>/gm) ?? [];
+    assert.ok(headingMatches.length >= 8, `Expected >=8 headings preserved in outline summary, got ${headingMatches.length}`);
+
+    const stressMedia = await tools.inspectMedia();
+    assert.equal(stressMedia.ok, true);
+    assert.ok(stressMedia.llmSummary.length <= 1200, `Stress media ${stressMedia.llmSummary.length} exceeded 1200`);
+    assert.ok(stressMedia.llmSummary.includes('svg=24'), 'inspect_media must report total svg=24 count');
+    assert.ok(!stressMedia.llmSummary.includes('- [svg]'), 'inspect_media must not list individual decorative SVGs');
+    assert.ok(stressMedia.llmSummary.includes('intrinsic=1440x900'), 'inspect_media must preserve canvas intrinsic resolution');
   } finally {
     await sess.close();
   }

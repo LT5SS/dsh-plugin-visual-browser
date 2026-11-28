@@ -663,6 +663,9 @@ async function main() {
   assert.deepEqual(navInspectRes.samples, []);
   assert.equal(navInspectRes.degraded, true);
   assert.ok((navInspectRes.degradedReason ?? '').length > 0);
+  assert.equal(navInspectRes.ok, false);
+  assert.ok(typeof navInspectRes.llmSummary === 'string' && navInspectRes.llmSummary.length <= 1200);
+  assert.ok(navInspectRes.extraData && navInspectRes.extraData.count === 0);
 
   const bugInspectToolset = new AtomicBrowserToolset(
     {
@@ -4691,6 +4694,35 @@ async function main() {
       await v203Plugin.runner.closeAllSessions();
     }
     console.log('[Strict DSH 0.2 Contract] 6f-6g Verified v2.0.3 schema params, LOGIN_REQUIRED resume loop-breaker, action_trace & declarative structured extraction!');
+
+    // 6h. v2.0.4 (TASK-v2.0.2a): Strictly enforce 4 read-only probe budgets & unified output shapes (ok + llmSummary + extraData + topElement)
+    const probeBudgetSess = await new BrowserSession({ mode: 'auto', windowMode: 'headless' }).start();
+    try {
+      const probeTools = new AtomicBrowserToolset(probeBudgetSess, path.join(artifactDir, 'v204-probes'));
+      await probeTools.navigate(`${srv.url}__design-editorial.html`, 100);
+      const dRes = await probeTools.inspectDom('h1, a', 5);
+      const sRes = await probeTools.inspectStyles('#1');
+      const oRes = await probeTools.extractOutline();
+      const mRes = await probeTools.inspectMedia();
+      assert.equal(dRes.ok, true);
+      assert.equal(sRes.ok, true);
+      assert.equal(oRes.ok, true);
+      assert.equal(mRes.ok, true);
+      for (const item of [dRes, sRes, oRes, mRes]) {
+        assert.ok(typeof item.llmSummary === 'string' && item.llmSummary.length > 0);
+        assert.ok(item.extraData && typeof item.extraData === 'object');
+      }
+      assert.ok(dRes.llmSummary.length <= 1200, `inspectDom budget ${dRes.llmSummary.length}`);
+      assert.ok(sRes.llmSummary.length <= 1000, `inspectStyles budget ${sRes.llmSummary.length}`);
+      assert.ok(oRes.llmSummary.length <= 1200, `extractOutline budget ${oRes.llmSummary.length}`);
+      assert.ok(mRes.llmSummary.length <= 1200, `inspectMedia budget ${mRes.llmSummary.length}`);
+      assert.ok((dRes.extraData as any).topElement);
+      assert.ok((sRes.extraData as any).topElement);
+      assert.ok((oRes.extraData as any).topElement);
+    } finally {
+      await probeBudgetSess.close();
+    }
+    console.log('[Strict DSH 0.2 Contract] 6h Verified TASK-v2.0.2a probe budgets (1200/1000/1200/1200), unified shapes & topElement!');
 
     console.log('\n✅ ALL DSH 0.2.x CONTRACT CHECKS PASSED!');
   } finally {

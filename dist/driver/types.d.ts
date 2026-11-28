@@ -152,6 +152,7 @@ export interface StylesInspectResult {
     blocked?: ActionBlockedReason;
     hint?: string;
     tag?: string;
+    topElement?: string;
     rect?: {
         x: number;
         y: number;
@@ -175,14 +176,17 @@ export interface OutlineItem {
 export interface OutlineExtractResult {
     ok: boolean;
     totalLandmarks: number;
+    landmarkCounts?: Record<string, number>;
     totalHeadings: number;
     headingsReason?: string;
+    topElement?: string;
     items: OutlineItem[];
     degraded?: boolean;
     degradedReason?: string;
 }
 export interface MediaInspectResult {
     ok: boolean;
+    topElement?: string;
     counts: {
         img: number;
         video: number;

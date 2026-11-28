@@ -116,6 +116,14 @@
 
 ---
 
+## v2.0.4 已交付（探针字符硬预算兑现、统一返回形状与 `topElement`）
+
+- **严格字符硬上限（[TASK-v2.0.2a.md](file:///E:/AI_Work/奇思妙想/visual-browser-plugin/TASK-v2.0.2a.md)）**：`inspect_dom` / `inspect_dom_for_agent`（`<= 1200`）、`inspect_styles`（`<= 1000`）、`extract_outline`（`<= 1200`）与 `inspect_media`（`<= 1200`）的 `llmSummary` 不再冗余拼接全页 HUD，只返回探针自身精简摘要（页面仍通过当步截图同步视觉状态）。
+- **四探针输出形状统一 + `topElement`**：`inspectDom()` 直接返回 `{ count, samples, ok, llmSummary, extraData, topElement? }`（保持既有 `count`/`samples`/`degraded` 完全兼容）；`inspect_styles` / `extract_outline` / `inspect_media` 同步补充 `topElement` 字段。
+- **信息密度按实测反馈提纯**：`inspect_styles` 优先裁剪 `cursor`/`pointerEvents`/`overflow`/`transform` 与 `lineHeight`/`letterSpacing`，超限再将 `fontFamily` 缩为前 2 个字体并保底保留 `rect`、`display`/`position`、`fontFamily`/`fontSize`/`color`/`backgroundColor`；`extract_outline` 默认 `maxItems=12` 且地标合并为单行计数；`inspect_media` 默认 `maxItems=6`、`<svg>` 只报总数不逐条列举、精简 `<img>` 与 `<video>` 字段。
+
+---
+
 ## v2.0.3 已交付（年龄门误报 / Resume 破循环修复与结构化抽取闭环）
 
 - **P0 · `takeover.ts` 严格密码框可见性与遮挡校验**：改用 `querySelectorAll` 逐一验证祖先链可见性（`display`/`visibility`/`opacity`/`hidden`/`aria-hidden`/`inert`）、几何尺寸与视口交集及 `elementFromPoint()` 顶层遮挡，彻底消除未打开弹窗 `.modal` 或年龄门遮罩下藏 `<input type="password">` 导致的误挂起。

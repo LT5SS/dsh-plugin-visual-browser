@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-visual-browser",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Dual-mode adaptive visual browser subagent plugin for DeepSeek Harness (DSH 0.2.x) with explicit set_viewport/DPR, condition wait_for, key/select/history primitives, Win32 HWND_NOTOPMOST self-heal, external/javascript protocol guard, and native dialog visibility.",
   "type": "module",
   "main": "dist/index.js",
